@@ -20,11 +20,6 @@ use crate::{prompts::SYSTEM_PROMPT, AppState};
 type LiveSocket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-#[derive(Debug, Clone)]
-struct LiveSessionHandle {
-    tx: mpsc::UnboundedSender<LiveOutgoing>,
-}
-
 #[derive(Debug)]
 enum LiveOutgoing {
     ClientContent {
@@ -34,7 +29,15 @@ enum LiveOutgoing {
     RealtimeAudio {
         pcm16_base64: String,
     },
+    ToolResponse {
+        payload: Value,
+    },
     Close,
+}
+
+#[derive(Debug, Clone)]
+struct LiveSessionHandle {
+    tx: mpsc::Sender<LiveOutgoing>,
 }
 
 #[derive(Debug, Clone)]
@@ -210,12 +213,16 @@ impl GeminiBridge {
         }
 
         let handle = self.ensure_live_session(state, &chunk.session_id).await?;
-        handle
+        if let Err(mpsc::error::TrySendError::Full(_)) = handle
             .tx
-            .send(LiveOutgoing::RealtimeAudio {
+            .try_send(LiveOutgoing::RealtimeAudio {
                 pcm16_base64: trimmed.to_string(),
             })
-            .map_err(|_| anyhow::anyhow!("gemini live outbound channel closed"))?;
+        {
+            tracing::warn!("gemini live outbound channel full, dropping audio chunk");
+        } else if handle.tx.is_closed() {
+            anyhow::bail!("gemini live outbound channel closed");
+        }
         Ok(())
     }
 
@@ -235,7 +242,7 @@ impl GeminiBridge {
         };
 
         if let Some(handle) = handle {
-            let _ = handle.tx.send(LiveOutgoing::Close);
+            let _ = handle.tx.try_send(LiveOutgoing::Close);
         }
     }
 
@@ -266,13 +273,20 @@ impl GeminiBridge {
         turn_complete: bool,
     ) -> anyhow::Result<()> {
         let handle = self.ensure_live_session(state, session_id).await?;
-        handle
+        if let Err(mpsc::error::TrySendError::Full(_)) = handle
             .tx
-            .send(LiveOutgoing::ClientContent {
+            .try_send(LiveOutgoing::ClientContent {
                 parts,
                 turn_complete,
             })
-            .map_err(|_| anyhow::anyhow!("gemini live outbound channel closed"))
+        {
+            tracing::warn!("gemini live outbound channel full, dropping client content");
+            Ok(())
+        } else if handle.tx.is_closed() {
+            Err(anyhow::anyhow!("gemini live outbound channel closed"))
+        } else {
+            Ok(())
+        }
     }
 
     async fn ensure_live_session(
@@ -294,7 +308,7 @@ impl GeminiBridge {
             return Ok(existing);
         }
 
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(1024);
         let handle = LiveSessionHandle { tx: tx.clone() };
 
         guard.insert(session_id.to_string(), handle.clone());
@@ -314,7 +328,7 @@ impl GeminiBridge {
         let live_sessions = Arc::clone(&self.live_sessions);
         let session_key = session_id.to_string();
         tokio::spawn(async move {
-            if let Err(error) = runner.run(rx).await {
+            if let Err(error) = runner.run(tx.clone(), rx).await {
                 tracing::warn!(
                     session_id = %session_key,
                     error = %error,
@@ -392,9 +406,10 @@ impl GeminiBridge {
 impl LiveSessionRunner {
     async fn run(
         &self,
-        mut outbound_rx: mpsc::UnboundedReceiver<LiveOutgoing>,
+        tx: mpsc::Sender<LiveOutgoing>,
+        mut outbound_rx: mpsc::Receiver<LiveOutgoing>,
     ) -> anyhow::Result<()> {
-        let result = self.run_inner(&mut outbound_rx).await;
+        let result = self.run_inner(tx, &mut outbound_rx).await;
 
         if let Err(error) = &result {
             self.emit_connection_state(
@@ -412,7 +427,8 @@ impl LiveSessionRunner {
 
     async fn run_inner(
         &self,
-        outbound_rx: &mut mpsc::UnboundedReceiver<LiveOutgoing>,
+        tx: mpsc::Sender<LiveOutgoing>,
+        outbound_rx: &mut mpsc::Receiver<LiveOutgoing>,
     ) -> anyhow::Result<()> {
         let ws_url = format!("{}?key={}", self.live_endpoint_base, self.api_key);
         let (mut socket, _) = tokio_tungstenite::connect_async(ws_url)
@@ -460,6 +476,9 @@ impl LiveSessionRunner {
                             });
                             send_ws_json(&mut socket, &payload).await?;
                         }
+                        LiveOutgoing::ToolResponse { payload } => {
+                            send_ws_json(&mut socket, &payload).await?;
+                        }
                         LiveOutgoing::Close => {
                             let _ = socket.close(None).await;
                             return Ok(());
@@ -481,7 +500,7 @@ impl LiveSessionRunner {
                                 continue;
                             };
 
-                            self.handle_server_payload(&mut socket, &payload).await?;
+                            self.handle_server_payload(tx.clone(), &payload).await?;
                         }
                         Err(error) => {
                             return Err(anyhow::anyhow!("gemini live websocket stream error: {error}"));
@@ -509,7 +528,7 @@ impl LiveSessionRunner {
 
     async fn handle_server_payload(
         &self,
-        socket: &mut LiveSocket,
+        tx: mpsc::Sender<LiveOutgoing>,
         payload: &Value,
     ) -> anyhow::Result<()> {
         for text in extract_texts(payload) {
@@ -544,7 +563,7 @@ impl LiveSessionRunner {
 
         let tool_calls = extract_tool_calls(payload);
         if !tool_calls.is_empty() {
-            self.handle_tool_calls(socket, tool_calls).await?;
+            self.handle_tool_calls(tx, tool_calls).await?;
         }
 
         Ok(())
@@ -552,30 +571,34 @@ impl LiveSessionRunner {
 
     async fn handle_tool_calls(
         &self,
-        socket: &mut LiveSocket,
+        tx: mpsc::Sender<LiveOutgoing>,
         tool_calls: Vec<GeminiToolCall>,
     ) -> anyhow::Result<()> {
-        let mut function_responses = Vec::new();
+        let runner = self.clone();
 
-        for call in tool_calls {
-            let args = normalize_tool_args(call.args);
-            let result = self.dispatch_tool_call(&call.name, &args).await;
+        tokio::spawn(async move {
+            let mut function_responses = Vec::new();
 
-            function_responses.push(json!({
-                "id": call.id,
-                "name": call.name,
-                "response": result,
-            }));
-        }
+            for call in tool_calls {
+                let args = normalize_tool_args(call.args);
+                let result = runner.dispatch_tool_call(&call.name, &args).await;
 
-        if !function_responses.is_empty() {
-            let payload = json!({
-                "toolResponse": {
-                    "functionResponses": function_responses,
-                }
-            });
-            send_ws_json(socket, &payload).await?;
-        }
+                function_responses.push(json!({
+                    "id": call.id,
+                    "name": call.name,
+                    "response": result,
+                }));
+            }
+
+            if !function_responses.is_empty() {
+                let payload = json!({
+                    "toolResponse": {
+                        "functionResponses": function_responses,
+                    }
+                });
+                let _ = tx.send(LiveOutgoing::ToolResponse { payload }).await;
+            }
+        });
 
         Ok(())
     }
