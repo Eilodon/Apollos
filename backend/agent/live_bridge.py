@@ -59,6 +59,8 @@ class GeminiLiveBridge:
         self._last_motion_state = 'stationary'
         self._consecutive_hazard_frames = 0
         self._last_hazard_ts = 0.0
+        self._hazard_confirmation_frames = max(1, int(os.getenv('HAZARD_CONFIRMATION_FRAMES', '1')))
+        self._hazard_confirmation_timeout_s = max(0.5, float(os.getenv('HAZARD_CONFIRMATION_TIMEOUT_S', '3.0')))
 
     async def ensure_started(self) -> bool:
         if self._stopped:
@@ -152,11 +154,23 @@ class GeminiLiveBridge:
         self._last_motion_state = motion_state
         pitch = float(payload.get('pitch', 0.0) or 0.0)
         velocity = float(payload.get('velocity', 0.0) or 0.0)
+        yaw_delta = float(payload.get('yaw_delta_deg', 0.0) or 0.0)
+
+        # Semantic Odometry: bơm góc xoay tích lũy để Gemini suy luận vị trí vật cản
+        odometry_hint = ''
+        if abs(yaw_delta) > 5.0:
+            direction = 'RIGHT' if yaw_delta > 0 else 'LEFT'
+            odometry_hint = (
+                f' [ODOMETRY: User rotated {abs(yaw_delta):.0f}-deg {direction} since last frame.'
+                f' If a hazard was detected on the {direction.lower()} previously,'
+                f' warn it may now be DIRECTLY AHEAD. Do not wait for next frame to confirm.]'
+            )
 
         motion_text = (
             f"[KINEMATIC: User is {motion_state}. Pitch: {pitch:.1f}deg. "
-            f"Velocity: {velocity:.2f}. Treat visible hazards with safety-first urgency.]"
+            f"Velocity: {velocity:.2f}. Treat visible hazards with safety-first urgency.]{odometry_hint}"
         )
+
 
         # Avoid repeating identical motion hints too aggressively.
         include_motion_text = motion_text != self._last_motion_text
@@ -338,8 +352,11 @@ class GeminiLiveBridge:
             'output_audio_transcription': {},
             'speech_config': {
                 'voice_config': {'prebuilt_voice_config': {'voice_name': 'Kore'}},
-                'enable_affective_dialog': True,
-                'enable_proactivity': True,
+            },
+            'enable_affective_dialog': True,
+            'proactivity': {'proactive_audio': True},
+            'realtime_input_config': {
+                'automatic_activity_detection': {'disabled': False},
             },
             'tools': [{'function_declarations': function_declarations}],
             'system_instruction': SYSTEM_PROMPT,
@@ -465,14 +482,14 @@ class GeminiLiveBridge:
 
             if name == 'log_hazard_event':
                 now_ts = time.monotonic()
-                if now_ts - self._last_hazard_ts > 3.0:
+                if now_ts - self._last_hazard_ts > self._hazard_confirmation_timeout_s:
                     self._consecutive_hazard_frames = 0
                 
                 self._last_hazard_ts = now_ts
                 self._consecutive_hazard_frames += 1
 
                 should_fire = (
-                    self._consecutive_hazard_frames >= 2 or
+                    self._consecutive_hazard_frames >= self._hazard_confirmation_frames or
                     self._last_motion_state in {'walking_fast', 'running'}
                 )
 

@@ -1,65 +1,307 @@
-from google.adk.agents import Agent
-from .tools.hazard_logger import log_hazard_event
-from .tools.mode_switcher import set_navigation_mode
-from .tools.emotion_logger import log_emotion_event
+from __future__ import annotations
+
+import asyncio
+import inspect
+import logging
+import os
+from datetime import datetime, timezone
+from typing import Any, Callable
+
+from .live_bridge import GeminiLiveBridge
+from .session_manager import SessionStore
 from .tools.context_manager import get_context_summary
+from .tools.emotion_logger import log_emotion_event
+from .tools.hazard_logger import log_hazard_event
 from .tools.human_help import request_human_help
+from .tools.mode_switcher import set_navigation_mode
+from .tools.runtime import configure_runtime, reset_current_session, set_current_session
+from .websocket_handler import WebSocketRegistry
 
-# ==================== FULL SYSTEM PROMPT ARIA v1.2 (60+ dòng) ====================
-SYSTEM_PROMPT = """You are ARIA, a real-time navigation assistant for a blind user.
-Your primary mission: SAFE -> NAVIGATE -> DESCRIBE.
+logger = logging.getLogger(__name__)
 
-=== SAFETY RULES (ABSOLUTE - NEVER VIOLATE) ===
-1. NEVER say "go", "walk", "step", "move" unless HIGH confidence path is clear in the CURRENT frame.
-2. Before ANY movement instruction: "Path looks clear. Say yes to proceed."
-3. If you detect: steps, stairs, drops, vehicles, water, construction, fast-moving objects -> CALL log_hazard_event() IMMEDIATELY, BEFORE speaking. The tool fires a hardware interrupt on the device - faster than your voice.
-4. NEVER guess distances. Use: "very close (within 1m)", "nearby (1-3m)", "ahead (3-5m)", "in the distance (5m+)".
-5. If frame quality is poor (dark, blurry) -> "I can't see clearly. Please stop." NEVER fabricate scene description.
-6. Ambiguous hazard = assume danger. False positive = safe. False negative = dangerous.
+ToolResult = dict[str, Any]
+ToolFn = Callable[..., Any]
 
-=== KINEMATIC CONTEXT ===
-7. Each frame includes motion_state metadata. If motion_state = "walking_fast" AND hazard visible -> URGENCY level maximum. Call log_hazard_event() without delay.
-8. If motion_state = "stationary" -> can give richer descriptive responses.
+_DISTANCE_VALUES = {'very_close', 'mid', 'far'}
 
-=== EMOTION-AWARE RULES ===
-9. Detect stress signals (fast speech, tremor, facial tension) -> slow pace, shorter sentences, offer pause. "I notice you may be stressed. Let's slow down. You're safe."
-10. Adjust warmth based on environment: calmer in high-traffic, warmer indoors.
 
-=== RESPONSE FORMAT ===
-- Hazard alerts: < 8 words. "Stop. Step down, very close." (tool fires first)
-- Descriptions: 1-3 sentences. Most important info first.
-- Reading text: Verbatim. "Sign reads: EXIT - Floor 2"
-- Directions: clock position + distance. "3 o'clock, nearby (1-2m)"
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {'0', 'false', 'off', 'no'}
 
-=== CURRENT MODE ===
-{MODE}
 
-=== SESSION CONTEXT ===
-{CONTEXT_SUMMARY}
+class AriaAgentOrchestrator:
+    """Routes client websocket payloads into Gemini Live and local tool runtime."""
 
-=== PROACTIVE RULES ===
-- NAVIGATION: Speak when scene changes or hazard detected.
-- EXPLORE: Speak only when asked, unless critical hazard.
-- READ: Speak when new text visible.
-- QUIET: Critical danger only.
-- Silence is correct behavior when nothing important changed.
-"""
+    def __init__(self, session_store: SessionStore, websocket_registry: WebSocketRegistry) -> None:
+        self._session_store = session_store
+        self._websocket_registry = websocket_registry
+        self._live_enabled = _env_flag('ENABLE_GEMINI_LIVE', True)
 
-def create_aria_agent() -> Agent:
-    """
-    Tạo Pure ADK Agent
-    System Prompt được inject trực tiếp qua parameter 'instruction'
-    """
-    return Agent(
-        name="aria_navigation_agent",
-        model="gemini-live-2.5-flash-native-audio",
-        description="Real-time navigation assistant for blind users with HRTF spatial audio safety system.",
-        instruction=SYSTEM_PROMPT,                            # CÁCH GHIM SYSTEM PROMPT VÀO ADK
-        tools=[
-            log_hazard_event,
-            set_navigation_mode,
-            log_emotion_event,
-            get_context_summary,
-            request_human_help,
-        ],
-    )
+        self._bridges: dict[str, GeminiLiveBridge] = {}
+        self._bridge_lock = asyncio.Lock()
+
+        self._tools: dict[str, ToolFn] = {
+            'log_hazard_event': log_hazard_event,
+            'set_navigation_mode': set_navigation_mode,
+            'log_emotion_event': log_emotion_event,
+            'get_context_summary': get_context_summary,
+            'request_human_help': request_human_help,
+        }
+
+        configure_runtime(session_store=session_store, websocket_registry=websocket_registry)
+
+    @property
+    def live_enabled(self) -> bool:
+        return self._live_enabled
+
+    async def handle_client_message(self, session_id: str, payload: dict[str, Any]) -> None:
+        message_type = str(payload.get('type', '')).strip()
+        if not message_type:
+            return
+
+        if message_type == 'heartbeat':
+            await self._websocket_registry.send_live(
+                session_id,
+                {
+                    'type': 'heartbeat_ack',
+                    'session_id': session_id,
+                    'timestamp': self._now(),
+                },
+            )
+            return
+
+        motion_state = str(payload.get('motion_state', 'stationary'))
+        await self._session_store.touch_session(session_id, motion_state=motion_state)
+
+        if message_type == 'multimodal_frame':
+            await self._handle_multimodal_frame(session_id, payload)
+            return
+
+        if message_type == 'audio_chunk':
+            await self._handle_audio_chunk(session_id, payload)
+            return
+
+        if message_type == 'user_command':
+            await self._handle_user_command(session_id, payload)
+            return
+
+        await self._send_assistant_text(session_id, f'Unsupported message type: {message_type}')
+
+    async def dispatch_tool_call(self, name: str, args: dict[str, Any], session_id: str) -> ToolResult:
+        tool = self._tools.get(name)
+        if tool is None:
+            return {'ok': False, 'tool': name, 'error': f'Unknown tool: {name}'}
+
+        prepared = dict(args)
+        if name == 'log_hazard_event':
+            if 'distance_category' not in prepared and 'distance' in prepared:
+                prepared['distance_category'] = prepared.pop('distance')
+            prepared.setdefault('distance_category', 'mid')
+            prepared.setdefault('session_id', session_id)
+
+        token = set_current_session(session_id)
+        try:
+            kwargs = self._filter_tool_kwargs(tool, prepared)
+            raw_result = tool(**kwargs)
+            if inspect.isawaitable(raw_result):
+                raw_result = await raw_result
+
+            normalized = self._normalize_tool_result(name, prepared, raw_result)
+            normalized.setdefault('ok', True)
+            normalized.setdefault('tool', name)
+            return normalized
+        except Exception as exc:
+            logger.exception('Tool dispatch failed (session=%s, tool=%s): %s', session_id, name, exc)
+            return {'ok': False, 'tool': name, 'error': str(exc)}
+        finally:
+            reset_current_session(token)
+
+    async def close_session(self, session_id: str) -> None:
+        async with self._bridge_lock:
+            bridge = self._bridges.pop(session_id, None)
+        if bridge is not None:
+            await bridge.close()
+
+    async def shutdown(self) -> None:
+        async with self._bridge_lock:
+            bridges = list(self._bridges.values())
+            self._bridges.clear()
+        if not bridges:
+            return
+        await asyncio.gather(*(bridge.close() for bridge in bridges), return_exceptions=True)
+
+    async def stats(self) -> dict[str, Any]:
+        async with self._bridge_lock:
+            bridge_count = len(self._bridges)
+        return {
+            'live_enabled': self._live_enabled,
+            'active_live_sessions': bridge_count,
+        }
+
+    async def _handle_multimodal_frame(self, session_id: str, payload: dict[str, Any]) -> None:
+        if not self._live_enabled:
+            return
+
+        bridge = await self._ensure_bridge(session_id)
+        await bridge.send_multimodal_frame(payload)
+
+        user_text = str(payload.get('user_text', '') or '').strip()
+        if user_text:
+            await bridge.send_text(user_text, turn_complete=True)
+
+    async def _handle_audio_chunk(self, session_id: str, payload: dict[str, Any]) -> None:
+        if not self._live_enabled:
+            return
+
+        audio_chunk = str(payload.get('audio_chunk_pcm16', '') or '').strip()
+        if not audio_chunk:
+            return
+
+        bridge = await self._ensure_bridge(session_id)
+        await bridge.send_audio_chunk(audio_chunk)
+
+    async def _handle_user_command(self, session_id: str, payload: dict[str, Any]) -> None:
+        command = str(payload.get('command', '') or '').strip()
+        if not command:
+            return
+
+        if await self._handle_local_command(session_id, command):
+            return
+
+        if not self._live_enabled:
+            await self._send_assistant_text(session_id, 'Live model disabled. Command recorded locally.')
+            return
+
+        bridge = await self._ensure_bridge(session_id)
+        await bridge.send_text(command, turn_complete=True)
+
+    async def _handle_local_command(self, session_id: str, command: str) -> bool:
+        normalized = command.strip()
+        lower = normalized.lower()
+
+        if lower.startswith('set_navigation_mode'):
+            mode = self._extract_mode_from_command(normalized)
+            if not mode:
+                await self._send_assistant_text(session_id, 'Mode command missing target mode.')
+                return True
+
+            result = await self.dispatch_tool_call('set_navigation_mode', {'mode': mode}, session_id)
+            await self._send_assistant_text(session_id, str(result.get('message') or result.get('value') or f'Mode switched to {mode}'))
+            return True
+
+        if lower == 'request_human_help':
+            result = await self.dispatch_tool_call('request_human_help', {}, session_id)
+            help_link = str(result.get('value') or result.get('message') or '')
+            if help_link:
+                await self._send_assistant_text(session_id, f'Human help requested: {help_link}')
+            else:
+                await self._send_assistant_text(session_id, 'Human help requested.')
+            return True
+
+        if lower == 'get_context_summary':
+            result = await self.dispatch_tool_call('get_context_summary', {}, session_id)
+            summary = str(result.get('value') or result.get('message') or '')
+            await self._send_assistant_text(session_id, summary or 'No context summary available yet.')
+            return True
+
+        if lower in {'describe_detailed', 'describe_detail', 'describe'}:
+            summary = await self._session_store.get_context_summary(session_id)
+            await self._send_assistant_text(session_id, f'Context snapshot: {summary}')
+            return True
+
+        if lower == 'sos':
+            result = await self.dispatch_tool_call('request_human_help', {}, session_id)
+            help_link = str(result.get('value') or result.get('message') or '')
+            await self._send_assistant_text(
+                session_id,
+                f'SOS acknowledged. Human help link: {help_link}' if help_link else 'SOS acknowledged. Human help requested.',
+            )
+            return True
+
+        return False
+
+    async def _ensure_bridge(self, session_id: str) -> GeminiLiveBridge:
+        async with self._bridge_lock:
+            bridge = self._bridges.get(session_id)
+            if bridge is not None:
+                return bridge
+
+            async def tool_dispatcher(name: str, args: dict[str, Any]) -> ToolResult:
+                return await self.dispatch_tool_call(name, args, session_id)
+
+            bridge = GeminiLiveBridge(
+                session_id=session_id,
+                session_store=self._session_store,
+                websocket_registry=self._websocket_registry,
+                tool_dispatcher=tool_dispatcher,
+            )
+            self._bridges[session_id] = bridge
+            return bridge
+
+    async def _send_assistant_text(self, session_id: str, text: str) -> None:
+        if not text.strip():
+            return
+        await self._websocket_registry.send_live(
+            session_id,
+            {
+                'type': 'assistant_text',
+                'session_id': session_id,
+                'timestamp': self._now(),
+                'text': text.strip(),
+            },
+        )
+
+    @staticmethod
+    def _filter_tool_kwargs(tool: ToolFn, args: dict[str, Any]) -> dict[str, Any]:
+        signature = inspect.signature(tool)
+        kwargs: dict[str, Any] = {}
+        for name in signature.parameters:
+            if name in args:
+                kwargs[name] = args[name]
+        return kwargs
+
+    @staticmethod
+    def _normalize_tool_result(name: str, args: dict[str, Any], raw_result: Any) -> ToolResult:
+        normalized: ToolResult = {}
+
+        if isinstance(raw_result, dict):
+            normalized.update(raw_result)
+        elif isinstance(raw_result, str):
+            normalized['message'] = raw_result
+            normalized['value'] = raw_result
+        elif raw_result is not None:
+            normalized['value'] = raw_result
+
+        if name == 'log_hazard_event':
+            position_x = float(args.get('position_x', 0.0) or 0.0)
+            distance = str(args.get('distance_category', 'mid') or 'mid')
+            if distance not in _DISTANCE_VALUES:
+                distance = 'mid'
+
+            normalized.setdefault('position_x', max(-1.0, min(1.0, position_x)))
+            normalized.setdefault('distance', distance)
+            normalized.setdefault('hazard_type', str(args.get('hazard_type', 'unknown') or 'unknown'))
+            normalized.setdefault('confidence', float(args.get('confidence', 0.0) or 0.0))
+
+        return normalized
+
+    @staticmethod
+    def _extract_mode_from_command(command: str) -> str:
+        if ':' in command:
+            _, mode = command.split(':', 1)
+            return mode.strip().upper()
+        if '=' in command:
+            _, mode = command.split('=', 1)
+            return mode.strip().upper()
+
+        parts = command.split(maxsplit=1)
+        if len(parts) == 2:
+            return parts[1].strip().upper()
+        return ''
+
+    @staticmethod
+    def _now() -> str:
+        return datetime.now(timezone.utc).isoformat()

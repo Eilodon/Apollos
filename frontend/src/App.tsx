@@ -8,6 +8,7 @@ import { useARIA } from './hooks/useARIA';
 import { useAudioStream } from './hooks/useAudioStream';
 import { useCamera } from './hooks/useCamera';
 import { useMotionSensor } from './hooks/useMotionSensor';
+import { usePocketMode } from './hooks/usePocketMode';
 import { useWakeLock } from './hooks/useWakeLock';
 import { AudioCache } from './services/audioCache';
 import { SpatialAudioEngine } from './services/spatialAudioEngine';
@@ -72,6 +73,7 @@ export default function App(): JSX.Element {
   } = useMotionSensor();
 
   const { oledBlackMode, wakeLockActive, activateNavigationMode, deactivateNavigationMode } = useWakeLock();
+  const inPocket = usePocketMode();
 
   const onBackendMessage = useCallback((message: BackendToClientMessage) => {
     if (message.type === 'assistant_text') {
@@ -124,13 +126,15 @@ export default function App(): JSX.Element {
     videoRef,
     enabled: sessionActive && aria.status === 'connected',
     motionSnapshot,
-    onFrame: ({ frameBase64, timestamp }) => {
+    onHazard: onHardStop,
+    onFrame: ({ frameBase64, timestamp, yaw_delta_deg }) => {
       aria.sendFrame({
         timestamp,
         frame_jpeg_base64: frameBase64,
         motion_state: motionSnapshot.state,
         pitch: motionSnapshot.pitch,
         velocity: motionSnapshot.velocity,
+        yaw_delta_deg,
       });
     },
   });
@@ -333,7 +337,7 @@ export default function App(): JSX.Element {
         Tap: mic toggle. Double tap: repeat. Long press: human help. Swipe up: next mode. Swipe down: detailed describe.
       </p>
 
-      <OLEDBlackOverlay enabled={oledBlackMode && sessionActive} />
+      <OLEDBlackOverlay enabled={(oledBlackMode || inPocket) && sessionActive} />
     </div>
   );
 }

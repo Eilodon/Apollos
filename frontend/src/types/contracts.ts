@@ -17,6 +17,8 @@ export interface MultimodalFrameMessage {
   pitch: number;
   velocity: number;
   user_text?: string;
+  /** Góc xoay ngang tích lũy (độ) kể từ frame trước → Semantic Odometry */
+  yaw_delta_deg?: number;
 }
 
 export interface AudioChunkMessage {

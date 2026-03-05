@@ -1,9 +1,12 @@
 import { MutableRefObject, useEffect, useMemo, useRef } from 'react';
-import { MotionSnapshot } from '../types/contracts';
+import { KinematicReading, computeYawDelta, shouldCaptureFrame } from '../services/kinematicGating';
+import { HardStopMessage, MotionSnapshot } from '../types/contracts';
 
 interface CameraFramePayload {
   frameBase64: string;
   timestamp: string;
+  /** Góc xoay ngang tích lũy (độ) kể từ frame trước → Semantic Odometry */
+  yaw_delta_deg: number;
 }
 
 interface UseCameraOptions {
@@ -11,6 +14,7 @@ interface UseCameraOptions {
   enabled: boolean;
   motionSnapshot: MotionSnapshot;
   onFrame: (payload: CameraFramePayload) => void;
+  onHazard?: (message: HardStopMessage) => void;
 }
 
 function intervalForMotionState(state: MotionSnapshot['state']): number {
@@ -47,11 +51,54 @@ async function getOptimalCameraStream() {
   return await navigator.mediaDevices.getUserMedia(constraints);
 }
 
-export function useCamera({ videoRef, enabled, motionSnapshot, onFrame }: UseCameraOptions): void {
+export function useCamera({ videoRef, enabled, motionSnapshot, onFrame, onHazard }: UseCameraOptions): void {
   const streamRef = useRef<MediaStream | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const edgeCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const workerRef = useRef<Worker | null>(null);
+  const kinematicRef = useRef<KinematicReading>({ accel: null, gyro: null });
+  const lastCloudPostRef = useRef<number>(Date.now());
+  const accumulatedYawRef = useRef<number>(0);
+  const lastMotionEventTsRef = useRef<number>(Date.now());
 
   const intervalMs = useMemo(() => intervalForMotionState(motionSnapshot.state), [motionSnapshot.state]);
+
+  useEffect(() => {
+    workerRef.current = new Worker(new URL('../workers/survivalReflex.worker.ts', import.meta.url), { type: 'module' });
+    workerRef.current.onmessage = (e) => {
+      if (e.data.type === 'CRITICAL_EDGE_HAZARD') {
+        onHazard?.({
+          type: 'HARD_STOP',
+          position_x: e.data.positionX,
+          distance: e.data.distance,
+          hazard_type: e.data.hazard_type,
+          confidence: 0.99
+        });
+      }
+    };
+    return () => {
+      workerRef.current?.terminate();
+      workerRef.current = null;
+    };
+  }, [onHazard]);
+
+  useEffect(() => {
+    const handler = (e: DeviceMotionEvent) => {
+      const now = Date.now();
+      const dtMs = now - lastMotionEventTsRef.current;
+      lastMotionEventTsRef.current = now;
+
+      kinematicRef.current = {
+        accel: e.accelerationIncludingGravity ?? e.acceleration,
+        gyro: e.rotationRate,
+      };
+
+      // Tích lũy yaw delta để bơm vào từng frame khi chụp
+      accumulatedYawRef.current += computeYawDelta(e.rotationRate, dtMs);
+    };
+    window.addEventListener('devicemotion', handler);
+    return () => window.removeEventListener('devicemotion', handler);
+  }, []);
 
   useEffect(() => {
     if (!enabled || streamRef.current) {
@@ -102,6 +149,7 @@ export function useCamera({ videoRef, enabled, motionSnapshot, onFrame }: UseCam
       return;
     }
 
+    const EDGE_INTERVAL = 100;
     const timer = window.setInterval(() => {
       const video = videoRef.current;
       if (!video || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
@@ -113,8 +161,14 @@ export function useCamera({ videoRef, enabled, motionSnapshot, onFrame }: UseCam
       canvas.width = 768;
       canvas.height = 768;
 
+      const edgeCanvas = edgeCanvasRef.current ?? document.createElement('canvas');
+      edgeCanvasRef.current = edgeCanvas;
+      edgeCanvas.width = 64;
+      edgeCanvas.height = 64;
+
       const ctx = canvas.getContext('2d');
-      if (!ctx) {
+      const edgeCtx = edgeCanvas.getContext('2d', { willReadFrequently: true });
+      if (!ctx || !edgeCtx) {
         return;
       }
 
@@ -133,11 +187,28 @@ export function useCamera({ videoRef, enabled, motionSnapshot, onFrame }: UseCam
         sy = (video.videoHeight - sh) / 2;
       }
 
-      ctx.drawImage(video, sx, sy, sw, sh, 0, 0, 768, 768);
-      const dataUrl = canvas.toDataURL('image/jpeg', 0.72);
-      const frameBase64 = dataUrl.split(',')[1] ?? '';
-      onFrame({ frameBase64, timestamp: new Date().toISOString() });
-    }, intervalMs);
+      edgeCtx.drawImage(video, sx, sy, sw, sh, 0, 0, 64, 64);
+      const edgeImageData = edgeCtx.getImageData(0, 0, 64, 64);
+      workerRef.current?.postMessage({ currentFrame: edgeImageData, timestamp: Date.now() });
+
+      const now = Date.now();
+      const timeSinceLastPost = now - lastCloudPostRef.current;
+
+      // Kinematic Gating: toán học vector → chỉ chụp khi thẳng đứng và ổn định
+      const isKinematicallyStable = shouldCaptureFrame(kinematicRef.current);
+      const isTimeout = timeSinceLastPost > intervalMs + 500;
+      const isTimeToPost = timeSinceLastPost >= intervalMs;
+
+      if (isTimeToPost && (isKinematicallyStable || isTimeout)) {
+        ctx.drawImage(video, sx, sy, sw, sh, 0, 0, 768, 768);
+        const dataUrl = canvas.toDataURL('image/jpeg', 0.72);
+        const frameBase64 = dataUrl.split(',')[1] ?? '';
+        const yawSnapshot = accumulatedYawRef.current;
+        accumulatedYawRef.current = 0; // Reset sau khi đã capture
+        onFrame({ frameBase64, timestamp: new Date().toISOString(), yaw_delta_deg: yawSnapshot });
+        lastCloudPostRef.current = now;
+      }
+    }, EDGE_INTERVAL);
 
     return () => {
       window.clearInterval(timer);
