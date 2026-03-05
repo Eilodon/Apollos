@@ -195,6 +195,7 @@ class GeminiLiveBridge:
 
         risk_score = self._compute_risk_multiplier(motion_state, pitch, velocity, yaw_delta)
         effective_mode = await self._session_store.get_effective_mode(self._session_id)
+        observability = await self._session_store.get_observability(self._session_id)
         spatial_context = await self._session_store.get_spatial_context(
             self._session_id,
             current_yaw=heading_value,
@@ -234,6 +235,17 @@ class GeminiLiveBridge:
             motion_text += ' [POCKET_SENSOR: unavailable; manual fallback active]'
         if edge_reflex_active:
             motion_text += ' [EDGE_HAZARD: local reflex already active. Defer voice; confirm/enrich only if needed.]'
+        sensor_health_score = float(observability.get('sensor_health_score', 1.0) or 1.0)
+        localization_uncertainty_m = float(observability.get('localization_uncertainty_m', 120.0) or 120.0)
+        degraded_mode = bool(observability.get('degraded_mode', False))
+        degraded_reason = str(observability.get('degraded_reason', '') or '')
+        motion_text += (
+            f' [OBSERVABILITY: sensor_health={sensor_health_score:.2f}; '
+            f'localization_uncertainty_m={localization_uncertainty_m:.1f}; '
+            f'degraded={1 if degraded_mode else 0}]'
+        )
+        if degraded_mode and degraded_reason:
+            motion_text += f' [DEGRADED_REASON: {degraded_reason}]'
 
 
         # Avoid repeating identical motion hints too aggressively.

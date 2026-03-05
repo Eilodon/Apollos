@@ -31,7 +31,7 @@ class HazardLoggerTests(unittest.IsolatedAsyncioTestCase):
 
         token = set_current_session('session-abc')
         try:
-            await log_hazard_event(
+            result = await log_hazard_event(
                 hazard_type='vehicle',
                 position_x=0.8,
                 distance_category='very_close',
@@ -45,6 +45,8 @@ class HazardLoggerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(emergency.messages), 1)
         self.assertEqual(emergency.messages[0]['type'], 'HARD_STOP')
         self.assertIn('server_emit_ts_ms', emergency.messages[0])
+        self.assertTrue(bool(result.get('hard_stop_emitted')))
+        self.assertIn(result.get('safety_tier'), {'hard_stop', 'human_escalation'})
 
     async def test_hazard_type_is_normalized_to_vn_taxonomy(self) -> None:
         store = SessionStore(use_firestore=False)
@@ -56,7 +58,7 @@ class HazardLoggerTests(unittest.IsolatedAsyncioTestCase):
 
         token = set_current_session('session-vn')
         try:
-            await log_hazard_event(
+            result = await log_hazard_event(
                 hazard_type='xe máy',
                 position_x=-0.3,
                 distance_category='mid',
@@ -69,6 +71,35 @@ class HazardLoggerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(emergency.messages), 1)
         self.assertEqual(emergency.messages[0]['hazard_type'], 'parked_motorbike')
+        self.assertIn(result.get('safety_tier'), {'voice', 'hard_stop', 'human_escalation'})
+
+    async def test_low_confidence_far_hazard_can_avoid_hard_stop(self) -> None:
+        store = SessionStore(use_firestore=False)
+        registry = WebSocketRegistry()
+        configure_runtime(store, registry)
+
+        emergency = FakeSocket()
+        live = FakeSocket()
+        await registry.register_emergency('session-low-risk', emergency)
+        await registry.register_live('session-low-risk', live)
+
+        token = set_current_session('session-low-risk')
+        try:
+            result = await log_hazard_event(
+                hazard_type='unknown_object',
+                position_x=0.1,
+                distance_category='far',
+                confidence=0.22,
+                description='uncertain object far away',
+                session_id='session-low-risk',
+            )
+        finally:
+            reset_current_session(token)
+
+        self.assertFalse(bool(result.get('hard_stop_emitted')))
+        self.assertEqual(len(emergency.messages), 0)
+        # Can still send softer response through live channel.
+        self.assertTrue(any(msg.get('type') in {'assistant_text', 'semantic_cue'} for msg in live.messages))
 
 
 if __name__ == '__main__':

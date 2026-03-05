@@ -8,6 +8,13 @@ DistanceCategory = Literal['very_close', 'mid', 'far']
 NavigationMode = Literal['NAVIGATION', 'EXPLORE', 'READ', 'QUIET']
 
 
+class SensorHealthPayload(TypedDict, total=False):
+    score: float
+    flags: list[str]
+    degraded: bool
+    source: str
+
+
 class MultimodalFramePayload(TypedDict, total=False):
     type: Literal['multimodal_frame']
     session_id: str
@@ -21,6 +28,9 @@ class MultimodalFramePayload(TypedDict, total=False):
     lat: float
     lng: float
     heading_deg: float
+    location_accuracy_m: float
+    location_age_ms: float
+    sensor_health: SensorHealthPayload
 
 
 class AudioChunkPayload(TypedDict):

@@ -26,6 +26,39 @@ let previousFrame: ImageData | null = null;
 let dynamicInterval = 33;
 let reflexLastProcessTime = performance.now();
 
+// --- Temporal hazard deduplication ---
+const HAZARD_DEDUP_COOLDOWN_MS = 3000;
+interface HazardRecord {
+  id: string;
+  lastEmittedAt: number;
+}
+const recentHazards: HazardRecord[] = [];
+
+function computeHazardId(pattern: ExpansionPattern, lateralBias: number, subtype?: string): string {
+  const lateralBucket = Math.round(lateralBias * 5); // -5..5 buckets
+  return `${subtype || pattern}:${lateralBucket}`;
+}
+
+function isDuplicate(hazardId: string, now: number): boolean {
+  const existing = recentHazards.find((r) => r.id === hazardId);
+  if (existing && now - existing.lastEmittedAt < HAZARD_DEDUP_COOLDOWN_MS) {
+    return true;
+  }
+  return false;
+}
+
+function recordHazard(hazardId: string, now: number): void {
+  const existing = recentHazards.find((r) => r.id === hazardId);
+  if (existing) {
+    existing.lastEmittedAt = now;
+  } else {
+    recentHazards.push({ id: hazardId, lastEmittedAt: now });
+    if (recentHazards.length > 10) {
+      recentHazards.shift();
+    }
+  }
+}
+
 function toGrayLuma(frame: ImageData): Float32Array {
   const gray = new Float32Array(frame.width * frame.height);
   let g = 0;
@@ -204,6 +237,12 @@ function detectFloorDrop(prev: ImageData, curr: ImageData): EdgeHazardPayload | 
     return null;
   }
 
+  const hazardId = computeHazardId('directional', 0, 'floor_drop');
+  if (isDuplicate(hazardId, performance.now())) {
+    return null;
+  }
+  recordHazard(hazardId, performance.now());
+
   return {
     type: 'CRITICAL_EDGE_HAZARD',
     urgency: 'high',
@@ -253,7 +292,11 @@ self.onmessage = (event: MessageEvent<{ currentFrame?: ImageData; riskScore?: nu
   const sustainedThreat = isSustainedThreat(pattern);
 
   if (immediateThreat || sustainedThreat) {
-    self.postMessage(buildHazardPayload(centerDiff, avgDiff, pattern, lateralBias));
+    const hazardId = computeHazardId(pattern, lateralBias);
+    if (!isDuplicate(hazardId, performance.now())) {
+      recordHazard(hazardId, performance.now());
+      self.postMessage(buildHazardPayload(centerDiff, avgDiff, pattern, lateralBias));
+    }
   }
 
   previousFrame = currentFrame;

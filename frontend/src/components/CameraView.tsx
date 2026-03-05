@@ -8,7 +8,7 @@ interface CameraViewProps {
 
 export function CameraView({ videoRef, connectionStatus, motionState }: CameraViewProps): JSX.Element {
   return (
-    <section className="camera-view" aria-label="Camera viewfinder">
+    <section className="camera-view" aria-hidden="true">
       <video ref={videoRef} className="camera-feed" autoPlay playsInline muted />
       <div className="camera-hud">
         <span className="chip">{connectionStatus}</span>

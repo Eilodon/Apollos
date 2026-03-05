@@ -11,7 +11,7 @@ interface TranscriptPanelProps {
 
 export function TranscriptPanel({ entries }: TranscriptPanelProps): JSX.Element {
   return (
-    <section className="transcript-panel" aria-label="Live transcript">
+    <section className="transcript-panel" aria-label="Live transcript" aria-live="polite" aria-atomic="false" aria-relevant="additions text">
       <h2>Transcript</h2>
       <ul>
         {entries.slice(-8).map((entry) => (

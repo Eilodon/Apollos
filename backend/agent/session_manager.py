@@ -88,7 +88,15 @@ class SessionState:
     last_location_lookup_epoch: float = 0.0
     edge_hazard_until_epoch: float = 0.0
     edge_hazard_type: str = ''
+    sensor_health_score: float = 1.0
+    sensor_health_flags: list[str] = field(default_factory=list)
+    localization_uncertainty_m: float = 120.0
+    degraded_mode: bool = False
+    degraded_reason: str = ''
+    degraded_since_epoch: float = 0.0
+    last_safety_tier: str = 'silent'
     last_persist_epoch: float = 0.0
+    utterance_timestamps: list[float] = field(default_factory=list)
 
 
 class SessionStore:
@@ -107,6 +115,14 @@ class SessionStore:
         self._use_firestore = use_firestore
         self._firestore_client = None
         self._persist_min_interval_s = max(0.2, float(os.getenv('SESSION_PERSIST_MIN_INTERVAL_S', '1.5')))
+        self._sensor_health_degraded_threshold = max(
+            0.2,
+            min(0.9, float(os.getenv('SENSOR_HEALTH_DEGRADED_THRESHOLD', '0.55'))),
+        )
+        self._localization_uncertainty_degraded_m = max(
+            10.0,
+            float(os.getenv('LOCALIZATION_UNCERTAINTY_DEGRADED_M', '45')),
+        )
 
         if self._use_firestore:
             try:
@@ -257,7 +273,17 @@ class SessionStore:
             if state.edge_hazard_until_epoch > time.time()
             else ''
         )
-        return f"Mode={state.mode}; motion={state.motion_state}; last_seen={state.last_seen}{edge_state}"
+        degraded_state = (
+            f"; degraded={state.degraded_reason or 'active'}"
+            if state.degraded_mode
+            else ''
+        )
+        return (
+            f"Mode={state.mode}; motion={state.motion_state}; "
+            f"sensor_health={state.sensor_health_score:.2f}; "
+            f"loc_uncertainty_m={state.localization_uncertainty_m:.1f}; "
+            f"last_seen={state.last_seen}{edge_state}{degraded_state}"
+        )
 
     async def get_spatial_context(
         self,
@@ -383,6 +409,115 @@ class SessionStore:
         state = await self.ensure_session(session_id)
         return state.lat, state.lng, state.heading_deg
 
+    async def get_observability(self, session_id: str) -> dict[str, Any]:
+        state = await self.ensure_session(session_id)
+        return {
+            'sensor_health_score': state.sensor_health_score,
+            'sensor_health_flags': list(state.sensor_health_flags),
+            'localization_uncertainty_m': state.localization_uncertainty_m,
+            'degraded_mode': state.degraded_mode,
+            'degraded_reason': state.degraded_reason,
+            'last_safety_tier': state.last_safety_tier,
+        }
+
+    async def update_observability(
+        self,
+        session_id: str,
+        *,
+        sensor_health_score: float | None = None,
+        sensor_health_flags: list[str] | None = None,
+        localization_uncertainty_m: float | None = None,
+        safety_tier: str | None = None,
+    ) -> dict[str, Any]:
+        state = await self.ensure_session(session_id)
+        should_persist = False
+
+        async with self._lock:
+            score = (
+                float(sensor_health_score)
+                if sensor_health_score is not None
+                else float(state.sensor_health_score)
+            )
+            score = max(0.0, min(1.0, score))
+
+            uncertainty_m = (
+                float(localization_uncertainty_m)
+                if localization_uncertainty_m is not None
+                else float(state.localization_uncertainty_m)
+            )
+            uncertainty_m = max(0.0, min(500.0, uncertainty_m))
+
+            cleaned_flags: list[str]
+            if sensor_health_flags is None:
+                cleaned_flags = list(state.sensor_health_flags)
+            else:
+                cleaned_flags = []
+                for raw in sensor_health_flags[:8]:
+                    normalized = str(raw).strip().lower().replace(' ', '_')
+                    if normalized and normalized not in cleaned_flags:
+                        cleaned_flags.append(normalized)
+
+            degraded_reasons: list[str] = []
+            if score < self._sensor_health_degraded_threshold:
+                degraded_reasons.append('low_sensor_health')
+            if uncertainty_m > self._localization_uncertainty_degraded_m:
+                degraded_reasons.append('high_localization_uncertainty')
+            if any(
+                flag in cleaned_flags
+                for flag in (
+                    'depth_error',
+                    'motion_permission_denied',
+                    'camera_unavailable',
+                    'location_missing',
+                )
+            ):
+                degraded_reasons.append('critical_sensor_gap')
+
+            degraded_mode = bool(degraded_reasons)
+            degraded_reason = ','.join(degraded_reasons)
+            previous_degraded = state.degraded_mode
+            previous_reason = state.degraded_reason
+            previous_score = state.sensor_health_score
+            previous_uncertainty = state.localization_uncertainty_m
+            previous_tier = state.last_safety_tier
+
+            state.sensor_health_score = score
+            state.sensor_health_flags = cleaned_flags
+            state.localization_uncertainty_m = uncertainty_m
+            state.degraded_mode = degraded_mode
+            state.degraded_reason = degraded_reason
+            if safety_tier:
+                state.last_safety_tier = str(safety_tier).strip().lower() or state.last_safety_tier
+            if degraded_mode and not previous_degraded:
+                state.degraded_since_epoch = time.time()
+            if not degraded_mode:
+                state.degraded_since_epoch = 0.0
+            state.last_seen = self._now()
+
+            changed = (
+                (abs(score - previous_score) >= 0.05)
+                or (abs(uncertainty_m - previous_uncertainty) >= 5.0)
+                or (degraded_mode != previous_degraded)
+                or (degraded_reason != previous_reason)
+                or (state.last_safety_tier != previous_tier)
+            )
+
+            if changed:
+                should_persist = self._mark_persist_if_due_locked(state, force=True)
+
+        if should_persist:
+            await self._persist_session(state)
+
+        return {
+            'sensor_health_score': state.sensor_health_score,
+            'sensor_health_flags': list(state.sensor_health_flags),
+            'localization_uncertainty_m': state.localization_uncertainty_m,
+            'degraded_mode': state.degraded_mode,
+            'degraded_reason': state.degraded_reason,
+            'degraded_changed': state.degraded_mode != previous_degraded,
+            'last_safety_tier': state.last_safety_tier,
+        }
+
     async def mark_edge_hazard(
         self,
         session_id: str,
@@ -404,6 +539,42 @@ class SessionStore:
         state = await self.ensure_session(session_id)
         reference = now_epoch if now_epoch is not None else time.time()
         return state.edge_hazard_until_epoch > reference
+
+    # --- Utterance Budget ---
+    UTTERANCE_WINDOW_S = 10.0
+    UTTERANCE_BUDGET_FAST_MOTION = 2
+    UTTERANCE_BUDGET_NORMAL = 5
+
+    async def should_allow_utterance(
+        self,
+        session_id: str,
+        *,
+        is_hard_stop: bool = False,
+    ) -> bool:
+        """Return True if an assistant_text message should be emitted.
+
+        Hard-stop messages always pass. For normal voice, a rolling window
+        based on motion state limits the number of utterances.
+        """
+        if is_hard_stop:
+            return True
+        state = await self.ensure_session(session_id)
+        now = time.time()
+        async with self._lock:
+            # Prune stale entries.
+            cutoff = now - self.UTTERANCE_WINDOW_S
+            state.utterance_timestamps = [
+                ts for ts in state.utterance_timestamps if ts > cutoff
+            ]
+            budget = (
+                self.UTTERANCE_BUDGET_FAST_MOTION
+                if state.motion_state in ('walking_fast', 'running')
+                else self.UTTERANCE_BUDGET_NORMAL
+            )
+            if len(state.utterance_timestamps) >= budget:
+                return False
+            state.utterance_timestamps.append(now)
+            return True
 
     @staticmethod
     def _parse_iso_epoch(value: Any) -> float:
@@ -718,6 +889,13 @@ class SessionStore:
             ],
             'edge_hazard_until_epoch': state.edge_hazard_until_epoch,
             'edge_hazard_type': state.edge_hazard_type,
+            'sensor_health_score': state.sensor_health_score,
+            'sensor_health_flags': list(state.sensor_health_flags),
+            'localization_uncertainty_m': state.localization_uncertainty_m,
+            'degraded_mode': state.degraded_mode,
+            'degraded_reason': state.degraded_reason,
+            'degraded_since_epoch': state.degraded_since_epoch,
+            'last_safety_tier': state.last_safety_tier,
         }
         await asyncio.to_thread(
             self._firestore_client.collection('sessions').document(state.session_id).set,

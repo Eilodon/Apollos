@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
+from typing import Any
 
 from ..session_manager import SessionStore
 from ..websocket_handler import WebSocketRegistry
@@ -11,15 +12,24 @@ from ..websocket_handler import WebSocketRegistry
 class ToolRuntime:
     session_store: SessionStore
     websocket_registry: WebSocketRegistry
+    human_fallback_manager: Any | None = None
 
 
 _runtime: ToolRuntime | None = None
 _current_session: ContextVar[str | None] = ContextVar('current_session', default=None)
 
 
-def configure_runtime(session_store: SessionStore, websocket_registry: WebSocketRegistry) -> None:
+def configure_runtime(
+    session_store: SessionStore,
+    websocket_registry: WebSocketRegistry,
+    human_fallback_manager: Any | None = None,
+) -> None:
     global _runtime
-    _runtime = ToolRuntime(session_store=session_store, websocket_registry=websocket_registry)
+    _runtime = ToolRuntime(
+        session_store=session_store,
+        websocket_registry=websocket_registry,
+        human_fallback_manager=human_fallback_manager,
+    )
 
 
 def get_runtime() -> ToolRuntime:

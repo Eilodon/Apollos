@@ -4,6 +4,8 @@ export interface LocationContextSnapshot {
   lat: number;
   lng: number;
   headingDeg?: number;
+  accuracyM: number;
+  recordedAtMs: number;
 }
 
 export function useLocationContext(enabled: boolean): LocationContextSnapshot | null {
@@ -16,9 +18,15 @@ export function useLocationContext(enabled: boolean): LocationContextSnapshot | 
 
     const watchId = navigator.geolocation.watchPosition(
       (position) => {
+        const now = Date.now();
         setSnapshot((prev) => ({
           lat: position.coords.latitude,
           lng: position.coords.longitude,
+          accuracyM:
+            typeof position.coords.accuracy === 'number' && !Number.isNaN(position.coords.accuracy)
+              ? Math.max(0, position.coords.accuracy)
+              : prev?.accuracyM ?? 120,
+          recordedAtMs: now,
           headingDeg:
             typeof position.coords.heading === 'number' && !Number.isNaN(position.coords.heading)
               ? position.coords.heading

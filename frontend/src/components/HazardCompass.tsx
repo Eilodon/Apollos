@@ -8,7 +8,7 @@ export function HazardCompass({ positionX, visible }: HazardCompassProps): JSX.E
   const percentage = ((clamped + 1) / 2) * 100;
 
   return (
-    <div className="hazard-compass" aria-hidden={!visible}>
+    <div className="hazard-compass" aria-hidden="true">
       <div className="hazard-arc" />
       {visible ? <div className="hazard-dot" style={{ left: `${percentage}%` }} /> : null}
     </div>

@@ -1,4 +1,5 @@
 /// <reference lib="webworker" />
+export {};
 
 declare const tf: any;
 declare const tflite: any;
@@ -13,6 +14,8 @@ interface DepthFrameMessage {
   type: 'depth_frame';
   currentFrame?: ImageData;
   riskScore?: number;
+  carryMode?: 'hand_held' | 'necklace' | 'chest_clip' | 'pocket';
+  gyroMagnitude?: number;
 }
 
 type InboundMessage = DepthInitMessage | DepthFrameMessage;
@@ -188,10 +191,26 @@ function toLumaGrid(frame: ImageData): Float32Array {
   return luma;
 }
 
-function detectDropAhead(depth: Float32Array, width: number, height: number): DropAheadPayload | null {
+function detectDropAhead(
+  depth: Float32Array,
+  width: number,
+  height: number,
+  opts?: {
+    carryMode?: 'hand_held' | 'necklace' | 'chest_clip' | 'pocket';
+    gyroMagnitude?: number;
+  },
+): DropAheadPayload | null {
+  const carryMode = opts?.carryMode || 'necklace';
+  const gyroMagnitude = Number.isFinite(opts?.gyroMagnitude) ? Number(opts?.gyroMagnitude) : 0;
+  const modeRoi = {
+    hand_held: { yStartRatio: 0.60, minConfidence: 0.55, minRatio: 0.10 },
+    necklace: { yStartRatio: 0.50, minConfidence: 0.62, minRatio: 0.13 },
+    chest_clip: { yStartRatio: 0.48, minConfidence: 0.60, minRatio: 0.12 },
+    pocket: { yStartRatio: 0.62, minConfidence: 0.74, minRatio: 0.16 },
+  }[carryMode];
   const xStart = Math.floor(width * 0.15);
   const xEnd = Math.floor(width * 0.85);
-  const yStart = Math.floor(height * 0.52);
+  const yStart = Math.floor(height * modeRoi.yStartRatio);
   const yEnd = height - 1;
 
   let discontinuityCount = 0;
@@ -221,7 +240,13 @@ function detectDropAhead(depth: Float32Array, width: number, height: number): Dr
   const discontinuityRatio = discontinuityCount / sampleCount;
   const confidence = Math.min(1, discontinuityRatio * 2.2 + confidenceSum / sampleCount);
 
-  if (confidence < 0.58 || discontinuityRatio < 0.12) {
+  // Necklace/chest carry can introduce pendulum-like oscillation.
+  const pendulumPenalty = (carryMode === 'necklace' || carryMode === 'chest_clip')
+    ? Math.min(0.10, Math.max(0, (gyroMagnitude - 110) / 1200))
+    : 0;
+  const stabilizedConfidence = Math.max(0, confidence - pendulumPenalty);
+
+  if (stabilizedConfidence < modeRoi.minConfidence || discontinuityRatio < modeRoi.minRatio) {
     return null;
   }
 
@@ -233,7 +258,7 @@ function detectDropAhead(depth: Float32Array, width: number, height: number): Dr
     hazard_type: 'DROP_AHEAD',
     distance: 'very_close',
     positionX,
-    confidence,
+    confidence: stabilizedConfidence,
     source: modelAvailable ? 'tflite' : 'heuristic',
   };
 }
@@ -294,7 +319,14 @@ function inferHeuristicDepth(frame: ImageData): Float32Array {
   return depth;
 }
 
-async function processDepthFrame(frame: ImageData, riskScore: number): Promise<void> {
+async function processDepthFrame(
+  frame: ImageData,
+  riskScore: number,
+  opts?: {
+    carryMode?: 'hand_held' | 'necklace' | 'chest_clip' | 'pocket';
+    gyroMagnitude?: number;
+  },
+): Promise<void> {
   const dynamicInterval = Math.max(50, BASE_INTERVAL_MS - (riskScore - 1) * 15);
   const now = performance.now();
   if (now - depthLastProcessTime < dynamicInterval) {
@@ -307,7 +339,7 @@ async function processDepthFrame(frame: ImageData, riskScore: number): Promise<v
     depthMap = inferHeuristicDepth(frame);
   }
 
-  const hazard = detectDropAhead(depthMap, frame.width, frame.height);
+  const hazard = detectDropAhead(depthMap, frame.width, frame.height, opts);
   if (hazard) {
     self.postMessage(hazard);
   }
@@ -325,6 +357,9 @@ self.onmessage = (event: MessageEvent<InboundMessage>) => {
 
   if (payload.type === 'depth_frame' && payload.currentFrame) {
     const riskScore = Number.isFinite(payload.riskScore) ? Number(payload.riskScore) : 1;
-    void processDepthFrame(payload.currentFrame, riskScore);
+    void processDepthFrame(payload.currentFrame, riskScore, {
+      carryMode: payload.carryMode,
+      gyroMagnitude: payload.gyroMagnitude,
+    });
   }
 };

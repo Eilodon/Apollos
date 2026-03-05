@@ -30,9 +30,21 @@ async def escalate_mode_if_stressed(
     )
     await runtime.session_store.log_emotion(session_id, state=normalized_state, confidence=confidence)
 
-    return {
+    human_help_link = ''
+    if normalized_state == 'panicked' and confidence >= 0.9:
+        manager = runtime.human_fallback_manager
+        if manager is not None:
+            human_help_link = manager.build_help_link(session_id, reason='panic_detected')
+            await manager.notify_contacts(human_help_link, reason='panic_detected')
+        else:
+            human_help_link = await runtime.session_store.build_human_help_link(session_id)
+
+    result = {
         'action': 'set_mode',
         'new_mode': 'NAVIGATION',
         'reason': 'vocal_distress_detected',
         'revert_after_seconds': 120,
     }
+    if human_help_link:
+        result['human_help_link'] = human_help_link
+    return result

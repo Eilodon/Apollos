@@ -12,6 +12,7 @@ interface UseARIAOptions {
   sessionId: string;
   clientId?: string;
   authToken?: string;
+  tokenProvider?: () => Promise<string | undefined>;
   onBackendMessage?: (message: BackendToClientMessage) => void;
   onHardStop?: (message: HardStopMessage) => void;
 }
@@ -28,6 +29,15 @@ interface UseARIAResult {
 
 const MAX_RETRIES = 6;
 const MAX_PENDING_EDGE_HAZARDS = 8;
+
+function encodeBase64Url(value: string): string {
+  const bytes = new TextEncoder().encode(value);
+  let binary = '';
+  bytes.forEach((byte) => {
+    binary += String.fromCharCode(byte);
+  });
+  return window.btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
 
 function buildWsUrl(path: string, params?: Record<string, string | undefined>): string {
   const configuredBase = import.meta.env.VITE_BACKEND_WS_BASE as string | undefined;
@@ -49,7 +59,15 @@ function buildWsUrl(path: string, params?: Record<string, string | undefined>): 
   return url.toString();
 }
 
-export function useARIA({ sessionId, clientId, authToken, onBackendMessage, onHardStop }: UseARIAOptions): UseARIAResult {
+function buildWsProtocols(token?: string): string[] {
+  const protocols = ['apollos.v1'];
+  if (token && token.trim()) {
+    protocols.push(`authb64.${encodeBase64Url(token.trim())}`);
+  }
+  return protocols;
+}
+
+export function useARIA({ sessionId, clientId, authToken, tokenProvider, onBackendMessage, onHardStop }: UseARIAOptions): UseARIAResult {
   const [status, setStatus] = useState<UseARIAResult['status']>('disconnected');
 
   const liveSocketRef = useRef<WebSocket | null>(null);
@@ -60,10 +78,7 @@ export function useARIA({ sessionId, clientId, authToken, onBackendMessage, onHa
   const emergencyRetryTimer = useRef<number | null>(null);
   const shouldReconnectRef = useRef(false);
   const staticWsToken = (import.meta.env.VITE_WS_AUTH_TOKEN as string | undefined)?.trim();
-  const oidcTokenStorageKey = (
-    (import.meta.env.VITE_OIDC_TOKEN_STORAGE_KEY as string | undefined)?.trim()
-    || 'apollos_oidc_token'
-  );
+  const queryTokenFallback = (import.meta.env.VITE_WS_TOKEN_QUERY_FALLBACK as string | undefined)?.trim() === '1';
 
   const handleInboundMessage = useCallback((payload: unknown) => {
     if (!payload || typeof payload !== 'object') {
@@ -82,7 +97,7 @@ export function useARIA({ sessionId, clientId, authToken, onBackendMessage, onHa
       return;
     }
 
-    if (type === 'assistant_text' || type === 'audio_chunk' || type === 'connection_state' || type === 'semantic_cue') {
+    if (type === 'assistant_text' || type === 'audio_chunk' || type === 'connection_state' || type === 'semantic_cue' || type === 'safety_state') {
       onBackendMessage?.(payload as BackendToClientMessage);
     }
   }, [onBackendMessage, onHardStop]);
@@ -98,23 +113,25 @@ export function useARIA({ sessionId, clientId, authToken, onBackendMessage, onHa
     }
   }, []);
 
-  const resolveWsToken = useCallback((): string | undefined => {
+  const resolveWsToken = useCallback(async (): Promise<string | undefined> => {
     if (authToken && authToken.trim()) {
       return authToken.trim();
     }
-    try {
-      const stored = localStorage.getItem(oidcTokenStorageKey);
-      if (stored && stored.trim()) {
-        return stored.trim();
+    if (tokenProvider) {
+      try {
+        const provided = await tokenProvider();
+        if (provided && provided.trim()) {
+          return provided.trim();
+        }
+      } catch {
+        // Token provider may fail transiently while broker refresh is in-flight.
       }
-    } catch {
-      // localStorage may be unavailable in hardened browser modes.
     }
     if (staticWsToken && staticWsToken.trim()) {
       return staticWsToken.trim();
     }
     return undefined;
-  }, [authToken, oidcTokenStorageKey, staticWsToken]);
+  }, [authToken, staticWsToken, tokenProvider]);
 
   const disconnect = useCallback(() => {
     shouldReconnectRef.current = false;
@@ -135,44 +152,98 @@ export function useARIA({ sessionId, clientId, authToken, onBackendMessage, onHa
   }, [clearReconnectTimer]);
 
   const connect = useCallback(() => {
-    if (liveSocketRef.current?.readyState === WebSocket.OPEN || liveSocketRef.current?.readyState === WebSocket.CONNECTING) {
-      liveSocketRef.current.close(1000, 'reconnecting');
-    }
-
-    shouldReconnectRef.current = true;
-    clearReconnectTimer();
-
-    setStatus(reconnectAttempts.current > 0 ? 'reconnecting' : 'connecting');
-    const wsToken = resolveWsToken();
-    const liveUrl = buildWsUrl(`/live/${sessionId}`, { client_id: clientId, token: wsToken });
-    const emergencyUrl = buildWsUrl(`/emergency/${sessionId}`, { client_id: clientId, token: wsToken });
-
-    const openEmergencyChannel = () => {
-      if (!shouldReconnectRef.current) {
-        return;
-      }
-      if (
-        emergencySocketRef.current?.readyState === WebSocket.OPEN ||
-        emergencySocketRef.current?.readyState === WebSocket.CONNECTING
-      ) {
-        return;
+    void (async () => {
+      if (liveSocketRef.current?.readyState === WebSocket.OPEN || liveSocketRef.current?.readyState === WebSocket.CONNECTING) {
+        liveSocketRef.current.close(1000, 'reconnecting');
       }
 
-      const emergencySocket = new WebSocket(emergencyUrl);
-      emergencySocketRef.current = emergencySocket;
+      shouldReconnectRef.current = true;
+      clearReconnectTimer();
 
-      emergencySocket.onopen = () => {
-        emergencySocket.send(JSON.stringify({ type: 'heartbeat', session_id: sessionId, timestamp: new Date().toISOString() }));
-        if (pendingEdgeHazardsRef.current.length > 0) {
-          const pending = [...pendingEdgeHazardsRef.current];
-          pendingEdgeHazardsRef.current = [];
-          pending.forEach((message) => {
-            emergencySocket.send(JSON.stringify(message));
-          });
+      setStatus(reconnectAttempts.current > 0 ? 'reconnecting' : 'connecting');
+      const wsToken = await resolveWsToken();
+      const wsProtocols = buildWsProtocols(wsToken);
+      const liveUrl = buildWsUrl(
+        `/live/${sessionId}`,
+        { client_id: clientId, token: queryTokenFallback ? wsToken : undefined },
+      );
+      const emergencyUrl = buildWsUrl(
+        `/emergency/${sessionId}`,
+        { client_id: clientId, token: queryTokenFallback ? wsToken : undefined },
+      );
+
+      const openEmergencyChannel = () => {
+        if (!shouldReconnectRef.current) {
+          return;
         }
+        if (
+          emergencySocketRef.current?.readyState === WebSocket.OPEN ||
+          emergencySocketRef.current?.readyState === WebSocket.CONNECTING
+        ) {
+          return;
+        }
+
+        const emergencySocket = new WebSocket(emergencyUrl, wsProtocols);
+        emergencySocketRef.current = emergencySocket;
+
+        emergencySocket.onopen = () => {
+          emergencySocket.send(JSON.stringify({ type: 'heartbeat', session_id: sessionId, timestamp: new Date().toISOString() }));
+          if (pendingEdgeHazardsRef.current.length > 0) {
+            const pending = [...pendingEdgeHazardsRef.current];
+            pendingEdgeHazardsRef.current = [];
+            pending.forEach((message) => {
+              emergencySocket.send(JSON.stringify(message));
+            });
+          }
+        };
+
+        emergencySocket.onmessage = (event) => {
+          let data: unknown;
+          try {
+            data = JSON.parse(event.data);
+          } catch {
+            return;
+          }
+          handleInboundMessage(data);
+        };
+
+        emergencySocket.onclose = () => {
+          emergencySocketRef.current = null;
+          if (!shouldReconnectRef.current) {
+            return;
+          }
+          if (liveSocketRef.current?.readyState !== WebSocket.OPEN) {
+            return;
+          }
+          if (emergencyRetryTimer.current !== null) {
+            return;
+          }
+          emergencyRetryTimer.current = window.setTimeout(() => {
+            emergencyRetryTimer.current = null;
+            openEmergencyChannel();
+          }, 750);
+        };
+
+        emergencySocket.onerror = () => {
+          emergencySocket.close();
+        };
       };
 
-      emergencySocket.onmessage = (event) => {
+      if (emergencySocketRef.current?.readyState === WebSocket.OPEN || emergencySocketRef.current?.readyState === WebSocket.CONNECTING) {
+        emergencySocketRef.current.close(1000, 'reconnecting');
+        emergencySocketRef.current = null;
+      }
+
+      const liveSocket = new WebSocket(liveUrl, wsProtocols);
+      liveSocketRef.current = liveSocket;
+
+      liveSocket.onopen = () => {
+        reconnectAttempts.current = 0;
+        setStatus('connected');
+        openEmergencyChannel();
+      };
+
+      liveSocket.onmessage = (event) => {
         let data: unknown;
         try {
           data = JSON.parse(event.data);
@@ -182,87 +253,42 @@ export function useARIA({ sessionId, clientId, authToken, onBackendMessage, onHa
         handleInboundMessage(data);
       };
 
-      emergencySocket.onclose = () => {
-        emergencySocketRef.current = null;
+      const onClose = () => {
+        if (emergencySocketRef.current) {
+          emergencySocketRef.current.close(1000, 'live_disconnected');
+          emergencySocketRef.current = null;
+        }
+
+        // Manage reconnect state
         if (!shouldReconnectRef.current) {
+          setStatus('disconnected');
           return;
         }
-        if (liveSocketRef.current?.readyState !== WebSocket.OPEN) {
+        if (reconnectAttempts.current >= MAX_RETRIES) {
+          shouldReconnectRef.current = false;
+          setStatus('disconnected');
           return;
         }
-        if (emergencyRetryTimer.current !== null) {
+        if (reconnectTimer.current !== null) {
           return;
         }
-        emergencyRetryTimer.current = window.setTimeout(() => {
-          emergencyRetryTimer.current = null;
-          openEmergencyChannel();
-        }, 750);
+
+        reconnectAttempts.current += 1;
+        setStatus('reconnecting');
+        const delay = Math.min(1000 * 2 ** reconnectAttempts.current, 8000);
+        reconnectTimer.current = window.setTimeout(() => {
+          reconnectTimer.current = null;
+          connect();
+        }, delay);
       };
 
-      emergencySocket.onerror = () => {
-        emergencySocket.close();
+      liveSocket.onclose = onClose;
+
+      liveSocket.onerror = () => {
+        liveSocket.close();
       };
-    };
-
-    if (emergencySocketRef.current?.readyState === WebSocket.OPEN || emergencySocketRef.current?.readyState === WebSocket.CONNECTING) {
-      emergencySocketRef.current.close(1000, 'reconnecting');
-      emergencySocketRef.current = null;
-    }
-
-    const liveSocket = new WebSocket(liveUrl);
-    liveSocketRef.current = liveSocket;
-
-    liveSocket.onopen = () => {
-      reconnectAttempts.current = 0;
-      setStatus('connected');
-      openEmergencyChannel();
-    };
-
-    liveSocket.onmessage = (event) => {
-      let data: unknown;
-      try {
-        data = JSON.parse(event.data);
-      } catch {
-        return;
-      }
-      handleInboundMessage(data);
-    };
-
-    const onClose = () => {
-      if (emergencySocketRef.current) {
-        emergencySocketRef.current.close(1000, 'live_disconnected');
-        emergencySocketRef.current = null;
-      }
-
-      // Manage reconnect state
-      if (!shouldReconnectRef.current) {
-        setStatus('disconnected');
-        return;
-      }
-      if (reconnectAttempts.current >= MAX_RETRIES) {
-        shouldReconnectRef.current = false;
-        setStatus('disconnected');
-        return;
-      }
-      if (reconnectTimer.current !== null) {
-        return;
-      }
-
-      reconnectAttempts.current += 1;
-      setStatus('reconnecting');
-      const delay = Math.min(1000 * 2 ** reconnectAttempts.current, 8000);
-      reconnectTimer.current = window.setTimeout(() => {
-        reconnectTimer.current = null;
-        connect();
-      }, delay);
-    };
-
-    liveSocket.onclose = onClose;
-
-    liveSocket.onerror = () => {
-      liveSocket.close();
-    };
-  }, [clearReconnectTimer, clientId, handleInboundMessage, resolveWsToken, sessionId]);
+    })();
+  }, [clearReconnectTimer, clientId, handleInboundMessage, queryTokenFallback, resolveWsToken, sessionId]);
 
   const sendFrame = useCallback(
     (message: Omit<MultimodalFrameMessage, 'type' | 'session_id'>) => {

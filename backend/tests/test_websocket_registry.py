@@ -7,7 +7,11 @@ except ModuleNotFoundError:  # pragma: no cover - package-style fallback
 
 
 class FakeSocket:
+    def __init__(self) -> None:
+        self.messages: list[dict] = []
+
     async def send_json(self, _payload):
+        self.messages.append(_payload)
         return None
 
 
@@ -83,6 +87,26 @@ class WebSocketRegistryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(ok_live)
         self.assertFalse(ok_emergency)
         self.assertIn('mismatch', reason_emergency)
+
+    async def test_help_viewers_receive_relay_payload(self) -> None:
+        registry = WebSocketRegistry()
+        viewer_a = FakeSocket()
+        viewer_b = FakeSocket()
+
+        await registry.register_help_viewer('session-help', viewer_a, viewer_id='viewer-a')
+        await registry.register_help_viewer('session-help', viewer_b, viewer_id='viewer-b')
+        delivered = await registry.send_help(
+            'session-help',
+            {
+                'type': 'help_frame',
+                'session_id': 'session-help',
+                'frame_jpeg_base64': 'abc',
+            },
+        )
+
+        self.assertEqual(delivered, 2)
+        self.assertEqual(len(viewer_a.messages), 1)
+        self.assertEqual(len(viewer_b.messages), 1)
 
 
 if __name__ == '__main__':

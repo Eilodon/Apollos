@@ -57,6 +57,20 @@ def main() -> None:
         ],
         env,
     )
+    failures += run_step(
+        'Safety regression gate',
+        [
+            py,
+            'scripts/safety_regression_gate.py',
+            '--iterations',
+            str(args.iterations),
+            '--budget-ms',
+            str(args.budget_ms),
+            '--python-bin',
+            py,
+        ],
+        env,
+    )
     failures += run_step('Internal reconnect test', [py, 'scripts/test_reconnect_internal.py'], env)
 
     if args.asgi:

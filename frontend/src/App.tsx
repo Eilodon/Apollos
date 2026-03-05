@@ -1,6 +1,7 @@
 import { TouchEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { CameraView } from './components/CameraView';
 import { HazardCompass } from './components/HazardCompass';
+import { HelperLiveView } from './components/HelperLiveView';
 import { ModeIndicator } from './components/ModeIndicator';
 import { OLEDBlackOverlay } from './components/OLEDBlackOverlay';
 import { TranscriptPanel } from './components/TranscriptPanel';
@@ -8,24 +9,36 @@ import { useARIA } from './hooks/useARIA';
 import { useAudioStream } from './hooks/useAudioStream';
 import { useBatteryGovernor } from './hooks/useBatteryGovernor';
 import { useCamera } from './hooks/useCamera';
+import type { DeterministicScanResult, FrameQualityResult } from './hooks/useCamera';
 import { useCarryMode } from './hooks/useCarryMode';
 import { useLocationContext } from './hooks/useLocationContext';
 import { useMotionSensor } from './hooks/useMotionSensor';
 import { usePocketMode } from './hooks/usePocketMode';
+import { useSensorHealth } from './hooks/useSensorHealth';
 import { useSmartCane } from './hooks/useSmartCane';
 import { useWakeLock } from './hooks/useWakeLock';
 import { AudioCache } from './services/audioCache';
 import type { CarryMode } from './services/carryMode';
+import { OIDCBrokerClient } from './services/oidcBroker';
 import { SpatialAudioEngine } from './services/spatialAudioEngine';
 import { vibrateHardStop, vibrateReconnect, vibrateSoftConfirm } from './services/haptics';
 import { getPlatformCapabilities } from './services/platformDetect';
-import { BackendToClientMessage, HardStopMessage, NavigationMode, SemanticCueMessage } from './types/contracts';
+import { BackendToClientMessage, HardStopMessage, NavigationMode, SafetyStateMessage, SafetyTier, SemanticCueMessage } from './types/contracts';
 
 type TranscriptEntry = {
   id: string;
   role: 'assistant' | 'user' | 'system';
   text: string;
   ts: string;
+};
+
+type SafetyRuntimeState = {
+  degraded: boolean;
+  reason: string;
+  sensorHealthScore: number;
+  sensorHealthFlags: string[];
+  localizationUncertaintyM: number;
+  tier: SafetyTier;
 };
 
 const MODE_ORDER: NavigationMode[] = ['NAVIGATION', 'EXPLORE', 'READ', 'QUIET'];
@@ -85,10 +98,40 @@ function distanceMeters(lat1: number, lng1: number, lat2: number, lng2: number):
   return earthRadiusM * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
+function deriveAuthBaseFromWsBase(): string {
+  const configuredWsBase = (import.meta.env.VITE_BACKEND_WS_BASE as string | undefined)?.trim();
+  const configuredAuthBase = (import.meta.env.VITE_AUTH_BROKER_BASE as string | undefined)?.trim();
+  if (configuredAuthBase) {
+    return configuredAuthBase;
+  }
+  if (configuredWsBase) {
+    try {
+      const wsUrl = new URL(configuredWsBase, window.location.href);
+      const httpProtocol = wsUrl.protocol === 'wss:' ? 'https:' : wsUrl.protocol === 'ws:' ? 'http:' : wsUrl.protocol;
+      return `${httpProtocol}//${wsUrl.host}/auth`;
+    } catch {
+      // Fall back below.
+    }
+  }
+  return `${window.location.origin}/auth`;
+}
+
 export default function App(): JSX.Element {
+  const helpTicket = useMemo(() => new URLSearchParams(window.location.search).get('help_ticket')?.trim() || '', []);
+  if (helpTicket) {
+    return <HelperLiveView helpTicket={helpTicket} />;
+  }
+
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const sessionId = useMemo(() => getOrCreateStableId(SESSION_ID_KEY, 'session'), []);
   const clientId = useMemo(() => getOrCreateStableId(CLIENT_ID_KEY, 'client'), []);
+  const brokerEnabled = ((import.meta.env.VITE_ENABLE_OIDC_BROKER as string | undefined)?.trim() || '1') !== '0';
+  const brokerBootstrapToken = (import.meta.env.VITE_OIDC_BOOTSTRAP_TOKEN as string | undefined)?.trim();
+  const brokerAuthBase = useMemo(() => deriveAuthBaseFromWsBase(), []);
+  const oidcBrokerClient = useMemo(
+    () => new OIDCBrokerClient({ authBaseUrl: brokerAuthBase, bootstrapOidcToken: brokerBootstrapToken }),
+    [brokerAuthBase, brokerBootstrapToken],
+  );
 
   const [navigationMode, setNavigationMode] = useState<NavigationMode>('NAVIGATION');
   const [transcriptEntries, setTranscriptEntries] = useState<TranscriptEntry[]>([]);
@@ -100,6 +143,17 @@ export default function App(): JSX.Element {
   const [manualPocketMode, setManualPocketMode] = useState(false);
   const [pocketSensorUnavailable, setPocketSensorUnavailable] = useState(false);
   const [indoorLikely, setIndoorLikely] = useState(false);
+  const [showOledOverlay, setShowOledOverlay] = useState(false);
+  const [motionPermissionDenied, setMotionPermissionDenied] = useState(false);
+  const [depthPipelineState, setDepthPipelineState] = useState<'unknown' | 'loading' | 'ready' | 'fallback' | 'error'>('unknown');
+  const [safetyRuntimeState, setSafetyRuntimeState] = useState<SafetyRuntimeState>({
+    degraded: false,
+    reason: '',
+    sensorHealthScore: 1,
+    sensorHealthFlags: [],
+    localizationUncertaintyM: 0,
+    tier: 'silent',
+  });
 
   const audioCacheRef = useRef(new AudioCache(3));
   const spatialRef = useRef<SpatialAudioEngine | null>(null);
@@ -121,6 +175,11 @@ export default function App(): JSX.Element {
   });
   const lastDepthStatusRef = useRef('');
   const lastSmartCaneErrorRef = useRef('');
+  const lastSafetyNoticeSignatureRef = useRef('');
+  const lastDeterministicScanSignatureRef = useRef('');
+  const lastDeterministicStatusRef = useRef('');
+  const consecutiveBadFramesRef = useRef(0);
+  const lastFrameQualityAlertRef = useRef('');
 
   const {
     motionSnapshot,
@@ -151,6 +210,14 @@ export default function App(): JSX.Element {
   });
   const locationSnapshot = useLocationContext(sessionActive);
   const battery = useBatteryGovernor(sessionActive);
+  const sensorHealth = useSensorHealth({
+    sessionActive,
+    pocketSensorAvailable,
+    motionPermissionDenied,
+    locationSnapshot,
+    battery,
+    depthState: depthPipelineState,
+  });
   const {
     supported: smartCaneSupported,
     connected: smartCaneConnected,
@@ -209,6 +276,22 @@ export default function App(): JSX.Element {
 
     if (message.type === 'connection_state' && message.state === 'reconnecting') {
       vibrateReconnect();
+      return;
+    }
+
+    if (message.type === 'safety_state') {
+      const safety = message as SafetyStateMessage;
+      setSafetyRuntimeState({
+        degraded: Boolean(safety.degraded),
+        reason: String(safety.reason ?? ''),
+        sensorHealthScore: Number(safety.sensor_health_score ?? 1),
+        sensorHealthFlags: Array.isArray(safety.sensor_health_flags) ? safety.sensor_health_flags.map((item) => String(item)) : [],
+        localizationUncertaintyM: Number(safety.localization_uncertainty_m ?? 0),
+        tier: (String(safety.tier || 'silent') as SafetyTier),
+      });
+      if (safety.degraded) {
+        vibrateReconnect();
+      }
     }
   }, [hazardPosition]);
 
@@ -237,6 +320,13 @@ export default function App(): JSX.Element {
     });
   }, [sendDirectional, sendHazardPattern, smartCaneConnected]);
 
+  const tokenProvider = useCallback(async (): Promise<string | undefined> => {
+    if (!brokerEnabled) {
+      return undefined;
+    }
+    return oidcBrokerClient.getWsAccessToken();
+  }, [brokerEnabled, oidcBrokerClient]);
+
   const {
     status: ariaStatus,
     connect: ariaConnect,
@@ -248,6 +338,7 @@ export default function App(): JSX.Element {
   } = useARIA({
     sessionId,
     clientId,
+    tokenProvider,
     onBackendMessage,
     onHardStop,
   });
@@ -272,6 +363,7 @@ export default function App(): JSX.Element {
       return;
     }
     lastDepthStatusRef.current = signature;
+    setDepthPipelineState(state);
     if (state === 'ready') {
       setTranscriptEntries((prev) => {
         const updated = [...prev, createEntry('system', 'Depth model ready for drop detection.')];
@@ -290,6 +382,46 @@ export default function App(): JSX.Element {
     }
   }, []);
 
+  const onDeterministicStatus = useCallback((state: 'ready' | 'fallback' | 'disabled', detail: string) => {
+    const signature = `${state}:${detail}`;
+    if (signature === lastDeterministicStatusRef.current) {
+      return;
+    }
+    lastDeterministicStatusRef.current = signature;
+    const text = state === 'ready'
+      ? 'Deterministic barcode scanner ready.'
+      : `Deterministic scanner ${state}: ${detail}`;
+    setTranscriptEntries((prev) => {
+      const updated = [...prev, createEntry('system', text)];
+      return updated.length > MAX_TRANSCRIPT_ENTRIES ? updated.slice(-MAX_TRANSCRIPT_ENTRIES) : updated;
+    });
+  }, []);
+
+  const onDeterministicScan = useCallback((result: DeterministicScanResult) => {
+    const value = result.value.trim();
+    if (!value) {
+      return;
+    }
+    const signature = `${result.task}:${result.format || ''}:${value}`;
+    if (signature === lastDeterministicScanSignatureRef.current) {
+      return;
+    }
+    lastDeterministicScanSignatureRef.current = signature;
+    const text = `Deterministic scan: ${result.format ? `${result.format} ` : ''}${value}`;
+    setTranscriptEntries((prev) => {
+      const updated = [...prev, createEntry('system', text)];
+      return updated.length > MAX_TRANSCRIPT_ENTRIES ? updated.slice(-MAX_TRANSCRIPT_ENTRIES) : updated;
+    });
+    vibrateSoftConfirm();
+    if ('speechSynthesis' in window) {
+      const utterance = new SpeechSynthesisUtterance(`Barcode detected ${value}`);
+      utterance.rate = 1.03;
+      utterance.lang = 'en-US';
+      window.speechSynthesis.cancel();
+      window.speechSynthesis.speak(utterance);
+    }
+  }, []);
+
   useCamera({
     videoRef,
     enabled: sessionActive && ariaStatus === 'connected',
@@ -297,10 +429,43 @@ export default function App(): JSX.Element {
     onHazard: onHardStop,
     onEdgeHazard,
     onDepthStatus,
+    onDeterministicScan,
+    onDeterministicStatus,
     locationSnapshot,
     carryMode: activeCarryMode,
     carryProfile,
     minCloudIntervalMs,
+    deterministicScanEnabled: sessionActive && (navigationMode === 'READ' || navigationMode === 'EXPLORE'),
+    onFrameQuality: useCallback((quality: FrameQualityResult) => {
+      if (quality.score < 0.5) {
+        consecutiveBadFramesRef.current++;
+      } else {
+        consecutiveBadFramesRef.current = 0;
+      }
+      const alertSig = `${quality.score < 0.5 ? 'bad' : 'ok'}:${quality.flags.join(',')}`;
+      if (consecutiveBadFramesRef.current >= 3 && alertSig !== lastFrameQualityAlertRef.current) {
+        lastFrameQualityAlertRef.current = alertSig;
+        const reasons = quality.flags.map((f) => {
+          if (f === 'too_dark') return 'quá tối';
+          if (f === 'blurry') return 'mờ';
+          if (f === 'occluded') return 'bị che';
+          if (f === 'too_bright') return 'quá sáng';
+          return f;
+        });
+        setTranscriptEntries((prev) => {
+          const msg = `Tôi không nhìn rõ: ${reasons.join(', ')}. Hãy dừng lại.`;
+          const updated = [...prev, createEntry('system', msg)];
+          return updated.length > MAX_TRANSCRIPT_ENTRIES ? updated.slice(-MAX_TRANSCRIPT_ENTRIES) : updated;
+        });
+      }
+      if (quality.score >= 0.5 && lastFrameQualityAlertRef.current.startsWith('bad')) {
+        lastFrameQualityAlertRef.current = '';
+        setTranscriptEntries((prev) => {
+          const updated = [...prev, createEntry('system', 'Camera đã rõ trở lại.')];
+          return updated.length > MAX_TRANSCRIPT_ENTRIES ? updated.slice(-MAX_TRANSCRIPT_ENTRIES) : updated;
+        });
+      }
+    }, []),
     onFrame: ({ frameBase64, timestamp, yaw_delta_deg, carry_mode }) => {
       sendFrame({
         timestamp,
@@ -314,6 +479,9 @@ export default function App(): JSX.Element {
         lat: locationSnapshot?.lat,
         lng: locationSnapshot?.lng,
         heading_deg: locationSnapshot?.headingDeg,
+        location_accuracy_m: locationSnapshot?.accuracyM,
+        location_age_ms: locationSnapshot ? Math.max(0, Date.now() - locationSnapshot.recordedAtMs) : undefined,
+        sensor_health: sensorHealth,
       });
     },
   });
@@ -385,9 +553,12 @@ export default function App(): JSX.Element {
 
     if (permissionRequired) {
       const granted = await requestMotionPermission();
+      setMotionPermissionDenied(!granted);
       if (!granted) {
         appendSystemEntry('Motion permission denied. Falling back to fixed behavior.');
       }
+    } else {
+      setMotionPermissionDenied(false);
     }
 
     if (!spatialRef.current) {
@@ -476,6 +647,7 @@ export default function App(): JSX.Element {
   const describeInDetail = useCallback(() => {
     sendUserCommand('describe_detailed');
     appendSystemEntry('Requested detailed description.');
+    vibrateSoftConfirm();
   }, [appendSystemEntry, sendUserCommand]);
 
   const handleSmartCaneConnect = useCallback(async () => {
@@ -623,6 +795,46 @@ export default function App(): JSX.Element {
   }, [appendSystemEntry, smartCaneLastError]);
 
   useEffect(() => {
+    if (!sessionActive) {
+      return;
+    }
+
+    const signature = [
+      safetyRuntimeState.degraded ? '1' : '0',
+      safetyRuntimeState.tier,
+      Math.round(safetyRuntimeState.sensorHealthScore * 100),
+      Math.round(safetyRuntimeState.localizationUncertaintyM),
+      safetyRuntimeState.reason,
+    ].join('|');
+    if (signature === lastSafetyNoticeSignatureRef.current) {
+      return;
+    }
+    lastSafetyNoticeSignatureRef.current = signature;
+
+    if (
+      !safetyRuntimeState.degraded
+      && safetyRuntimeState.tier === 'silent'
+      && safetyRuntimeState.sensorHealthScore >= 0.95
+      && !safetyRuntimeState.reason
+    ) {
+      return;
+    }
+
+    if (safetyRuntimeState.degraded) {
+      appendSystemEntry(
+        `Degraded-safe mode: ${safetyRuntimeState.reason || 'limited visibility'}. `
+        + `Sensor ${Math.round(safetyRuntimeState.sensorHealthScore * 100)}%.`,
+      );
+      return;
+    }
+
+    appendSystemEntry(
+      `Safety tier ${safetyRuntimeState.tier}. `
+      + `Sensor ${Math.round(safetyRuntimeState.sensorHealthScore * 100)}%.`,
+    );
+  }, [appendSystemEntry, safetyRuntimeState, sessionActive]);
+
+  useEffect(() => {
     if (!sessionActive || ariaStatus !== 'connected') {
       return;
     }
@@ -684,16 +896,28 @@ export default function App(): JSX.Element {
       return;
     }
 
+    if (Math.abs(dx) > 60 && Math.abs(dx) > Math.abs(dy)) {
+      setShowOledOverlay((prev) => {
+        const next = !prev;
+        appendSystemEntry(next ? 'Screen disabled (Battery Saver).' : 'Screen enabled.');
+        return next;
+      });
+      vibrateSoftConfirm();
+      return;
+    }
+
     if (duration < 260 && Math.abs(dx) < 30 && Math.abs(dy) < 30) {
       const now = Date.now();
       if (now - state.lastTapAt < 320) {
         repeatLastResponse();
+        vibrateSoftConfirm();
       } else {
         void toggleMic();
+        vibrateSoftConfirm();
       }
       state.lastTapAt = now;
     }
-  }, [cycleMode, describeInDetail, repeatLastResponse, toggleMic]);
+  }, [cycleMode, describeInDetail, repeatLastResponse, toggleMic, appendSystemEntry]);
 
   return (
     <div className="app-shell" onTouchStart={onTouchStart} onTouchEnd={onTouchEnd}>
@@ -706,6 +930,9 @@ export default function App(): JSX.Element {
           <span>{wakeLockActive ? 'Wake lock' : 'Fallback keepalive'}</span>
           <span>Carry: {CARRY_MODE_LABELS[activeCarryMode]}</span>
           <span>Safety: {platformCapabilities.safetyGrade}</span>
+          <span>Sensor: {(sensorHealth.score * 100).toFixed(0)}%</span>
+          <span>Tier: {safetyRuntimeState.tier}</span>
+          {safetyRuntimeState.degraded && <span>Degraded-safe mode</span>}
           {battery.levelPercent !== null && <span aria-label={`Battery ${battery.levelPercent.toFixed(0)} percent`}>Battery: {battery.levelPercent.toFixed(1)}%</span>}
           {battery.dischargeRatePerMin !== null && <span>Drain: {battery.dischargeRatePerMin.toFixed(2)}%/min</span>}
           {minCloudIntervalMs > 0 && <span>Power save FPS cap</span>}
@@ -795,8 +1022,10 @@ export default function App(): JSX.Element {
         </div>
       )}
 
+      {showOledOverlay && <OLEDBlackOverlay enabled={true} />}
+
       <p className="gesture-hint">
-        Tap: mic toggle. Double tap: repeat. Long press: human help. Swipe up: next mode. Swipe down: detailed describe.
+        Tap: mic toggle. Double tap: repeat. Long press: human help. Swipe up: next mode. Swipe down: detailed describe. Swipe left/right: toggle screen.
       </p>
 
       <OLEDBlackOverlay enabled={(oledBlackMode || inPocket) && sessionActive} />

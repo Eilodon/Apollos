@@ -12,10 +12,20 @@ set -euo pipefail
 #   iam.serviceAccountKeys.create/delete
 #   apikeys.keys.create/delete/getKeyString
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
 PROJECT_ID="${PROJECT_ID:-apollos-c7028}"
-SERVICE_ACCOUNT_KEY_FILE="${SERVICE_ACCOUNT_KEY_FILE:-/home/ybao/B.1/Apollos/apollos-c7028-firebase-adminsdk-fbsvc-944bc7acea.json}"
-BACKEND_ENV_FILE="${BACKEND_ENV_FILE:-/home/ybao/B.1/Apollos/backend/.env}"
+BACKEND_ENV_FILE="${BACKEND_ENV_FILE:-$REPO_ROOT/backend/.env}"
+SERVICE_ACCOUNT_KEY_FILE="${SERVICE_ACCOUNT_KEY_FILE:-}"
 SKIP_DELETE_OLD_KEYS="${SKIP_DELETE_OLD_KEYS:-0}"
+
+if [[ -z "$SERVICE_ACCOUNT_KEY_FILE" && -f "$BACKEND_ENV_FILE" ]]; then
+  SERVICE_ACCOUNT_KEY_FILE="$(
+    awk -F= '/^GOOGLE_APPLICATION_CREDENTIALS=/{v=$2; gsub(/^"|"$/, "", v); print v}' "$BACKEND_ENV_FILE" | tail -n1
+  )"
+fi
+SERVICE_ACCOUNT_KEY_FILE="${SERVICE_ACCOUNT_KEY_FILE:-$HOME/.config/apollos/firebase-adminsdk.json}"
 
 if [[ ! -f "$SERVICE_ACCOUNT_KEY_FILE" ]]; then
   echo "Missing service-account key file: $SERVICE_ACCOUNT_KEY_FILE"

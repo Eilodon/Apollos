@@ -42,7 +42,8 @@ Real-time AI navigation assistant for blind and low-vision users. Built on **Dua
 - HRTF spatial audio engine + sonar ping matrix (`100/400/800ms`)
 - Wake Lock + OLED black mode (also activates in-pocket) + keepalive fallback
 - Gesture mapping: tap (mic), double-tap (repeat), long press (human help), swipe up/down (mode/describe), shake (SOS)
-- Hazard compass + transcript panel + mode indicator
+- **Deterministic Scan Worker**: Runs barcode scanning on the edge asynchronously when in `READ` or `EXPLORE` modes, speaking results aloud using `SpeechSynthesisUtterance`.
+- Hazard compass + transcript panel + mode indicator + helper live view subsystem
 
 ### Backend (FastAPI + Gemini Live)
 - Gemini Live API bridge (audio realtime + multimodal frame turns)
@@ -144,8 +145,13 @@ Security hardening notes:
 - Never commit `backend/.env`, `frontend/.env`, or service-account JSON keys.
 - Keep `/dev/*` endpoints disabled outside local development.
 - Avoid wildcard CORS in production.
-- Frontend WebSocket client reads OIDC token from localStorage key `apollos_oidc_token`
-  (override with `VITE_OIDC_TOKEN_STORAGE_KEY`).
+- WebSocket auth token is transported via `Sec-WebSocket-Protocol` (`authb64.<token>`), not URL query by default.
+- Keep `WS_ALLOW_QUERY_TOKEN=0` in production (empty value auto-disables query token in production).
+- Keep realtime payload limits (`MAX_WS_MESSAGE_BYTES`, `MAX_FRAME_B64_CHARS`, `MAX_AUDIO_CHUNK_B64_CHARS`) enabled.
+- Use OIDC broker flow (`/auth/oidc/exchange` -> secure cookie -> `/auth/ws-ticket`) so browser does not persist WS token in localStorage.
+- Keep `OIDC_BROKER_SIGNING_KEY` configured in production.
+- Keep `HUMAN_HELP_SIGNING_KEY` configured in production; helper links are one-time exchange tickets.
+- Do not enable helper viewer token in query string; keep subprotocol auth (`authb64.<token>`).
 
 ### Key Rotation (Gemini + Firebase)
 
@@ -159,10 +165,14 @@ Optional flags:
 
 ```bash
 PROJECT_ID=apollos-c7028 \
-SERVICE_ACCOUNT_KEY_FILE=/abs/path/firebase-adminsdk.json \
+SERVICE_ACCOUNT_KEY_FILE=$HOME/.config/apollos/firebase-adminsdk.json \
 BACKEND_ENV_FILE=/abs/path/backend/.env \
 scripts/rotate_keys_gcp.sh
 ```
+
+Defaults:
+- `BACKEND_ENV_FILE=<repo>/backend/.env`
+- `SERVICE_ACCOUNT_KEY_FILE` is inferred from `GOOGLE_APPLICATION_CREDENTIALS` in `BACKEND_ENV_FILE` when present, otherwise falls back to `$HOME/.config/apollos/firebase-adminsdk.json`.
 
 The script rotates:
 
@@ -175,6 +185,28 @@ Optional Vertex path:
 - `GEMINI_USE_VERTEX=1`
 - `GOOGLE_CLOUD_PROJECT=...`
 - `GOOGLE_CLOUD_LOCATION=us-central1`
+
+### OIDC Broker (Production Hardening)
+
+When `WS_AUTH_MODE=oidc`, backend supports a broker flow with short-lived websocket tickets:
+
+1. Client sends external OIDC token to `POST /auth/oidc/exchange` (Bearer token).
+2. Backend verifies token and sets `HttpOnly` broker session cookie.
+3. Client calls `POST /auth/ws-ticket` to receive short-lived `access_token` for websocket auth.
+4. Frontend refreshes ticket in-memory before expiry (no localStorage token persistence).
+
+### Human Fallback Live Link (Production Hardening)
+
+When `HUMAN_FALLBACK_ENABLED=1`, `request_human_help()` and safety-escalation can generate secure helper links:
+
+1. Backend issues short-lived signed `help_ticket` embedded in link (`PUBLIC_HELP_BASE?help_ticket=...`).
+2. Helper page exchanges it once via `POST /auth/help-ticket/exchange`.
+3. Backend returns short-lived `viewer_token`.
+4. Helper websocket connects to `GET /ws/help/{session_id}` using `Sec-WebSocket-Protocol: apollos.help.v1,authb64.<viewer_token>`.
+5. Backend relays camera frames and PCM16 audio chunks for remote assistance.
+
+Optional SMS dispatch:
+- Configure `EMERGENCY_CONTACTS` and Twilio credentials to send helper links automatically.
 
 ## WebSocket contracts
 
@@ -189,7 +221,15 @@ Optional Vertex path:
   "motion_state": "walking_fast",
   "pitch": 8.2,
   "velocity": 2.1,
-  "yaw_delta_deg": 12.5
+  "yaw_delta_deg": 12.5,
+  "location_accuracy_m": 18.0,
+  "location_age_ms": 500,
+  "sensor_health": {
+    "score": 0.81,
+    "flags": ["depth_fallback"],
+    "degraded": false,
+    "source": "edge-fused-v1"
+  }
 }
 ```
 
@@ -220,6 +260,22 @@ Optional Vertex path:
 ```
 
 > `HARD_STOP` can be triggered by **either** the Edge Survival Reflex Worker (Layer 0, <16ms) or the Cloud Gemini agent (Layer 2, ~600ms+). Edge fires first.
+
+### Backend → client: `safety_state`
+
+```json
+{
+  "type": "safety_state",
+  "session_id": "...",
+  "timestamp": "2026-03-05T00:00:00Z",
+  "degraded": true,
+  "reason": "low_sensor_health,high_localization_uncertainty",
+  "sensor_health_score": 0.42,
+  "sensor_health_flags": ["depth_error", "location_missing"],
+  "localization_uncertainty_m": 120,
+  "tier": "voice"
+}
+```
 
 ## Testing
 

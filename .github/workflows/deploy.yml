@@ -58,10 +58,25 @@ jobs:
           PYTHONPATH: backend
         run: python3 scripts/hardening_pass.py
 
+  safety-gate:
+    runs-on: ubuntu-latest
+    needs: [backend-tests, hardening-pass]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install backend dependencies
+        run: pip install -r backend/requirements.txt
+      - name: Run safety regression gate
+        env:
+          PYTHONPATH: backend
+        run: python3 scripts/safety_regression_gate.py --min-recall 0.80 --max-false-stop 0.34 --budget-ms 100
+
   terraform-plan:
     if: ${{ github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
-    needs: [backend-tests, hardening-pass, frontend-check]
+    needs: [backend-tests, hardening-pass, safety-gate, frontend-check]
     steps:
       - uses: actions/checkout@v4
 
@@ -104,14 +119,16 @@ jobs:
         env:
           OIDC_ISSUER: ${{ secrets.OIDC_ISSUER }}
           OIDC_AUDIENCE: ${{ secrets.OIDC_AUDIENCE }}
+          OIDC_BROKER_SIGNING_KEY: ${{ secrets.OIDC_BROKER_SIGNING_KEY }}
+          HUMAN_HELP_SIGNING_KEY: ${{ secrets.HUMAN_HELP_SIGNING_KEY }}
           FRONTEND_ORIGIN: ${{ vars.FRONTEND_ORIGIN }}
         run: |
-          if [ -z "$OIDC_ISSUER" ] || [ -z "$OIDC_AUDIENCE" ]; then
-            echo "Missing required secret: OIDC_ISSUER or OIDC_AUDIENCE"
+          if [ -z "$OIDC_ISSUER" ] || [ -z "$OIDC_AUDIENCE" ] || [ -z "$OIDC_BROKER_SIGNING_KEY" ] || [ -z "$HUMAN_HELP_SIGNING_KEY" ]; then
+            echo "Missing required secret: OIDC_ISSUER, OIDC_AUDIENCE, OIDC_BROKER_SIGNING_KEY, or HUMAN_HELP_SIGNING_KEY"
             exit 1
           fi
           gcloud run deploy aria-backend \
             --image ${{ secrets.BACKEND_IMAGE_URI }} \
             --region ${{ vars.GCP_REGION }} \
             --project ${{ secrets.GCP_PROJECT_ID }} \
-            --update-env-vars APP_ENV=production,WS_AUTH_MODE=oidc,OIDC_ISSUER=$OIDC_ISSUER,OIDC_AUDIENCE=$OIDC_AUDIENCE,ENABLE_DEV_ENDPOINTS=0,CORS_ALLOW_ORIGINS=${FRONTEND_ORIGIN}
+            --update-env-vars APP_ENV=production,WS_AUTH_MODE=oidc,OIDC_ISSUER=$OIDC_ISSUER,OIDC_AUDIENCE=$OIDC_AUDIENCE,OIDC_BROKER_ENABLED=1,OIDC_BROKER_SIGNING_KEY=$OIDC_BROKER_SIGNING_KEY,HUMAN_FALLBACK_ENABLED=1,HUMAN_HELP_SIGNING_KEY=$HUMAN_HELP_SIGNING_KEY,ENABLE_DEV_ENDPOINTS=0,CORS_ALLOW_ORIGINS=${FRONTEND_ORIGIN}

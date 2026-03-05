@@ -3,6 +3,99 @@ import { KinematicReading, computeRiskScore, computeYawDelta, shouldCaptureFrame
 import type { CarryMode, CarryModeProfile } from '../services/carryMode';
 import { HardStopMessage, MotionSnapshot } from '../types/contracts';
 
+// --- Frame Quality Assessment ---
+
+export type FrameQualityFlag = 'too_dark' | 'too_bright' | 'blurry' | 'occluded';
+
+export interface FrameQualityResult {
+  score: number; // 0..1, higher = better
+  flags: FrameQualityFlag[];
+  avgLuma: number;
+  blurVariance: number;
+}
+
+const DARK_LUMA_THRESHOLD = 25;
+const BRIGHT_LUMA_THRESHOLD = 235;
+const BLUR_VARIANCE_THRESHOLD = 80;
+const OCCLUSION_BLACK_RATIO_THRESHOLD = 0.70;
+
+function assessFrameQuality(imageData: ImageData): FrameQualityResult {
+  const { data, width, height } = imageData;
+  const pixelCount = width * height;
+  let lumaSum = 0;
+  let nearBlackCount = 0;
+  const lumaValues = new Float32Array(pixelCount);
+
+  for (let i = 0; i < pixelCount; i++) {
+    const offset = i * 4;
+    const r = data[offset] ?? 0;
+    const g = data[offset + 1] ?? 0;
+    const b = data[offset + 2] ?? 0;
+    const luma = 0.299 * r + 0.587 * g + 0.114 * b;
+    lumaValues[i] = luma;
+    lumaSum += luma;
+    if (luma < 12) {
+      nearBlackCount++;
+    }
+  }
+
+  const avgLuma = lumaSum / pixelCount;
+
+  // Laplacian variance for blur estimation (3x3 kernel on luminance grid)
+  let lapSum = 0;
+  let lapCount = 0;
+  for (let y = 1; y < height - 1; y++) {
+    for (let x = 1; x < width - 1; x++) {
+      const idx = y * width + x;
+      const lap =
+        -4 * lumaValues[idx]
+        + lumaValues[idx - 1]
+        + lumaValues[idx + 1]
+        + lumaValues[idx - width]
+        + lumaValues[idx + width];
+      lapSum += lap * lap;
+      lapCount++;
+    }
+  }
+  const blurVariance = lapCount > 0 ? lapSum / lapCount : 0;
+  const blackRatio = nearBlackCount / pixelCount;
+
+  const flags: FrameQualityFlag[] = [];
+  let score = 1.0;
+
+  if (avgLuma < DARK_LUMA_THRESHOLD) {
+    flags.push('too_dark');
+    score -= 0.4;
+  }
+  if (avgLuma > BRIGHT_LUMA_THRESHOLD) {
+    flags.push('too_bright');
+    score -= 0.3;
+  }
+  if (blurVariance < BLUR_VARIANCE_THRESHOLD) {
+    flags.push('blurry');
+    score -= 0.3;
+  }
+  if (blackRatio > OCCLUSION_BLACK_RATIO_THRESHOLD) {
+    flags.push('occluded');
+    score -= 0.4;
+  }
+
+  return {
+    score: Math.max(0, Math.min(1, score)),
+    flags,
+    avgLuma: Math.round(avgLuma * 10) / 10,
+    blurVariance: Math.round(blurVariance),
+  };
+}
+
+export interface DeterministicScanResult {
+  task: 'barcode';
+  value: string;
+  format?: string;
+  confidence: number;
+  timestamp: string;
+}
+
 interface CameraFramePayload {
   frameBase64: string;
   timestamp: string;
@@ -18,6 +111,8 @@ export interface LocationSnapshot {
   lat: number;
   lng: number;
   headingDeg?: number;
+  accuracyM: number;
+  recordedAtMs: number;
 }
 
 interface UseCameraOptions {
@@ -28,10 +123,14 @@ interface UseCameraOptions {
   onHazard?: (message: HardStopMessage) => void;
   onEdgeHazard?: (message: HardStopMessage) => void;
   onDepthStatus?: (state: 'loading' | 'ready' | 'fallback' | 'error', detail: string) => void;
+  onDeterministicScan?: (result: DeterministicScanResult) => void;
+  onDeterministicStatus?: (state: 'ready' | 'fallback' | 'disabled', detail: string) => void;
+  onFrameQuality?: (result: FrameQualityResult) => void;
   locationSnapshot?: LocationSnapshot | null;
   carryMode: CarryMode;
   carryProfile: CarryModeProfile;
   minCloudIntervalMs?: number;
+  deterministicScanEnabled?: boolean;
 }
 
 function intervalForMotionState(state: MotionSnapshot['state']): number {
@@ -76,16 +175,21 @@ export function useCamera({
   onHazard,
   onEdgeHazard,
   onDepthStatus,
+  onDeterministicScan,
+  onDeterministicStatus,
+  onFrameQuality,
   locationSnapshot,
   carryMode,
   carryProfile,
   minCloudIntervalMs = 0,
+  deterministicScanEnabled = false,
 }: UseCameraOptions): void {
   const streamRef = useRef<MediaStream | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const edgeCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const reflexWorkerRef = useRef<Worker | null>(null);
   const depthWorkerRef = useRef<Worker | null>(null);
+  const deterministicWorkerRef = useRef<Worker | null>(null);
   const kinematicRef = useRef<KinematicReading>({ accel: null, gyro: null });
   const lastCloudPostRef = useRef<number>(Date.now());
   const accumulatedYawRef = useRef<number>(0);
@@ -93,12 +197,16 @@ export function useCamera({
   const lastYawDeltaDegRef = useRef<number>(0);
   const lastEdgeHazardAtRef = useRef<number>(0);
   const lastDepthHazardAtRef = useRef<number>(0);
+  const deterministicCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const consecutiveBadFramesRef = useRef<number>(0);
+  const lastQualityReportRef = useRef<string>('');
 
   const intervalMs = useMemo(() => intervalForMotionState(motionSnapshot.state), [motionSnapshot.state]);
 
   useEffect(() => {
     reflexWorkerRef.current = new Worker(new URL('../workers/survivalReflex.worker.ts', import.meta.url), { type: 'module' });
     depthWorkerRef.current = new Worker(new URL('../workers/depthGuard.worker.ts', import.meta.url));
+    deterministicWorkerRef.current = new Worker(new URL('../workers/deterministicScan.worker.ts', import.meta.url), { type: 'module' });
     const configuredModelUrl = import.meta.env.VITE_DEPTH_MODEL_URL;
     const depthModelUrl = typeof configuredModelUrl === 'string'
       ? configuredModelUrl
@@ -154,14 +262,31 @@ export function useCamera({
         onEdgeHazard?.(message);
       }
     };
+    deterministicWorkerRef.current.onmessage = (e) => {
+      if (e.data.type === 'DETERMINISTIC_SCAN_STATUS') {
+        onDeterministicStatus?.(e.data.state, String(e.data.detail ?? ''));
+        return;
+      }
+      if (e.data.type === 'DETERMINISTIC_SCAN_RESULT') {
+        onDeterministicScan?.({
+          task: 'barcode',
+          value: String(e.data.value ?? ''),
+          format: String(e.data.format ?? ''),
+          confidence: Number(e.data.confidence ?? 0.7),
+          timestamp: String(e.data.timestamp ?? new Date().toISOString()),
+        });
+      }
+    };
 
     return () => {
       reflexWorkerRef.current?.terminate();
       depthWorkerRef.current?.terminate();
+      deterministicWorkerRef.current?.terminate();
       reflexWorkerRef.current = null;
       depthWorkerRef.current = null;
+      deterministicWorkerRef.current = null;
     };
-  }, [onDepthStatus, onEdgeHazard, onHazard]);
+  }, [onDepthStatus, onDeterministicScan, onDeterministicStatus, onEdgeHazard, onHazard]);
 
   useEffect(() => {
     const handler = (e: DeviceMotionEvent) => {
@@ -247,10 +372,15 @@ export function useCamera({
       edgeCanvasRef.current = edgeCanvas;
       edgeCanvas.width = 64;
       edgeCanvas.height = 64;
+      const deterministicCanvas = deterministicCanvasRef.current ?? document.createElement('canvas');
+      deterministicCanvasRef.current = deterministicCanvas;
+      deterministicCanvas.width = 256;
+      deterministicCanvas.height = 256;
 
       const ctx = canvas.getContext('2d');
       const edgeCtx = edgeCanvas.getContext('2d', { willReadFrequently: true });
-      if (!ctx || !edgeCtx) {
+      const deterministicCtx = deterministicCanvas.getContext('2d', { willReadFrequently: true });
+      if (!ctx || !edgeCtx || !deterministicCtx) {
         return;
       }
 
@@ -280,7 +410,41 @@ export function useCamera({
       const edgeInterval = Math.max(16, 150 - riskScore * 33);
 
       reflexWorkerRef.current?.postMessage({ currentFrame: edgeImageData, riskScore });
-      depthWorkerRef.current?.postMessage({ type: 'depth_frame', currentFrame: edgeImageData, riskScore });
+      const gyro = kinematicRef.current.gyro;
+      const gyroMagnitude = Math.sqrt(
+        (gyro?.alpha ?? 0) ** 2
+        + (gyro?.beta ?? 0) ** 2
+        + (gyro?.gamma ?? 0) ** 2,
+      );
+      depthWorkerRef.current?.postMessage({
+        type: 'depth_frame',
+        currentFrame: edgeImageData,
+        riskScore,
+        carryMode,
+        gyroMagnitude,
+      });
+
+      if (deterministicScanEnabled) {
+        deterministicCtx.drawImage(video, sx, sy, sw, sh, 0, 0, 256, 256);
+        const deterministicImageData = deterministicCtx.getImageData(0, 0, 256, 256);
+        deterministicWorkerRef.current?.postMessage({
+          type: 'scan_frame',
+          currentFrame: deterministicImageData,
+        });
+      }
+
+      // Frame quality assessment
+      const quality = assessFrameQuality(edgeImageData);
+      const qualitySig = `${quality.score.toFixed(2)}-${quality.flags.join(',')}`;
+      if (qualitySig !== lastQualityReportRef.current) {
+        lastQualityReportRef.current = qualitySig;
+        onFrameQuality?.(quality);
+      }
+      if (quality.score < 0.5) {
+        consecutiveBadFramesRef.current++;
+      } else {
+        consecutiveBadFramesRef.current = 0;
+      }
 
       const now = Date.now();
       const timeSinceLastPost = now - lastCloudPostRef.current;
@@ -326,6 +490,7 @@ export function useCamera({
     motionSnapshot.pitch,
     motionSnapshot.state,
     motionSnapshot.velocity,
+    deterministicScanEnabled,
     onFrame,
     videoRef,
   ]);

@@ -2,6 +2,7 @@ export type MotionState = 'stationary' | 'walking_slow' | 'walking_fast' | 'runn
 export type DistanceCategory = 'very_close' | 'mid' | 'far';
 export type NavigationMode = 'NAVIGATION' | 'EXPLORE' | 'READ' | 'QUIET';
 export type CarryMode = 'hand_held' | 'necklace' | 'chest_clip' | 'pocket';
+export type SafetyTier = 'silent' | 'ping' | 'voice' | 'hard_stop' | 'human_escalation';
 
 export interface MotionSnapshot {
   state: MotionState;
@@ -25,6 +26,9 @@ export interface MultimodalFrameMessage {
   lat?: number;
   lng?: number;
   heading_deg?: number;
+  location_accuracy_m?: number;
+  location_age_ms?: number;
+  sensor_health?: SensorHealthSnapshot;
 }
 
 export interface AudioChunkMessage {
@@ -74,6 +78,13 @@ export interface SemanticCueMessage {
   position_x?: number;
 }
 
+export interface SensorHealthSnapshot {
+  score: number;
+  flags: string[];
+  degraded: boolean;
+  source: string;
+}
+
 export interface HardStopMessage {
   type: 'HARD_STOP';
   position_x: number;
@@ -85,8 +96,36 @@ export interface HardStopMessage {
 
 export interface ConnectionStateMessage {
   type: 'connection_state';
-  state: 'connected' | 'reconnecting' | 'disconnected';
+  state: 'connected' | 'reconnecting' | 'disconnected' | 'degraded';
   detail?: string;
+}
+
+export interface SafetyStateMessage {
+  type: 'safety_state';
+  session_id: string;
+  timestamp: string;
+  degraded: boolean;
+  reason?: string;
+  sensor_health_score: number;
+  sensor_health_flags?: string[];
+  localization_uncertainty_m: number;
+  tier: SafetyTier;
+}
+
+export interface HumanHelpRTCSession {
+  provider: 'twilio' | 'livekit';
+  room_name: string;
+  identity?: string;
+  token: string;
+  expires_in: number;
+}
+
+export interface HumanHelpSessionMessage {
+  type: 'human_help_session';
+  session_id: string;
+  timestamp: string;
+  help_link?: string;
+  rtc: HumanHelpRTCSession;
 }
 
 export type BackendToClientMessage =
@@ -94,4 +133,6 @@ export type BackendToClientMessage =
   | AssistantAudioMessage
   | HardStopMessage
   | ConnectionStateMessage
-  | SemanticCueMessage;
+  | SemanticCueMessage
+  | SafetyStateMessage
+  | HumanHelpSessionMessage;
