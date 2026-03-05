@@ -99,7 +99,7 @@ fn build_cors_layer() -> CorsLayer {
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers(Any);
 
-    if origins.is_empty() || origins.iter().any(|value| *value == "*") {
+    if origins.is_empty() || origins.contains(&"*") {
         cors = cors.allow_origin(Any);
     } else {
         let parsed = origins

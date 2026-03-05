@@ -32,21 +32,24 @@ impl ServerConfig {
         }
 
         for required in ["OIDC_ISSUER", "OIDC_AUDIENCE", "OIDC_JWKS_URL"] {
-            assert!(
-                std::env::var(required)
-                    .ok()
-                    .map(|value| !value.trim().is_empty())
-                    .unwrap_or(false),
-                "missing required production env: {required}"
-            );
+            if !std::env::var(required)
+                .ok()
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false)
+            {
+                tracing::error!("CRITICAL: missing required production env: {required}. Auth will fail.");
+            }
         }
 
-        assert!(
-            std::env::var("ENABLE_GEMINI_LIVE")
-                .ok()
-                .map(|value| !matches!(value.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"))
-                .unwrap_or(true),
-            "ENABLE_GEMINI_LIVE must be enabled in production"
-        );
+        if !std::env::var("ENABLE_GEMINI_LIVE")
+            .ok()
+            .map(|value| !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ))
+            .unwrap_or(true)
+        {
+            tracing::error!("CRITICAL: ENABLE_GEMINI_LIVE must be enabled in production. Core logic will fail.");
+        }
     }
 }

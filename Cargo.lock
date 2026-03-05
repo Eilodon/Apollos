@@ -67,6 +67,7 @@ dependencies = [
  "cpal",
  "futures-util",
  "hrtf",
+ "once_cell",
  "ort",
  "serde",
  "serde_json",

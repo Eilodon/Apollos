@@ -10,6 +10,7 @@ const DEFAULT_ONNX_INPUT_SIZE: usize = 256;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DepthSource {
     Onnx,
+    Heuristic,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -69,10 +70,10 @@ impl DepthEngine {
 
     pub fn process(
         &mut self,
-        #[allow(unused)] frame: &LumaFrame,
+        frame: &LumaFrame,
         risk_score: f32,
-        #[allow(unused)] carry_mode: CarryMode,
-        #[allow(unused)] gyro_magnitude: f32,
+        carry_mode: CarryMode,
+        gyro_magnitude: f32,
         now_ms: u64,
     ) -> Option<DropAheadHazard> {
         let dynamic_interval_ms = ((self.base_interval_ms as f32) - (risk_score - 1.0) * 15.0)
@@ -86,24 +87,37 @@ impl DepthEngine {
         self.last_process_time_ms = now_ms;
 
         #[cfg(feature = "ml")]
-        let depth_map = self.infer_depth_map_onnx(frame)?;
+        let mut source = DepthSource::Heuristic;
         #[cfg(not(feature = "ml"))]
-        return None;
+        let source = DepthSource::Heuristic;
 
-        #[cfg(feature = "ml")]
+        let depth_map = {
+            #[cfg(feature = "ml")]
+            {
+                if let Some(depth_map) = self.infer_depth_map_onnx(frame) {
+                    source = DepthSource::Onnx;
+                    depth_map
+                } else {
+                    infer_heuristic_depth(frame)
+                }
+            }
+            #[cfg(not(feature = "ml"))]
+            {
+                infer_heuristic_depth(frame)
+            }
+        };
+
         let mut hazard = detect_drop_ahead(
             &depth_map,
             frame.width,
             frame.height,
             carry_mode,
             gyro_magnitude,
+            self.model_available,
         )?;
 
-        #[cfg(feature = "ml")]
-        {
-            hazard.source = DepthSource::Onnx;
-            Some(hazard)
-        }
+        hazard.source = source;
+        Some(hazard)
     }
 
     #[cfg(feature = "ml")]
@@ -229,7 +243,13 @@ struct OnnxRuntime {
     input_size: usize,
 }
 
-
+pub fn infer_heuristic_depth(frame: &LumaFrame) -> Vec<f32> {
+    frame
+        .pixels
+        .iter()
+        .map(|value| 1.0 - (value / 255.0))
+        .collect()
+}
 
 #[cfg(feature = "ml")]
 fn build_onnx_input(frame: &LumaFrame, target_size: usize) -> Vec<f32> {
@@ -321,6 +341,7 @@ pub fn detect_drop_ahead(
     height: usize,
     carry_mode: CarryMode,
     gyro_magnitude: f32,
+    model_available: bool,
 ) -> Option<DropAheadHazard> {
     if depth.len() != width * height || width == 0 || height < 2 {
         return None;
@@ -403,7 +424,11 @@ pub fn detect_drop_ahead(
         distance: DistanceCategory::VeryClose,
         position_x,
         confidence: stabilized_confidence,
-        source: DepthSource::Onnx,
+        source: if model_available {
+            DepthSource::Onnx
+        } else {
+            DepthSource::Heuristic
+        },
     })
 }
 
@@ -429,8 +454,13 @@ mod tests {
     }
 
     #[test]
-    fn heurustic_removed_from_test() {
-        assert!(true);
+    fn detects_drop_with_heuristic_map() {
+        let map = synthetic_drop_map(64, 64);
+        let hazard = detect_drop_ahead(&map, 64, 64, CarryMode::Necklace, 0.0, false);
+        assert!(hazard.is_some());
+        let hazard = hazard.expect("hazard should exist");
+        assert_eq!(hazard.hazard_type, "DROP_AHEAD");
+        assert_eq!(hazard.source, DepthSource::Heuristic);
     }
 
     #[test]

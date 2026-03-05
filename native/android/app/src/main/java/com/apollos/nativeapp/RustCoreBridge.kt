@@ -6,6 +6,14 @@ data class KinematicResult(
     val yawDeltaDeg: Float,
 )
 
+data class DepthHazardResult(
+    val detected: Boolean,
+    val positionX: Float,
+    val confidence: Float,
+    val sourceCode: Int,
+    val distanceCode: Int,
+)
+
 object RustCoreBridge {
     init {
         System.loadLibrary("rust_bridge")
@@ -28,7 +36,20 @@ object RustCoreBridge {
         sensorUnavailable: Byte,
     ): FloatArray
 
+    private external fun nativeDepthOnnxEnabled(): Int
+
+    private external fun nativeDetectDropAheadRgba(
+        rgbaBytes: ByteArray,
+        width: Int,
+        height: Int,
+        riskScore: Float,
+        carryModeCode: Byte,
+        gyroMagnitude: Float,
+        nowMs: Long,
+    ): FloatArray
+
     fun abiVersion(): Int = nativeAbiVersion()
+    fun depthOnnxEnabled(): Boolean = nativeDepthOnnxEnabled() != 0
 
     fun analyzeDefaultWalkingFrame(): KinematicResult {
         val output = nativeAnalyzeKinematics(
@@ -50,6 +71,33 @@ object RustCoreBridge {
             riskScore = output.getOrElse(0) { 0.0f },
             shouldCapture = output.getOrElse(1) { 0.0f } > 0.5f,
             yawDeltaDeg = output.getOrElse(2) { 0.0f },
+        )
+    }
+
+    fun detectDropAheadRgba(
+        rgbaBytes: ByteArray,
+        width: Int,
+        height: Int,
+        riskScore: Float,
+        carryModeCode: Byte,
+        gyroMagnitude: Float,
+        nowMs: Long,
+    ): DepthHazardResult {
+        val output = nativeDetectDropAheadRgba(
+            rgbaBytes = rgbaBytes,
+            width = width,
+            height = height,
+            riskScore = riskScore,
+            carryModeCode = carryModeCode,
+            gyroMagnitude = gyroMagnitude,
+            nowMs = nowMs,
+        )
+        return DepthHazardResult(
+            detected = output.getOrElse(0) { 0.0f } > 0.5f,
+            positionX = output.getOrElse(1) { 0.0f },
+            confidence = output.getOrElse(2) { 0.0f },
+            sourceCode = output.getOrElse(3) { 0.0f }.toInt(),
+            distanceCode = output.getOrElse(4) { 0.0f }.toInt(),
         )
     }
 }

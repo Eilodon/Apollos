@@ -62,7 +62,7 @@ pub fn should_capture_frame(reading: KinematicReading, profile: CarryModeProfile
     };
 
     let magnitude = (accel.x * accel.x + accel.y * accel.y + accel.z * accel.z).sqrt();
-    if magnitude < 8.0 || magnitude > 12.0 {
+    if !(8.0..=12.0).contains(&magnitude) {
         return false;
     }
 

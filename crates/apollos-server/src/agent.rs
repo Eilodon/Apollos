@@ -103,16 +103,17 @@ impl AgentOrchestrator {
                     ));
                 }
 
-                let detail = if let Err(error) = state.gemini.forward_audio_chunk(state, &chunk).await {
-                    warn!(
-                        session_id = %chunk.session_id,
-                        error = %error,
-                        "failed to forward audio chunk to gemini live"
-                    );
-                    "gemini_live_unavailable"
-                } else {
-                    "audio_ingested"
-                };
+                let detail =
+                    if let Err(error) = state.gemini.forward_audio_chunk(state, &chunk).await {
+                        warn!(
+                            session_id = %chunk.session_id,
+                            error = %error,
+                            "failed to forward audio chunk to gemini live"
+                        );
+                        "gemini_live_unavailable"
+                    } else {
+                        "audio_ingested"
+                    };
 
                 Some(BackendToClientMessage::ConnectionState(
                     ConnectionStateMessage {

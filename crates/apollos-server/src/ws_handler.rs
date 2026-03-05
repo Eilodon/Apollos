@@ -286,26 +286,34 @@ fn parse_incoming(
     match (encoding, message) {
         (SocketEncoding::Json, Message::Text(text)) => {
             if text.len() > max_bytes {
-                return Err(transport::TransportError::MissingPayload("payload_too_large"));
+                return Err(transport::TransportError::MissingPayload(
+                    "payload_too_large",
+                ));
             }
             serde_json::from_str::<ClientToBackendMessage>(&text)
                 .map_err(|_| transport::TransportError::MissingPayload("json_parse"))
         }
         (SocketEncoding::Json, Message::Binary(bytes)) => {
             if bytes.len() > max_bytes {
-                return Err(transport::TransportError::MissingPayload("payload_too_large"));
+                return Err(transport::TransportError::MissingPayload(
+                    "payload_too_large",
+                ));
             }
             transport::decode_client_message(&bytes)
         }
         (SocketEncoding::Protobuf, Message::Binary(bytes)) => {
             if bytes.len() > max_bytes {
-                return Err(transport::TransportError::MissingPayload("payload_too_large"));
+                return Err(transport::TransportError::MissingPayload(
+                    "payload_too_large",
+                ));
             }
             transport::decode_client_message(&bytes)
         }
         (SocketEncoding::Protobuf, Message::Text(text)) => {
             if text.len() > max_bytes {
-                return Err(transport::TransportError::MissingPayload("payload_too_large"));
+                return Err(transport::TransportError::MissingPayload(
+                    "payload_too_large",
+                ));
             }
             serde_json::from_str::<ClientToBackendMessage>(&text)
                 .map_err(|_| transport::TransportError::MissingPayload("json_parse"))

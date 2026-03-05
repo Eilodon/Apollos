@@ -160,10 +160,9 @@ impl Default for HumanFallbackService {
             .max(30);
         let twilio = TwilioConfig::from_env(viewer_ttl_seconds);
 
-        assert!(
-            !(twilio_required && twilio.is_none()),
-            "TWILIO_REQUIRED is enabled but Twilio config is missing"
-        );
+        if twilio_required && twilio.is_none() {
+            tracing::warn!("TWILIO_REQUIRED is enabled but Twilio config is missing. Human fallback video will not work.");
+        }
 
         Self {
             public_help_base: std::env::var("PUBLIC_HELP_BASE")

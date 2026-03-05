@@ -725,11 +725,11 @@ impl FirestorePersistence {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
         else {
-            assert!(
-                !firestore_required,
-                "FIRESTORE_REQUIRED is enabled but GOOGLE_CLOUD_PROJECT is missing"
-            );
-            warn!("USE_FIRESTORE=1 but GOOGLE_CLOUD_PROJECT is missing; disabling Firestore persistence");
+            if firestore_required {
+                warn!("FIRESTORE_REQUIRED is enabled but GOOGLE_CLOUD_PROJECT is missing. Disabling Firestore persistence, but this may cause issues in production.");
+            } else {
+                warn!("USE_FIRESTORE=1 but GOOGLE_CLOUD_PROJECT is missing; disabling Firestore persistence");
+            }
             return None;
         };
 

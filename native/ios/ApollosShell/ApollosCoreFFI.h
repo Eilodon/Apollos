@@ -9,6 +9,14 @@ typedef struct {
     float yaw_delta_deg;
 } ApollosKinematicOutput;
 
+typedef struct {
+    uint8_t detected;
+    float position_x;
+    float confidence;
+    uint8_t source_code;
+    uint8_t distance_code;
+} ApollosDepthHazardOutput;
+
 uint32_t apollos_abi_version_u32(void);
 ApollosKinematicOutput apollos_analyze_kinematics(
     uint8_t motion_state_code,
@@ -23,6 +31,17 @@ ApollosKinematicOutput apollos_analyze_kinematics(
     float gyro_beta,
     float gyro_gamma,
     uint8_t sensor_unavailable
+);
+uint8_t apollos_depth_onnx_runtime_enabled(void);
+ApollosDepthHazardOutput apollos_detect_drop_ahead_rgba(
+    const uint8_t *rgba_ptr,
+    uintptr_t rgba_len,
+    uint32_t width,
+    uint32_t height,
+    float risk_score,
+    uint8_t carry_mode_code,
+    float gyro_magnitude,
+    uint64_t now_ms
 );
 
 #endif

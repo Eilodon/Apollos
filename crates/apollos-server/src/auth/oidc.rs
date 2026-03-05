@@ -63,11 +63,10 @@ pub async fn verify_id_token(token: &str) -> Option<OidcIdentity> {
 impl OidcRuntimeConfig {
     fn from_env() -> Self {
         let app_env = std::env::var("APP_ENV").unwrap_or_else(|_| "development".to_string());
-        let strict_mode = app_env.eq_ignore_ascii_case("production")
-            || env_flag("OIDC_REQUIRE_STRICT", false);
+        let strict_mode =
+            app_env.eq_ignore_ascii_case("production") || env_flag("OIDC_REQUIRE_STRICT", false);
 
-        let allow_insecure_dev_tokens =
-            env_flag("OIDC_ALLOW_INSECURE_DEV_TOKENS", !strict_mode);
+        let allow_insecure_dev_tokens = env_flag("OIDC_ALLOW_INSECURE_DEV_TOKENS", !strict_mode);
 
         let issuer = read_non_empty_env("OIDC_ISSUER");
         let audience = read_non_empty_env("OIDC_AUDIENCE");
@@ -146,7 +145,10 @@ fn verify_against_keyset(
     keyset: &JwkSet,
 ) -> Option<OidcIdentity> {
     let candidates = if let Some(kid) = header.kid.as_deref() {
-        keyset.find(kid).map(|value| vec![value]).unwrap_or_default()
+        keyset
+            .find(kid)
+            .map(|value| vec![value])
+            .unwrap_or_default()
     } else {
         keyset.keys.iter().collect::<Vec<_>>()
     };

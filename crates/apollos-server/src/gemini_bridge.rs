@@ -213,9 +213,8 @@ impl GeminiBridge {
         }
 
         let handle = self.ensure_live_session(state, &chunk.session_id).await?;
-        if let Err(mpsc::error::TrySendError::Full(_)) = handle
-            .tx
-            .try_send(LiveOutgoing::RealtimeAudio {
+        if let Err(mpsc::error::TrySendError::Full(_)) =
+            handle.tx.try_send(LiveOutgoing::RealtimeAudio {
                 pcm16_base64: trimmed.to_string(),
             })
         {
@@ -273,9 +272,8 @@ impl GeminiBridge {
         turn_complete: bool,
     ) -> anyhow::Result<()> {
         let handle = self.ensure_live_session(state, session_id).await?;
-        if let Err(mpsc::error::TrySendError::Full(_)) = handle
-            .tx
-            .try_send(LiveOutgoing::ClientContent {
+        if let Err(mpsc::error::TrySendError::Full(_)) =
+            handle.tx.try_send(LiveOutgoing::ClientContent {
                 parts,
                 turn_complete,
             })
