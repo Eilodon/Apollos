@@ -1,0 +1,70 @@
+syntax = "proto3";
+
+package apollos.types.v1;
+
+enum MotionState {
+  MOTION_STATE_UNSPECIFIED = 0;
+  MOTION_STATE_STATIONARY = 1;
+  MOTION_STATE_WALKING_SLOW = 2;
+  MOTION_STATE_WALKING_FAST = 3;
+  MOTION_STATE_RUNNING = 4;
+}
+
+enum DistanceCategory {
+  DISTANCE_CATEGORY_UNSPECIFIED = 0;
+  DISTANCE_CATEGORY_VERY_CLOSE = 1;
+  DISTANCE_CATEGORY_MID = 2;
+  DISTANCE_CATEGORY_FAR = 3;
+}
+
+enum NavigationMode {
+  NAVIGATION_MODE_UNSPECIFIED = 0;
+  NAVIGATION_MODE_NAVIGATION = 1;
+  NAVIGATION_MODE_EXPLORE = 2;
+  NAVIGATION_MODE_READ = 3;
+  NAVIGATION_MODE_QUIET = 4;
+}
+
+enum CarryMode {
+  CARRY_MODE_UNSPECIFIED = 0;
+  CARRY_MODE_HAND_HELD = 1;
+  CARRY_MODE_NECKLACE = 2;
+  CARRY_MODE_CHEST_CLIP = 3;
+  CARRY_MODE_POCKET = 4;
+}
+
+enum SafetyTier {
+  SAFETY_TIER_UNSPECIFIED = 0;
+  SAFETY_TIER_SILENT = 1;
+  SAFETY_TIER_PING = 2;
+  SAFETY_TIER_VOICE = 3;
+  SAFETY_TIER_HARD_STOP = 4;
+  SAFETY_TIER_HUMAN_ESCALATION = 5;
+}
+
+enum HumanRtcProvider {
+  HUMAN_RTC_PROVIDER_UNSPECIFIED = 0;
+  HUMAN_RTC_PROVIDER_TWILIO = 1;
+  HUMAN_RTC_PROVIDER_LIVEKIT = 2;
+}
+
+message MotionSnapshot {
+  MotionState state = 1;
+  float pitch = 2;
+  float velocity = 3;
+}
+
+message SensorHealthSnapshot {
+  float score = 1;
+  repeated string flags = 2;
+  bool degraded = 3;
+  string source = 4;
+}
+
+message HumanHelpRtcSession {
+  HumanRtcProvider provider = 1;
+  string room_name = 2;
+  optional string identity = 3;
+  string token = 4;
+  uint32 expires_in = 5;
+}

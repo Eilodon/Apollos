@@ -1,1 +1,0 @@
-"""VisionGPT backend package."""

@@ -1,26 +1,17 @@
-# Architecture (Text Diagram)
+# Apollos Architecture (Rust + Native)
 
-```text
-Mobile PWA (React)
-  - Camera (adaptive FPS)
-  - Mic 16k PCM
-  - SpatialAudioEngine (HRTF)
-  - Wake Lock + OLED black
-  - Motion sensor fusion
-      |
-      | WebSocket BIDI (/ws/live)
-      v
-FastAPI + Agent Orchestrator
-  - Session manager
-  - Tool runtime
-  - hazard logger => HARD_STOP
-  - Firestore bridge
-      |
-      | Emergency WS (/ws/emergency)
-      v
-Client hard interrupt
-  - stop current audio
-  - sonar ping by direction + distance rhythm
-```
+## Runtime split
 
-For submission, export this into PNG and place at `docs/ARCHITECTURE.png`.
+- `apollos-core` (Rust): edge reflex, kinematic gating, depth engine, FFI surface.
+- `apollos-server` (Rust/Axum): websocket transport, Gemini Live bridge, auth, persistence, human fallback.
+- `apollos-proto` (Rust): shared contracts and protobuf envelopes.
+- `native/android` + `native/ios`: thin UI/sensor/audio shells invoking Rust over FFI.
+
+## Data path
+
+1. Native shell captures motion/frame/audio.
+2. Shell calls `apollos-core` FFI for reflex/risk computations.
+3. Shell forwards multimodal events to `apollos-server` over WS.
+4. Server relays realtime input to Gemini Live and handles tool calls.
+5. Server emits assistant/hard-stop/help responses back to clients.
+6. Session/hazard/emotion data persists to Firestore when enabled.

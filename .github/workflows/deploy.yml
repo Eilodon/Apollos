@@ -1,85 +1,54 @@
-name: CI/CD Pipeline
+name: Rust Deploy Pipeline
 
 on:
   push:
     branches: [main]
     paths:
-      - "backend/**"
-      - "frontend/**"
-      - "infra/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Dockerfile"
+      - "crates/**"
+      - "native/**"
       - "scripts/**"
+      - "infra/**"
       - ".github/workflows/deploy.yml"
   workflow_dispatch:
 
 jobs:
-  backend-tests:
+  rust-tests:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          python-version: "3.12"
+          components: rustfmt, clippy
 
-      - name: Install backend dependencies
-        run: pip install -r backend/requirements.txt
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
 
-      - name: Run backend tests
-        env:
-          PYTHONPATH: backend
-        run: python -m unittest discover backend/tests
+      - name: Rustfmt
+        run: cargo fmt --all --check
 
-  frontend-check:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-      - name: Install frontend dependencies
-        working-directory: frontend
-        run: npm install
-      - name: TypeScript Check
-        working-directory: frontend
-        run: npx tsc --noEmit
+      - name: Cargo check
+        run: cargo check --workspace
 
-  hardening-pass:
-    runs-on: ubuntu-latest
-    needs: backend-tests
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Install backend dependencies
-        run: pip install -r backend/requirements.txt
-      - name: Run hardening pass
-        env:
-          PYTHONPATH: backend
-        run: python3 scripts/hardening_pass.py
+      - name: Cargo test
+        run: cargo test --workspace
 
-  safety-gate:
-    runs-on: ubuntu-latest
-    needs: [backend-tests, hardening-pass]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Install backend dependencies
-        run: pip install -r backend/requirements.txt
-      - name: Run safety regression gate
-        env:
-          PYTHONPATH: backend
-        run: python3 scripts/safety_regression_gate.py --min-recall 0.80 --max-false-stop 0.34 --budget-ms 100
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Clippy (ml feature)
+        run: cargo clippy -p apollos-core --features ml --all-targets -- -D warnings
 
   terraform-plan:
     if: ${{ github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
-    needs: [backend-tests, hardening-pass, safety-gate, frontend-check]
+    needs: [rust-tests]
     steps:
       - uses: actions/checkout@v4
-
       - uses: hashicorp/setup-terraform@v3
 
       - name: Terraform Init
@@ -107,15 +76,19 @@ jobs:
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_CREDENTIALS }}
+
       - name: Setup Google Cloud CLI
         uses: google-github-actions/setup-gcloud@v2
+
       - name: Configure Docker
         run: gcloud auth configure-docker ${{ vars.GCP_REGION }}-docker.pkg.dev
+
       - name: Build and Push Docker image
         run: |
-          docker build -t ${{ secrets.BACKEND_IMAGE_URI }} backend/
+          docker build -t ${{ secrets.BACKEND_IMAGE_URI }} .
           docker push ${{ secrets.BACKEND_IMAGE_URI }}
-      - name: Deploy to Cloud Run
+
+      - name: Deploy Rust server to Cloud Run
         env:
           OIDC_ISSUER: ${{ secrets.OIDC_ISSUER }}
           OIDC_AUDIENCE: ${{ secrets.OIDC_AUDIENCE }}
@@ -127,8 +100,9 @@ jobs:
             echo "Missing required secret: OIDC_ISSUER, OIDC_AUDIENCE, OIDC_BROKER_SIGNING_KEY, or HUMAN_HELP_SIGNING_KEY"
             exit 1
           fi
-          gcloud run deploy aria-backend \
+
+          gcloud run deploy apollos-server \
             --image ${{ secrets.BACKEND_IMAGE_URI }} \
             --region ${{ vars.GCP_REGION }} \
             --project ${{ secrets.GCP_PROJECT_ID }} \
-            --update-env-vars APP_ENV=production,WS_AUTH_MODE=oidc,OIDC_ISSUER=$OIDC_ISSUER,OIDC_AUDIENCE=$OIDC_AUDIENCE,OIDC_BROKER_ENABLED=1,OIDC_BROKER_SIGNING_KEY=$OIDC_BROKER_SIGNING_KEY,HUMAN_FALLBACK_ENABLED=1,HUMAN_HELP_SIGNING_KEY=$HUMAN_HELP_SIGNING_KEY,ENABLE_DEV_ENDPOINTS=0,CORS_ALLOW_ORIGINS=${FRONTEND_ORIGIN}
+            --update-env-vars APP_ENV=production,ENABLE_GEMINI_LIVE=1,WS_AUTH_MODE=oidc,OIDC_ISSUER=$OIDC_ISSUER,OIDC_AUDIENCE=$OIDC_AUDIENCE,OIDC_BROKER_ENABLED=1,OIDC_BROKER_SIGNING_KEY=$OIDC_BROKER_SIGNING_KEY,HUMAN_FALLBACK_ENABLED=1,HUMAN_HELP_SIGNING_KEY=$HUMAN_HELP_SIGNING_KEY,ENABLE_DEV_ENDPOINTS=0,CORS_ALLOW_ORIGINS=${FRONTEND_ORIGIN}

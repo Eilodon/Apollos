@@ -1,0 +1,22 @@
+
+X main CI/CD Pipeline · 22710185635
+Triggered via workflow_dispatch about 21 minutes ago
+
+JOBS
+X backend-tests in 3s (ID 65846084782)
+X frontend-check in 3s (ID 65846084795)
+- hardening-pass in 0s (ID 65846091751)
+- safety-gate in 0s (ID 65846092051)
+- terraform-plan in 0s (ID 65846092063)
+- deploy (ID 65846092387)
+
+ANNOTATIONS
+X The job was not started because your account is locked due to a billing issue.
+backend-tests: .github#1
+
+X The job was not started because your account is locked due to a billing issue.
+frontend-check: .github#1
+
+
+To see what failed, try: gh run view 22710185635 --log-failed
+View this run on GitHub: https://github.com/Eilodon/Apollos/actions/runs/22710185635

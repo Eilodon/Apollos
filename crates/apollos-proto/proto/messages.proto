@@ -1,0 +1,134 @@
+syntax = "proto3";
+
+package apollos.messages.v1;
+
+import "types.proto";
+
+enum ConnectionStateKind {
+  CONNECTION_STATE_KIND_UNSPECIFIED = 0;
+  CONNECTION_STATE_KIND_CONNECTED = 1;
+  CONNECTION_STATE_KIND_RECONNECTING = 2;
+  CONNECTION_STATE_KIND_DISCONNECTED = 3;
+  CONNECTION_STATE_KIND_DEGRADED = 4;
+}
+
+enum SemanticCueKind {
+  SEMANTIC_CUE_KIND_UNSPECIFIED = 0;
+  SEMANTIC_CUE_KIND_APPROACHING_OBJECT = 1;
+  SEMANTIC_CUE_KIND_SOFT_OBSTACLE = 2;
+  SEMANTIC_CUE_KIND_TURNING_RECOMMENDED = 3;
+  SEMANTIC_CUE_KIND_DESTINATION_NEAR = 4;
+  SEMANTIC_CUE_KIND_POCKET_MODE_ACTIVE = 5;
+}
+
+message MultimodalFrameMessage {
+  string session_id = 1;
+  string timestamp = 2;
+  optional bytes frame_jpeg = 3;
+  apollos.types.v1.MotionState motion_state = 4;
+  float pitch = 5;
+  float velocity = 6;
+  optional string user_text = 7;
+  optional float yaw_delta_deg = 8;
+  optional apollos.types.v1.CarryMode carry_mode = 9;
+  optional bool sensor_unavailable = 10;
+  optional double lat = 11;
+  optional double lng = 12;
+  optional float heading_deg = 13;
+  optional float location_accuracy_m = 14;
+  optional uint64 location_age_ms = 15;
+  optional apollos.types.v1.SensorHealthSnapshot sensor_health = 16;
+}
+
+message AudioChunkMessage {
+  string session_id = 1;
+  string timestamp = 2;
+  string audio_chunk_pcm16 = 3;
+}
+
+message UserCommandMessage {
+  string session_id = 1;
+  string timestamp = 2;
+  string command = 3;
+}
+
+message EdgeHazardMessage {
+  string session_id = 1;
+  string timestamp = 2;
+  string hazard_type = 3;
+  optional float position_x = 4;
+  optional apollos.types.v1.DistanceCategory distance = 5;
+  optional float confidence = 6;
+  optional uint32 suppress_seconds = 7;
+}
+
+message AssistantTextMessage {
+  string session_id = 1;
+  string timestamp = 2;
+  string text = 3;
+}
+
+message AssistantAudioMessage {
+  string session_id = 1;
+  string timestamp = 2;
+  optional bytes pcm24 = 3;
+  optional bytes pcm16 = 4;
+  optional float hazard_position_x = 5;
+}
+
+message SemanticCueMessage {
+  SemanticCueKind cue = 1;
+  optional float position_x = 2;
+}
+
+message HardStopMessage {
+  float position_x = 1;
+  apollos.types.v1.DistanceCategory distance = 2;
+  string hazard_type = 3;
+  float confidence = 4;
+  optional string ts = 5;
+}
+
+message ConnectionStateMessage {
+  ConnectionStateKind state = 1;
+  optional string detail = 2;
+}
+
+message SafetyStateMessage {
+  string session_id = 1;
+  string timestamp = 2;
+  bool degraded = 3;
+  optional string reason = 4;
+  float sensor_health_score = 5;
+  repeated string sensor_health_flags = 6;
+  float localization_uncertainty_m = 7;
+  apollos.types.v1.SafetyTier tier = 8;
+}
+
+message HumanHelpSessionMessage {
+  string session_id = 1;
+  string timestamp = 2;
+  optional string help_link = 3;
+  apollos.types.v1.HumanHelpRtcSession rtc = 4;
+}
+
+message ClientEnvelope {
+  oneof payload {
+    MultimodalFrameMessage multimodal_frame = 1;
+    AudioChunkMessage audio_chunk = 2;
+    UserCommandMessage user_command = 3;
+    EdgeHazardMessage edge_hazard = 4;
+  }
+}
+
+message ServerEnvelope {
+  oneof payload {
+    AssistantTextMessage assistant_text = 1;
+    AssistantAudioMessage assistant_audio = 2;
+    HardStopMessage hard_stop = 3;
+    ConnectionStateMessage connection_state = 4;
+    SemanticCueMessage semantic_cue = 5;
+    SafetyStateMessage safety_state = 6;
+    HumanHelpSessionMessage human_help_session = 7;
+  }
+}
