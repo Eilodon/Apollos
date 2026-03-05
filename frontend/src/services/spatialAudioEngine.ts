@@ -7,6 +7,20 @@ const PING_INTERVALS: Record<DistanceCategory, number> = {
   far: 800,
 };
 
+type OutputMode = 'headphones' | 'speaker' | 'unknown';
+export type SemanticPingType =
+  | 'approaching_object'
+  | 'soft_obstacle'
+  | 'turning_recommended'
+  | 'destination_near';
+
+const PING_SEMANTIC: Record<SemanticPingType, { interval: number; pitch: number; holdMs: number }> = {
+  approaching_object: { interval: 100, pitch: 880, holdMs: 3000 },
+  soft_obstacle: { interval: 400, pitch: 440, holdMs: 2000 },
+  turning_recommended: { interval: 600, pitch: 330, holdMs: 1800 },
+  destination_near: { interval: 200, pitch: 660, holdMs: 2200 },
+};
+
 export class SpatialAudioEngine {
   private readonly ctx: AudioContext;
   private readonly panner: PannerNode;
@@ -15,6 +29,7 @@ export class SpatialAudioEngine {
   private activeSources = new Set<AudioBufferSourceNode>();
   private nextPlayTime: number = 0;
   private readonly JITTER_DELAY = 0.1;
+  private outputMode: OutputMode = 'unknown';
 
   constructor() {
     const Ctx = window.AudioContext || (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
@@ -39,6 +54,7 @@ export class SpatialAudioEngine {
     if (this.ctx.state === 'suspended') {
       await this.ctx.resume();
     }
+    this.configureOutputMode();
     if (this.sirenBuffer) {
       return;
     }
@@ -74,7 +90,8 @@ export class SpatialAudioEngine {
     let z = -3;
     if (distance === 'very_close') z = -1;
     if (distance === 'far') z = -6;
-    this.panner.setPosition(clamped * 3, 0, z);
+    const xScale = this.outputMode === 'speaker' ? 4.5 : 3;
+    this.panner.setPosition(clamped * xScale, 0, z);
   }
 
   private registerSource(source: AudioBufferSourceNode): void {
@@ -84,10 +101,10 @@ export class SpatialAudioEngine {
     });
   }
 
-  private playOscillatorPing(): void {
+  private playOscillatorPing(pitch = 980): void {
     const oscillator = this.ctx.createOscillator();
     const gain = this.ctx.createGain();
-    oscillator.frequency.value = 980;
+    oscillator.frequency.value = pitch;
     gain.gain.value = 0.1;
     oscillator.connect(gain);
     gain.connect(this.panner);
@@ -95,9 +112,9 @@ export class SpatialAudioEngine {
     oscillator.stop(this.ctx.currentTime + 0.08);
   }
 
-  private playPingOnce(): void {
+  private playPingOnce(pitch = 980): void {
     if (!this.sirenBuffer) {
-      this.playOscillatorPing();
+      this.playOscillatorPing(pitch);
       return;
     }
 
@@ -113,14 +130,32 @@ export class SpatialAudioEngine {
     this.setPosition(positionX, distance);
 
     const interval = PING_INTERVALS[distance];
-    this.playPingOnce();
+    this.playPingOnce(980);
     this.pingInterval = window.setInterval(() => {
-      this.playPingOnce();
+      this.playPingOnce(980);
     }, interval);
 
     window.setTimeout(() => {
       this.stopPing();
     }, 3000);
+  }
+
+  fireSemanticCue(type: SemanticPingType, positionX = 0): void {
+    const profile = PING_SEMANTIC[type];
+    if (!profile) {
+      return;
+    }
+
+    this.stopPing();
+    this.setPosition(positionX, 'default');
+    this.playPingOnce(profile.pitch);
+    this.pingInterval = window.setInterval(() => {
+      this.playPingOnce(profile.pitch);
+    }, profile.interval);
+
+    window.setTimeout(() => {
+      this.stopPing();
+    }, profile.holdMs);
   }
 
   stopPing(): void {
@@ -156,5 +191,20 @@ export class SpatialAudioEngine {
   playChunkFromBase64(pcmBase64: string, hazardPositionX = 0): void {
     const pcmData = pcm16Base64ToFloat32(pcmBase64);
     this.playChunk(pcmData, hazardPositionX);
+  }
+
+  private configureOutputMode(): void {
+    try {
+      const channelCount = this.ctx.destination.channelCount;
+      if (channelCount <= 1) {
+        this.outputMode = 'speaker';
+        this.panner.panningModel = 'equalpower';
+        return;
+      }
+      this.outputMode = 'headphones';
+      this.panner.panningModel = 'HRTF';
+    } catch {
+      this.outputMode = 'unknown';
+    }
   }
 }

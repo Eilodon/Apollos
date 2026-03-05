@@ -21,6 +21,25 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
         summary = await store.get_context_summary('session-2')
         self.assertIn('Mode=', summary)
 
+    async def test_spatial_memory_context(self) -> None:
+        store = SessionStore(use_firestore=False)
+        await store.touch_session('session-3', heading_deg=12.0)
+        await store.add_spatial_hazard_memory(
+            session_id='session-3',
+            hazard_type='stairs',
+            yaw_at_detection=15.0,
+            position_description='Near entrance',
+        )
+        context = await store.get_spatial_context('session-3', current_yaw=20.0)
+        self.assertIn('stairs', context)
+
+    async def test_stress_mode_override_auto_expiry(self) -> None:
+        store = SessionStore(use_firestore=False)
+        await store.set_mode('session-4', 'QUIET')
+        await store.apply_stress_mode_override('session-4', reason='test', revert_after_seconds=120)
+        mode = await store.get_effective_mode('session-4')
+        self.assertEqual(mode, 'NAVIGATION')
+
 
 if __name__ == '__main__':
     unittest.main()

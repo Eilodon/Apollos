@@ -13,6 +13,8 @@ REQUIRED_PATTERNS = {
     'autoGainControl': r'autoGainControl\s*:\s*true',
     'sampleRate': r'sampleRate\s*:\s*16000',
     'channelCount': r'channelCount\s*:\s*1',
+    'voiceGateThreshold': r'VOICE_THRESHOLD\s*=\s*0\.02',
+    'voiceGateHold': r'GATE_HOLD_FRAMES\s*=\s*8',
 }
 
 

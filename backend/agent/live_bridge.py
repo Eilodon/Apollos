@@ -61,6 +61,12 @@ class GeminiLiveBridge:
         self._last_hazard_ts = 0.0
         self._hazard_confirmation_frames = max(1, int(os.getenv('HAZARD_CONFIRMATION_FRAMES', '1')))
         self._hazard_confirmation_timeout_s = max(0.5, float(os.getenv('HAZARD_CONFIRMATION_TIMEOUT_S', '3.0')))
+        self._last_pitch = 0.0
+        self._last_velocity = 0.0
+        self._last_yaw_delta = 0.0
+        self._last_heading_deg: float | None = None
+        self._last_voice_emit_ts = 0.0
+        self._last_location_context = ''
 
     async def ensure_started(self) -> bool:
         if self._stopped:
@@ -155,6 +161,14 @@ class GeminiLiveBridge:
         pitch = float(payload.get('pitch', 0.0) or 0.0)
         velocity = float(payload.get('velocity', 0.0) or 0.0)
         yaw_delta = float(payload.get('yaw_delta_deg', 0.0) or 0.0)
+        lat = payload.get('lat')
+        lng = payload.get('lng')
+        heading_deg = payload.get('heading_deg')
+        heading_value = float(heading_deg) if isinstance(heading_deg, (float, int)) else self._last_heading_deg
+        self._last_heading_deg = heading_value
+        self._last_pitch = pitch
+        self._last_velocity = velocity
+        self._last_yaw_delta = yaw_delta
 
         # Semantic Odometry: bơm góc xoay tích lũy để Gemini suy luận vị trí vật cản
         odometry_hint = ''
@@ -166,9 +180,34 @@ class GeminiLiveBridge:
                 f' warn it may now be DIRECTLY AHEAD. Do not wait for next frame to confirm.]'
             )
 
+        risk_score = self._compute_risk_multiplier(motion_state, pitch, velocity, yaw_delta)
+        effective_mode = await self._session_store.get_effective_mode(self._session_id)
+        spatial_context = await self._session_store.get_spatial_context(self._session_id, current_yaw=heading_value)
+        location_hint = ''
+        if isinstance(lat, (int, float)) and isinstance(lng, (int, float)):
+            location_hint = f' [LOCATION: lat={float(lat):.5f}, lng={float(lng):.5f}, heading={heading_value or 0:.1f}deg]'
+            now_epoch = time.time()
+            should_lookup = await self._session_store.should_lookup_location(self._session_id, now_epoch=now_epoch, min_interval_s=30)
+            if should_lookup:
+                location_result = await self._tool_dispatcher(
+                    'identify_location',
+                    {
+                        'lat': float(lat),
+                        'lng': float(lng),
+                        'heading_deg': float(heading_value or 0.0),
+                    },
+                )
+                name = str(location_result.get('name', '')).strip()
+                info = str(location_result.get('relevant_info', '')).strip()
+                if name:
+                    self._last_location_context = f"[LOCATION INTEL: {name}. {info}]"
+            elif self._last_location_context:
+                location_hint += f" {self._last_location_context}"
+
         motion_text = (
             f"[KINEMATIC: User is {motion_state}. Pitch: {pitch:.1f}deg. "
-            f"Velocity: {velocity:.2f}. Treat visible hazards with safety-first urgency.]{odometry_hint}"
+            f"Velocity: {velocity:.2f}. Mode: {effective_mode}. RiskScore: {risk_score:.2f}. "
+            f"Treat visible hazards with safety-first urgency.]{odometry_hint}{spatial_context}{location_hint}"
         )
 
 
@@ -335,6 +374,32 @@ class GeminiLiveBridge:
                 },
             },
             {
+                'name': 'escalate_mode_if_stressed',
+                'description': 'Escalate mode to NAVIGATION temporarily when vocal distress is detected.',
+                'parameters': {
+                    'type': 'object',
+                    'properties': {
+                        'state': {'type': 'string'},
+                        'confidence': {'type': 'number', 'minimum': 0.0, 'maximum': 1.0},
+                        'current_mode': {'type': 'string'},
+                    },
+                    'required': ['state', 'confidence', 'current_mode'],
+                },
+            },
+            {
+                'name': 'identify_location',
+                'description': 'Identify relevant nearby location context when user is stationary.',
+                'parameters': {
+                    'type': 'object',
+                    'properties': {
+                        'lat': {'type': 'number'},
+                        'lng': {'type': 'number'},
+                        'heading_deg': {'type': 'number'},
+                    },
+                    'required': ['lat', 'lng', 'heading_deg'],
+                },
+            },
+            {
                 'name': 'get_context_summary',
                 'description': 'Get session context summary for reconnect/resume.',
                 'parameters': {'type': 'object', 'properties': {}},
@@ -433,6 +498,8 @@ class GeminiLiveBridge:
     async def _handle_live_response(self, response: Any) -> None:
         texts = self._extract_texts(response)
         for text in texts:
+            if not self._should_emit_text(text):
+                continue
             await self._websocket_registry.send_live(
                 self._session_id,
                 {
@@ -487,9 +554,20 @@ class GeminiLiveBridge:
                 
                 self._last_hazard_ts = now_ts
                 self._consecutive_hazard_frames += 1
+                risk_score = self._compute_risk_multiplier(
+                    self._last_motion_state,
+                    self._last_pitch,
+                    self._last_velocity,
+                    self._last_yaw_delta,
+                )
+                required_frames = self._hazard_confirmation_frames
+                if risk_score > 2.0:
+                    required_frames = 1
+                if risk_score > 3.0 and args.get('confidence', 0.0) < 0.5:
+                    args['confidence'] = 0.6
 
                 should_fire = (
-                    self._consecutive_hazard_frames >= self._hazard_confirmation_frames or
+                    self._consecutive_hazard_frames >= required_frames or
                     self._last_motion_state in {'walking_fast', 'running'}
                 )
 
@@ -513,6 +591,23 @@ class GeminiLiveBridge:
             if name == 'log_hazard_event':
                 position = float(result.get('position_x', 0.0) or 0.0)
                 self._last_hazard_position = max(-1.0, min(1.0, position))
+                await self._websocket_registry.send_live(
+                    self._session_id,
+                    {
+                        'type': 'semantic_cue',
+                        'cue': 'approaching_object',
+                        'position_x': self._last_hazard_position,
+                    },
+                )
+            if name == 'identify_location' and str(result.get('type', '')).lower() in {'transit', 'hospital', 'pharmacy'}:
+                await self._websocket_registry.send_live(
+                    self._session_id,
+                    {
+                        'type': 'semantic_cue',
+                        'cue': 'destination_near',
+                        'position_x': 0,
+                    },
+                )
 
             response_payload = {
                 'ok': bool(result.get('ok', True)),
@@ -557,10 +652,41 @@ class GeminiLiveBridge:
 
         await self.close(mark_stopped=False)
 
+    @staticmethod
+    def _compute_risk_multiplier(motion_state: str, pitch: float, velocity: float, yaw_delta: float) -> float:
+        score = 1.0
+        if motion_state == 'running':
+            score *= 2.0
+        elif motion_state == 'walking_fast':
+            score *= 1.5
+
+        if abs(pitch) > 20:
+            score *= 1.3
+
+        if abs(yaw_delta) > 30:
+            score *= 1.4
+
+        if velocity > 2.5 and abs(pitch) > 15:
+            score *= 1.5
+
+        return min(score, 4.0)
+
     def _build_blob(self, data: bytes, mime_type: str) -> Any:
         if self._types is None:
             return {'mime_type': mime_type, 'data': data}
         return self._types.Blob(data=data, mime_type=mime_type)
+
+    def _should_emit_text(self, text: str) -> bool:
+        now = time.monotonic()
+        normalized = text.strip().lower()
+        high_priority_tokens = ('stop', 'hazard', 'danger', 'vehicle', 'stairs', 'hole', 'drop')
+        if any(token in normalized for token in high_priority_tokens):
+            self._last_voice_emit_ts = now
+            return True
+        if now - self._last_voice_emit_ts >= 8:
+            self._last_voice_emit_ts = now
+            return True
+        return False
 
     @staticmethod
     def _now() -> str:

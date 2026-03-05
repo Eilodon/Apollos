@@ -60,7 +60,7 @@ export function useARIA({ sessionId, onBackendMessage, onHardStop }: UseARIAOpti
       return;
     }
 
-    if (type === 'assistant_text' || type === 'audio_chunk' || type === 'connection_state') {
+    if (type === 'assistant_text' || type === 'audio_chunk' || type === 'connection_state' || type === 'semantic_cue') {
       onBackendMessage?.(payload as BackendToClientMessage);
     }
   }, [onBackendMessage, onHardStop]);

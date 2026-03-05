@@ -10,9 +10,11 @@ from typing import Any, Callable
 from .live_bridge import GeminiLiveBridge
 from .session_manager import SessionStore
 from .tools.context_manager import get_context_summary
+from .tools.emotion_escalator import escalate_mode_if_stressed
 from .tools.emotion_logger import log_emotion_event
 from .tools.hazard_logger import log_hazard_event
 from .tools.human_help import request_human_help
+from .tools.location_intel import identify_location
 from .tools.mode_switcher import set_navigation_mode
 from .tools.runtime import configure_runtime, reset_current_session, set_current_session
 from .websocket_handler import WebSocketRegistry
@@ -47,6 +49,8 @@ class AriaAgentOrchestrator:
             'log_hazard_event': log_hazard_event,
             'set_navigation_mode': set_navigation_mode,
             'log_emotion_event': log_emotion_event,
+            'escalate_mode_if_stressed': escalate_mode_if_stressed,
+            'identify_location': identify_location,
             'get_context_summary': get_context_summary,
             'request_human_help': request_human_help,
         }
@@ -74,7 +78,16 @@ class AriaAgentOrchestrator:
             return
 
         motion_state = str(payload.get('motion_state', 'stationary'))
-        await self._session_store.touch_session(session_id, motion_state=motion_state)
+        lat = payload.get('lat')
+        lng = payload.get('lng')
+        heading_deg = payload.get('heading_deg')
+        await self._session_store.touch_session(
+            session_id,
+            motion_state=motion_state,
+            lat=float(lat) if isinstance(lat, (int, float)) else None,
+            lng=float(lng) if isinstance(lng, (int, float)) else None,
+            heading_deg=float(heading_deg) if isinstance(heading_deg, (int, float)) else None,
+        )
 
         if message_type == 'multimodal_frame':
             await self._handle_multimodal_frame(session_id, payload)
@@ -101,6 +114,8 @@ class AriaAgentOrchestrator:
                 prepared['distance_category'] = prepared.pop('distance')
             prepared.setdefault('distance_category', 'mid')
             prepared.setdefault('session_id', session_id)
+        if name == 'escalate_mode_if_stressed':
+            prepared.setdefault('current_mode', await self._session_store.get_effective_mode(session_id))
 
         token = set_current_session(session_id)
         try:

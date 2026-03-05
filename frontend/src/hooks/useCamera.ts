@@ -7,6 +7,15 @@ interface CameraFramePayload {
   timestamp: string;
   /** Góc xoay ngang tích lũy (độ) kể từ frame trước → Semantic Odometry */
   yaw_delta_deg: number;
+  lat?: number;
+  lng?: number;
+  heading_deg?: number;
+}
+
+export interface LocationSnapshot {
+  lat: number;
+  lng: number;
+  headingDeg?: number;
 }
 
 interface UseCameraOptions {
@@ -15,6 +24,7 @@ interface UseCameraOptions {
   motionSnapshot: MotionSnapshot;
   onFrame: (payload: CameraFramePayload) => void;
   onHazard?: (message: HardStopMessage) => void;
+  locationSnapshot?: LocationSnapshot | null;
 }
 
 function intervalForMotionState(state: MotionSnapshot['state']): number {
@@ -51,7 +61,7 @@ async function getOptimalCameraStream() {
   return await navigator.mediaDevices.getUserMedia(constraints);
 }
 
-export function useCamera({ videoRef, enabled, motionSnapshot, onFrame, onHazard }: UseCameraOptions): void {
+export function useCamera({ videoRef, enabled, motionSnapshot, onFrame, onHazard, locationSnapshot }: UseCameraOptions): void {
   const streamRef = useRef<MediaStream | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const edgeCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -132,14 +142,6 @@ export function useCamera({ videoRef, enabled, motionSnapshot, onFrame, onHazard
   }, [enabled, videoRef]);
 
   useEffect(() => {
-    if (streamRef.current) {
-      streamRef.current.getVideoTracks().forEach((track) => {
-        track.enabled = motionSnapshot.state !== 'stationary';
-      });
-    }
-  }, [motionSnapshot.state]);
-
-  useEffect(() => {
     if (!enabled) {
       streamRef.current?.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
@@ -205,7 +207,14 @@ export function useCamera({ videoRef, enabled, motionSnapshot, onFrame, onHazard
         const frameBase64 = dataUrl.split(',')[1] ?? '';
         const yawSnapshot = accumulatedYawRef.current;
         accumulatedYawRef.current = 0; // Reset sau khi đã capture
-        onFrame({ frameBase64, timestamp: new Date().toISOString(), yaw_delta_deg: yawSnapshot });
+        onFrame({
+          frameBase64,
+          timestamp: new Date().toISOString(),
+          yaw_delta_deg: yawSnapshot,
+          lat: locationSnapshot?.lat,
+          lng: locationSnapshot?.lng,
+          heading_deg: locationSnapshot?.headingDeg,
+        });
         lastCloudPostRef.current = now;
       }
     }, EDGE_INTERVAL);
@@ -213,5 +222,5 @@ export function useCamera({ videoRef, enabled, motionSnapshot, onFrame, onHazard
     return () => {
       window.clearInterval(timer);
     };
-  }, [enabled, intervalMs, onFrame, videoRef]);
+  }, [enabled, intervalMs, locationSnapshot, onFrame, videoRef]);
 }

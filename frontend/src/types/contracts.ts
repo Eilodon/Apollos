@@ -19,6 +19,9 @@ export interface MultimodalFrameMessage {
   user_text?: string;
   /** Góc xoay ngang tích lũy (độ) kể từ frame trước → Semantic Odometry */
   yaw_delta_deg?: number;
+  lat?: number;
+  lng?: number;
+  heading_deg?: number;
 }
 
 export interface AudioChunkMessage {
@@ -51,6 +54,12 @@ export interface AssistantAudioMessage {
   hazard_position_x?: number;
 }
 
+export interface SemanticCueMessage {
+  type: 'semantic_cue';
+  cue: 'approaching_object' | 'soft_obstacle' | 'turning_recommended' | 'destination_near';
+  position_x?: number;
+}
+
 export interface HardStopMessage {
   type: 'HARD_STOP';
   position_x: number;
@@ -70,4 +79,5 @@ export type BackendToClientMessage =
   | AssistantTextMessage
   | AssistantAudioMessage
   | HardStopMessage
-  | ConnectionStateMessage;
+  | ConnectionStateMessage
+  | SemanticCueMessage;

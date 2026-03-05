@@ -10,7 +10,12 @@ class FakeSessionStore:
 
 
 class FakeWebSocketRegistry:
-    pass
+    def __init__(self):
+        self.messages = []
+
+    async def send_live(self, session_id: str, payload: dict[str, Any]) -> bool:
+        self.messages.append((session_id, payload))
+        return True
 
 
 class LiveBridgeTests(unittest.IsolatedAsyncioTestCase):
@@ -104,6 +109,12 @@ class LiveBridgeTests(unittest.IsolatedAsyncioTestCase):
         call = [{'name': 'log_hazard_event', 'id': 'call1', 'args': {'position_x': 0.2}}]
         await bridge._handle_tool_calls(call)
         self.assertEqual(len(dispatched_calls), 1)
+
+    def test_risk_multiplier_increases_with_unstable_motion(self):
+        calm = self.bridge._compute_risk_multiplier('walking_slow', pitch=3, velocity=0.4, yaw_delta=1)
+        risky = self.bridge._compute_risk_multiplier('running', pitch=25, velocity=3.1, yaw_delta=40)
+        self.assertGreater(risky, calm)
+        self.assertLessEqual(risky, 4.0)
 
 if __name__ == '__main__':
     unittest.main()

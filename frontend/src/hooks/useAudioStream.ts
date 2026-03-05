@@ -20,6 +20,10 @@ export function useAudioStream({ onAudioChunk }: UseAudioStreamOptions): UseAudi
   const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const sinkGainRef = useRef<GainNode | null>(null);
+  const gateHoldFramesRef = useRef(0);
+
+  const VOICE_THRESHOLD = 0.02;
+  const GATE_HOLD_FRAMES = 8;
 
   const stopMic = useCallback(() => {
     processorRef.current?.disconnect();
@@ -37,6 +41,7 @@ export function useAudioStream({ onAudioChunk }: UseAudioStreamOptions): UseAudi
 
     mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
     mediaStreamRef.current = null;
+    gateHoldFramesRef.current = 0;
 
     setMicActive(false);
   }, []);
@@ -68,6 +73,25 @@ export function useAudioStream({ onAudioChunk }: UseAudioStreamOptions): UseAudi
         const input = event.inputBuffer.getChannelData(0);
         const chunk = new Float32Array(input.length);
         chunk.set(input);
+
+        let sum = 0;
+        for (let i = 0; i < chunk.length; i += 1) {
+          const sample = chunk[i] ?? 0;
+          sum += sample * sample;
+        }
+        const rms = Math.sqrt(sum / Math.max(chunk.length, 1));
+        const isVoice = rms > VOICE_THRESHOLD;
+
+        if (isVoice) {
+          gateHoldFramesRef.current = GATE_HOLD_FRAMES;
+        } else if (gateHoldFramesRef.current > 0) {
+          gateHoldFramesRef.current -= 1;
+        }
+
+        if (!isVoice && gateHoldFramesRef.current === 0) {
+          return;
+        }
+
         const base64 = floatToPcm16Base64(chunk);
         onAudioChunk(base64);
       };

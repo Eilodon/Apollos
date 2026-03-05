@@ -17,6 +17,10 @@ class MultimodalFramePayload(TypedDict, total=False):
     pitch: float
     velocity: float
     user_text: str
+    yaw_delta_deg: float
+    lat: float
+    lng: float
+    heading_deg: float
 
 
 class AudioChunkPayload(TypedDict):

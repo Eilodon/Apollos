@@ -7,13 +7,14 @@ import { TranscriptPanel } from './components/TranscriptPanel';
 import { useARIA } from './hooks/useARIA';
 import { useAudioStream } from './hooks/useAudioStream';
 import { useCamera } from './hooks/useCamera';
+import { useLocationContext } from './hooks/useLocationContext';
 import { useMotionSensor } from './hooks/useMotionSensor';
 import { usePocketMode } from './hooks/usePocketMode';
 import { useWakeLock } from './hooks/useWakeLock';
 import { AudioCache } from './services/audioCache';
 import { SpatialAudioEngine } from './services/spatialAudioEngine';
 import { vibrateHardStop, vibrateReconnect, vibrateSoftConfirm } from './services/haptics';
-import { BackendToClientMessage, HardStopMessage, NavigationMode } from './types/contracts';
+import { BackendToClientMessage, HardStopMessage, NavigationMode, SemanticCueMessage } from './types/contracts';
 
 type TranscriptEntry = {
   id: string;
@@ -23,6 +24,7 @@ type TranscriptEntry = {
 };
 
 const MODE_ORDER: NavigationMode[] = ['NAVIGATION', 'EXPLORE', 'READ', 'QUIET'];
+const ONBOARDING_KEY = 'apollos_onboarding_completed_v1';
 
 function nextMode(current: NavigationMode): NavigationMode {
   const index = MODE_ORDER.indexOf(current);
@@ -53,6 +55,7 @@ export default function App(): JSX.Element {
   const [hazardPosition, setHazardPosition] = useState(0);
   const [hazardVisible, setHazardVisible] = useState(false);
   const [hazardDistance, setHazardDistance] = useState<'very_close' | 'mid' | 'far'>('mid');
+  const [onboardingState, setOnboardingState] = useState<'pending' | 'running' | 'await_mode' | 'done'>('pending');
 
   const audioCacheRef = useRef(new AudioCache(3));
   const spatialRef = useRef<SpatialAudioEngine | null>(null);
@@ -74,6 +77,7 @@ export default function App(): JSX.Element {
 
   const { oledBlackMode, wakeLockActive, activateNavigationMode, deactivateNavigationMode } = useWakeLock();
   const inPocket = usePocketMode();
+  const locationSnapshot = useLocationContext(sessionActive);
 
   const onBackendMessage = useCallback((message: BackendToClientMessage) => {
     if (message.type === 'assistant_text') {
@@ -90,6 +94,15 @@ export default function App(): JSX.Element {
 
       spatialRef.current.playChunkFromBase64(pcmBase64, message.hazard_position_x ?? hazardPosition);
       audioCacheRef.current.add({ timestamp: message.timestamp, pcmBase64 });
+      return;
+    }
+
+    if (message.type === 'semantic_cue') {
+      if (!spatialRef.current) {
+        return;
+      }
+      const cueMessage = message as SemanticCueMessage;
+      spatialRef.current.fireSemanticCue(cueMessage.cue, cueMessage.position_x ?? hazardPosition);
       return;
     }
 
@@ -127,6 +140,7 @@ export default function App(): JSX.Element {
     enabled: sessionActive && aria.status === 'connected',
     motionSnapshot,
     onHazard: onHardStop,
+    locationSnapshot,
     onFrame: ({ frameBase64, timestamp, yaw_delta_deg }) => {
       aria.sendFrame({
         timestamp,
@@ -135,6 +149,9 @@ export default function App(): JSX.Element {
         pitch: motionSnapshot.pitch,
         velocity: motionSnapshot.velocity,
         yaw_delta_deg,
+        lat: locationSnapshot?.lat,
+        lng: locationSnapshot?.lng,
+        heading_deg: locationSnapshot?.headingDeg,
       });
     },
   });
@@ -142,6 +159,45 @@ export default function App(): JSX.Element {
   const appendSystemEntry = useCallback((text: string) => {
     setTranscriptEntries((prev) => [...prev, createEntry('system', text)]);
   }, []);
+
+  const sleep = useCallback((ms: number) => new Promise<void>((resolve) => {
+    window.setTimeout(resolve, ms);
+  }), []);
+
+  const completeOnboarding = useCallback((preferredMode: NavigationMode) => {
+    setNavigationMode(preferredMode);
+    aria.sendUserCommand(`set_navigation_mode:${preferredMode}`);
+    localStorage.setItem(ONBOARDING_KEY, '1');
+    setOnboardingState('done');
+    appendSystemEntry(`Onboarding completed. Mode set to ${preferredMode}.`);
+  }, [appendSystemEntry, aria]);
+
+  const runTrustProtocol = useCallback(async () => {
+    if (onboardingState !== 'pending' || !sessionActive) {
+      return;
+    }
+    setOnboardingState('running');
+    appendSystemEntry('Onboarding 90s: ARIA trust protocol started.');
+
+    appendSystemEntry('Xin chao, toi la ARIA. Toi dang nhin qua camera cua ban.');
+    aria.sendUserCommand('describe_detailed');
+    await sleep(9000);
+
+    appendSystemEntry('Hay gio tay truoc camera de toi xac nhan khoang cach.');
+    aria.sendUserCommand('describe_hand_distance');
+    await sleep(18000);
+
+    appendSystemEntry('Dang calibration am thanh dinh huong: trai -> phai -> giua.');
+    spatialRef.current?.fireSemanticCue('turning_recommended', -1);
+    await sleep(1000);
+    spatialRef.current?.fireSemanticCue('turning_recommended', 1);
+    await sleep(1000);
+    spatialRef.current?.fireSemanticCue('destination_near', 0);
+    await sleep(1500);
+
+    appendSystemEntry('Chon cach ARIA se noi: NAVIGATION (nhieu huong dan) hoac QUIET (chi khi critical).');
+    setOnboardingState('await_mode');
+  }, [appendSystemEntry, aria, onboardingState, sessionActive, sleep]);
 
   const startSession = useCallback(async () => {
     if (sessionActive) {
@@ -232,6 +288,20 @@ export default function App(): JSX.Element {
     appendSystemEntry('Shake detected. SOS sent.');
     vibrateHardStop();
   }, [appendSystemEntry, aria, sessionActive, shakeSignal]);
+
+  useEffect(() => {
+    const completed = localStorage.getItem(ONBOARDING_KEY) === '1';
+    if (completed) {
+      setOnboardingState('done');
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!sessionActive || onboardingState !== 'pending') {
+      return;
+    }
+    void runTrustProtocol();
+  }, [onboardingState, runTrustProtocol, sessionActive]);
 
   useEffect(() => {
     if (aria.status === 'connected') {
@@ -332,6 +402,20 @@ export default function App(): JSX.Element {
           Repeat
         </button>
       </footer>
+
+      {sessionActive && onboardingState === 'await_mode' && (
+        <div className="controls">
+          <button type="button" onClick={() => completeOnboarding('NAVIGATION')}>
+            Onboarding: NAVIGATION
+          </button>
+          <button type="button" onClick={() => completeOnboarding('QUIET')}>
+            Onboarding: QUIET
+          </button>
+          <button type="button" onClick={() => completeOnboarding('NAVIGATION')}>
+            Skip
+          </button>
+        </div>
+      )}
 
       <p className="gesture-hint">
         Tap: mic toggle. Double tap: repeat. Long press: human help. Swipe up: next mode. Swipe down: detailed describe.
