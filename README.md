@@ -176,12 +176,17 @@ terraform apply \
   -var="container_image=gcr.io/YOUR_PROJECT/aria-backend:latest"
 ```
 
+## Architecture: Layer 0 Fallback (Upcoming)
+
+Whilst Gemini Live API BIDI streaming (Layer 2/3) provides the core multimodal intelligence, we are planning a **Layer 0 TFLite Fallback** stub. This will utilize on-device Firebase ML Kit / TFLite object detection to ensure basic obstacle and drop-off alerts remain functional even during complete network drops.
+
 ## Known limitations in this MVP
 
-- Exact Live API config compatibility can vary by SDK/model version; bridge auto-retries reduced config/model fallbacks.
-- `assets/alert_ping.mp3` is placeholder and should be replaced with production ping audio.
-- iOS background constraints remain browser-dependent; fallback behavior is documented.
+- **iOS Web Audio Quirks:** Background execution on iOS Safari is heavily restricted. The app may suspend spatial audio or microphone streaming when the screen is locked unless specific PWA capabilities are granted.
+- Exact Live API config compatibility can vary by SDK/model version.
+- `assets/alert_ping.mp3` spatial depths are mapped but may vary slightly based on the HRTF implementation of the user's browser.
 
-## Safety note
+## Hardware Requirements & Safety Note
 
-For real-world usage, open-ear or bone-conduction headphones are strongly recommended to preserve traffic awareness.
+**Mandatory:** For real-world usage, **open-ear or bone-conduction headphones (e.g., Shokz)** are strongly required. 
+Using standard noise-canceling or in-ear headphones will block environmental sounds (traffic, pedestrians), which is a critical safety hazard for blind and low-vision users. Always preserve your natural acoustic awareness.

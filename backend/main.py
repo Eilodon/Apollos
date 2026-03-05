@@ -1,143 +1,54 @@
-from __future__ import annotations
-
-import json
-import os
-from datetime import datetime, timezone
-from time import time
-from typing import Any
-
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from google.adk.runners import Runner
+from google.adk.sessions import InMemorySessionService
+from .agent.aria_agent import create_aria_agent
+from .agent.run_config import get_run_config
+import asyncio
 
-from agent.aria_agent import AriaAgent
-from agent.session_manager import SessionStore
-from agent.tools.hazard_logger import log_hazard_event
-from agent.tools.runtime import reset_current_session, set_current_session
-from agent.websocket_handler import WebSocketRegistry
+app = FastAPI(title="VisionGPT ARIA - Pure ADK Backend")
 
-
-class HazardRequest(BaseModel):
-    hazard_type: str = 'drop'
-    position_x: float = Field(default=0.0, ge=-1.0, le=1.0)
-    distance: str = 'very_close'
-    confidence: float = Field(default=0.95, ge=0.0, le=1.0)
-    description: str = 'Manual hazard trigger for testing.'
-
-
-app = FastAPI(title='VisionGPT ARIA Backend', version='0.1.0')
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=['*'],
-    allow_methods=['*'],
-    allow_headers=['*'],
+# Khởi tạo Pure ADK
+root_agent = create_aria_agent()
+session_service = InMemorySessionService()
+runner = Runner(
+    agent=root_agent,
+    session_service=session_service,
+    app_name="visiongpt-aria"
 )
 
-session_store = SessionStore(
-    project_id=os.getenv('GOOGLE_CLOUD_PROJECT'),
-    use_firestore=os.getenv('USE_FIRESTORE', '0') == '1',
-)
-ws_registry = WebSocketRegistry()
-aria_agent = AriaAgent(session_store=session_store, websocket_registry=ws_registry)
+run_config = get_run_config()
 
+# Lưu active WS cho HARD_STOP emit
+active_connections: dict[str, WebSocket] = {}
 
-@app.get('/healthz')
-async def healthz() -> dict[str, str]:
-    return {'status': 'ok'}
-
-
-@app.get('/config')
-async def read_config() -> dict[str, object]:
-    run_config = aria_agent.run_config
-    if hasattr(run_config, 'payload'):
-        serialized = run_config.payload
-    else:
-        serialized = {'type': type(run_config).__name__}
-
-    return {
-        'model': os.getenv('GEMINI_MODEL', 'gemini-live-2.5-flash-native-audio'),
-        'run_config': serialized,
-    }
-
-
-@app.on_event('shutdown')
-async def on_shutdown() -> None:
-    await aria_agent.close_all_sessions()
-
-
-@app.websocket('/ws/live/{session_id}')
-async def ws_live(websocket: WebSocket, session_id: str) -> None:
+@app.websocket("/ws/live/{session_id}")
+async def websocket_live_endpoint(websocket: WebSocket, session_id: str):
     await websocket.accept()
-    await ws_registry.register_live(session_id, websocket)
-
-    await ws_registry.send_live(
-        session_id,
-        {
-            'type': 'connection_state',
-            'state': 'connected',
-            'detail': 'Live channel ready',
-        },
-    )
-
+    active_connections[session_id] = websocket
+    
     try:
-        while True:
-            raw_message = await websocket.receive_text()
-            try:
-                payload = json.loads(raw_message)
-            except json.JSONDecodeError:
-                await ws_registry.send_live(
-                    session_id,
-                    {
-                        'type': 'assistant_text',
-                        'session_id': session_id,
-                        'timestamp': session_store.now(),
-                        'text': 'Malformed JSON payload.',
-                    },
-                )
-                continue
-            await aria_agent.handle_client_message(session_id, payload)
-    except WebSocketDisconnect:
-        pass
-    finally:
-        await ws_registry.unregister_live(session_id, websocket)
-        await aria_agent.close_session(session_id)
-
-
-@app.websocket('/ws/emergency/{session_id}')
-async def ws_emergency(websocket: WebSocket, session_id: str) -> None:
-    await websocket.accept()
-    await ws_registry.register_emergency(session_id, websocket)
-
-    try:
-        while True:
-            # Keep socket alive. Client may optionally send heartbeat messages.
-            await websocket.receive_text()
-    except WebSocketDisconnect:
-        pass
-    finally:
-        await ws_registry.unregister_emergency(session_id, websocket)
-
-
-@app.post('/dev/hazard/{session_id}')
-async def trigger_hazard(session_id: str, body: HazardRequest) -> dict[str, Any]:
-    received_at_ms = int(time() * 1000)
-    token = set_current_session(session_id)
-    try:
-        message = await log_hazard_event(
-            hazard_type=body.hazard_type,
-            position_x=body.position_x,
-            distance_category=body.distance,
-            confidence=body.confidence,
-            description=body.description,
+        # Pure ADK run_live (xử lý video frame + audio chunk từ client)
+        async for event in runner.run_live(
             session_id=session_id,
-        )
+            run_config=run_config
+        ):
+            if event.type == "audio":
+                await websocket.send_bytes(event.audio_data)          # Gửi voice về PWA
+            elif event.type == "function_call":
+                await handle_function_call(event, websocket, session_id)
+                
+    except WebSocketDisconnect:
+        print(f"Session {session_id} disconnected")
     finally:
-        reset_current_session(token)
+        active_connections.pop(session_id, None)
 
-    return {
-        'status': 'ok',
-        'message': message,
-        'request_received_ts': datetime.now(timezone.utc).isoformat(),
-        'request_received_ts_ms': received_at_ms,
-    }
+async def handle_function_call(event, websocket: WebSocket, session_id: str):
+    """Xử lý HARD_STOP khi Gemini gọi tool"""
+    if event.tool_name == "log_hazard_event":
+        payload = {
+            "type": "HARD_STOP",
+            "position_x": event.args.get("position_x", 0.0),
+            "distance": event.args.get("distance_category", "mid"),
+            "hazard_type": event.args.get("hazard_type")
+        }
+        await websocket.send_json(payload)   # Trigger siren ngay lập tức

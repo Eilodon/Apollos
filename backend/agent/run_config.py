@@ -1,53 +1,41 @@
-from __future__ import annotations
+from google.adk.run_config import RunConfig, StreamingMode
+from google.genai import types
 
-from dataclasses import dataclass
-from typing import Any
-
-
-@dataclass(slots=True)
-class FallbackRunConfig:
-    """Used when Google ADK packages are unavailable locally."""
-
-    payload: dict[str, Any]
-
-
-def build_run_config() -> Any:
-    payload = {
-        'streaming_mode': 'BIDI',
-        'response_modalities': ['AUDIO'],
-        'session_resumption': {'transparent': True},
-        'context_window_compression': {
-            'trigger_tokens': 100000,
-            'sliding_window': {'target_tokens': 80000},
-        },
-        'speech_config': {
-            'voice_name': 'Kore',
-            'enable_affective_dialog': True,
-            'enable_proactivity': True,
-        },
-    }
-
-    try:
-        from google.adk.agents.run_config import RunConfig, StreamingMode
-        from google.genai import types
-    except Exception:
-        return FallbackRunConfig(payload=payload)
-
+def get_run_config() -> RunConfig:
+    """
+    RunConfig chính thức cho Gemini Live API BIDI streaming
+    (theo ADK Streaming Guide Part 4 - 2026)
+    """
     return RunConfig(
         streaming_mode=StreamingMode.BIDI,
-        response_modalities=['AUDIO'],
+        response_modalities=["AUDIO"],                    # Chỉ audio output (voice)
         input_audio_transcription=types.AudioTranscriptionConfig(),
         output_audio_transcription=types.AudioTranscriptionConfig(),
-        session_resumption=types.SessionResumptionConfig(transparent=True),
+        
+        # === SESSION MANAGEMENT (fix 2-min video limit + 10-min connection) ===
+        session_resumption=types.SessionResumptionConfig(
+            transparent=True                              # ADK tự resume + inject context
+        ),
         context_window_compression=types.ContextWindowCompressionConfig(
             trigger_tokens=100000,
-            sliding_window=types.SlidingWindow(target_tokens=80000),
+            sliding_window=types.SlidingWindow(target_tokens=80000)
         ),
+        
+        # === SPEECH & AFFECTIVE DIALOG (Emotion-aware + proactive) ===
         speech_config=types.SpeechConfig(
-            voice_config=types.VoiceConfig(
-                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name='Kore')
-            ),
-            enable_affective_dialog=True,
-            enable_proactivity=True,
+            voice_config=types.PrebuiltVoiceConfig(voice_name="Kore"),
+            enable_affective_dialog=True,                 # Native emotion detection
+            enable_proactivity=True,                      # Proactive hazard alerts
         ),
+        
+        # === REALTIME INPUT (VAD + barge-in) ===
+        realtime_input_config=types.RealtimeInputConfig(
+            automatic_activity_detection=types.AutomaticActivityDetection(
+                enabled=True
+            )
+        ),
+        
+        thinking_config=types.ThinkingConfig(
+            thinking_budget=512
+        )
     )

@@ -68,6 +68,14 @@ export function useCamera({ videoRef, enabled, motionSnapshot, onFrame }: UseCam
   }, [enabled, videoRef]);
 
   useEffect(() => {
+    if (streamRef.current) {
+      streamRef.current.getVideoTracks().forEach((track) => {
+        track.enabled = motionSnapshot.state !== 'stationary';
+      });
+    }
+  }, [motionSnapshot.state]);
+
+  useEffect(() => {
     if (!enabled) {
       streamRef.current?.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
