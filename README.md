@@ -1,112 +1,80 @@
-# Apollos — Rust Core + Native Shells
+# Apollos — Cognitive Infrastructure (Eidolon-V)
 
-Apollos is now a Rust-first safety navigation stack:
+Apollos is a **Safety-Critical, Rust-First Navigation Stack** serving as the Cognitive Infrastructure (Eidolon-V) for the visually impaired. It is built upon a Thermodynamic Causal Architecture designed to guarantee **Zero Hallucinations** and **Safe-by-Design** execution.
 
-- `apollos-core`: edge/reflex logic + C ABI for mobile FFI
-- `apollos-server`: Axum backend with Gemini Live WS + tool-calls
-- `apollos-proto`: shared contracts and protobuf transport
-- `apollos-bench`: benchmark harness
-- `native/android` + `native/ios`: thin native shells calling Rust core
+The legacy Python/TypeScript runtime has been completely eradicated.
 
-Legacy TypeScript/Python runtime has been removed.
+## Core Architecture
 
-## Workspace
+Apollos is split into highly optimized Rust crates and Native Shells:
+
+- **`apollos-core` (The Edge Brain):** Computes physics, optical flow, and depth on the edge. Exposes a zero-copy C ABI for mobile FFI.
+- **`apollos-server` (The Orchestrator):** Axum-based WebSocket backend handling Gemini Live API duplex streaming, Tool Calls, and Thermodynamic State regulation.
+- **`apollos-proto` (The Contract):** Type-safe, Protobuf-based communication removing Schema Drift between Edge and Cloud.
+- **`native/android` & `native/ios` (The Sensory Organisms):** Ultra-thin native shells collecting 1000Hz IMU and RGB data, bridging to the Rust Core via JNI/Swift bindings.
+
+## The Thermodynamic Causal Engine
+
+Apollos operates strictly on Causal reasoning (Pearl's do-calculus), rejecting standard AI correlation.
+
+1. **Anti-OOM Backpressure (Gemini Bridge):** Realtime duplex streaming using Bounded Channels (`mpsc::channel(1024)`) with `try_send`. Frames are intelligently dropped during network congestion to preserve memory, but audio is prioritized. Tool calls are strictly decoupled via `tokio::spawn` to prevent blocking the WebSocket loop (Vòng Lặp Tử Thần).
+2. **Strict Kinematic Gating:** The Edge Brain refuses to capture data during Free Fall (Magnitude outside 8.0 - 12.0) or when upside-down. The FFI consumes dual Quaternions (not error-prone Gyro) for exact Semantic Odometry (Yaw/Pitch/Roll).
+3. **Block Matching Algorithm (BMA):** Frame Differencing has been replaced by a rigorous Data-Oriented BMA for Optical Expansion, calculating pure depth-threats and ignoring ego-motion (walking side-to-side).
+4. **Zero-Guess Depth Engine:** ONNX heuristics fallbacks are forbidden. If the Depth ML fails, the system safely degrades. We don't guess with human lives.
+5. **Global Trauma Registry:** `apollos-server/session.rs` persists Hazard logs via Firestore (`USE_FIRESTORE=1`), building a collective Crowd Hazard Map for immediate system recoil upon repeated failures.
+
+## Workspace Layout
 
 ```text
 crates/
-  apollos-core
-  apollos-server
-  apollos-proto
-  apollos-bench
+  apollos-core     # FFI, Physics, Block Matcher, Depth Engine
+  apollos-server   # Axum, Gemini Bridge, Session, Tool Registry
+  apollos-proto    # Protobuf definitions
+  apollos-bench    # Benchmarking
 native/
-  android/
-  ios/
+  android/         # Kotlin Shell + C++ JNI Config
+  ios/             # Swift UI + C Header Bridge
 scripts/
   build_native_core.sh
 ```
 
-## Core Commands
+## Running the Engine
+
+### Local Development / CI Checks
 
 ```bash
 cargo fmt --all
 cargo check --workspace
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-cargo clippy -p apollos-core --features ml --all-targets -- -D warnings
 ```
 
-Run backend:
-
+### Server Boot
 ```bash
 cargo run -p apollos-server
-```
 
-Health check:
-
-```bash
+# Health check
 curl http://127.0.0.1:8000/healthz
 ```
 
-## Gemini Live
-
-`apollos-server` supports:
-
-- Live WebSocket bridge to Gemini BidiGenerateContent
-- Realtime frame/audio forwarding
-- Tool-call dispatch + tool-response loop
-- REST `generateContent` fallback path
-
-Important envs:
-
-- `ENABLE_GEMINI_LIVE=1`
-- `GEMINI_API_KEY` or `GOOGLE_API_KEY`
-- `GEMINI_MODEL` (default `gemini-2.5-flash`)
-- `GEMINI_LIVE_ENDPOINT_BASE` (optional override)
-
-## Firestore Persistence
-
-Session and event persistence is available via Firestore REST when enabled:
-
-- `USE_FIRESTORE=1`
-- `GOOGLE_CLOUD_PROJECT=<project-id>`
-- Auth: either
-  - `FIRESTORE_BEARER_TOKEN=<oauth-token>`
-  - or Cloud metadata token (Cloud Run / GCE default service account)
-
-Persisted data:
-
-- `sessions/{session_id}`
-- `sessions/{session_id}/hazards`
-- `sessions/{session_id}/emotions`
-- `hazard_map/{geohash-hazard}`
-
-## Twilio Human Help Tokens
-
-Human fallback now mints real Twilio Video access tokens when configured:
-
-- `TWILIO_ACCOUNT_SID`
-- `TWILIO_VIDEO_API_KEY_SID`
-- `TWILIO_VIDEO_API_KEY_SECRET`
-- `TWILIO_VIDEO_ROOM_PREFIX` (optional, default `apollos-help`)
-- `TWILIO_VIDEO_TOKEN_TTL_SECONDS` (optional)
-
-If credentials are absent, service falls back to explicit stub token strings.
-
-## Native FFI Integration
-
-`apollos-core` exports C ABI symbols from `crates/apollos-core/src/ffi.rs`:
-
-- `apollos_abi_version_u32`
-- `apollos_analyze_kinematics`
-- `apollos_compute_yaw_delta`
-- `apollos_get_carry_mode_profile`
-
-Build native artifacts:
-
+### Native Core Building
 ```bash
 ./scripts/build_native_core.sh
 ```
 
-Android shell uses JNI bridge (`native/android/app/src/main/cpp/rust_bridge.cpp`) and Kotlin wrapper (`RustCoreBridge.kt`).
+## Crucial Environment Variables
 
-iOS shell uses Swift bridge (`native/ios/ApollosShell/RustCoreBridge.swift`) + C header (`ApollosCoreFFI.h`).
+**Gemini Live Orchestrator:**
+- `ENABLE_GEMINI_LIVE=1`
+- `GEMINI_API_KEY` (Required)
+- `GEMINI_MODEL` (Default: `gemini-2.5-flash`)
+
+**Trauma Registry (Firestore):**
+- `USE_FIRESTORE=1`
+- `GOOGLE_CLOUD_PROJECT`
+- `FIRESTORE_BEARER_TOKEN` (or Cloud Run Default Service Account)
+
+**Human Support Escapement (Twilio):**
+- `TWILIO_ACCOUNT_SID`
+- `TWILIO_VIDEO_API_KEY_SID`
+- `TWILIO_VIDEO_API_KEY_SECRET`
