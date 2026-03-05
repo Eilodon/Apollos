@@ -34,13 +34,11 @@ export function useARIA({ sessionId, onBackendMessage, onHardStop }: UseARIAOpti
   const [status, setStatus] = useState<UseARIAResult['status']>('disconnected');
 
   const liveSocketRef = useRef<WebSocket | null>(null);
-  const emergencySocketRef = useRef<WebSocket | null>(null);
   const reconnectAttempts = useRef(0);
   const reconnectTimer = useRef<number | null>(null);
   const shouldReconnectRef = useRef(false);
 
   const liveUrl = useMemo(() => buildWsUrl(`/live/${sessionId}`), [sessionId]);
-  const emergencyUrl = useMemo(() => buildWsUrl(`/emergency/${sessionId}`), [sessionId]);
 
   const clearReconnectTimer = useCallback(() => {
     if (reconnectTimer.current !== null) {
@@ -58,11 +56,6 @@ export function useARIA({ sessionId, onBackendMessage, onHardStop }: UseARIAOpti
       liveSocketRef.current = null;
     }
 
-    if (emergencySocketRef.current) {
-      emergencySocketRef.current.close(1000, 'client_disconnect');
-      emergencySocketRef.current = null;
-    }
-
     reconnectAttempts.current = 0;
     setStatus('disconnected');
   }, [clearReconnectTimer]);
@@ -71,9 +64,6 @@ export function useARIA({ sessionId, onBackendMessage, onHardStop }: UseARIAOpti
     if (liveSocketRef.current?.readyState === WebSocket.OPEN || liveSocketRef.current?.readyState === WebSocket.CONNECTING) {
       liveSocketRef.current.close(1000, 'reconnecting');
     }
-    if (emergencySocketRef.current?.readyState === WebSocket.OPEN || emergencySocketRef.current?.readyState === WebSocket.CONNECTING) {
-      emergencySocketRef.current.close(1000, 'reconnecting');
-    }
 
     shouldReconnectRef.current = true;
     clearReconnectTimer();
@@ -81,9 +71,7 @@ export function useARIA({ sessionId, onBackendMessage, onHardStop }: UseARIAOpti
     setStatus(reconnectAttempts.current > 0 ? 'reconnecting' : 'connecting');
 
     const liveSocket = new WebSocket(liveUrl);
-    const emergencySocket = new WebSocket(emergencyUrl);
     liveSocketRef.current = liveSocket;
-    emergencySocketRef.current = emergencySocket;
 
     liveSocket.onopen = () => {
       reconnectAttempts.current = 0;
@@ -103,28 +91,8 @@ export function useARIA({ sessionId, onBackendMessage, onHardStop }: UseARIAOpti
       }
     };
 
-    emergencySocket.onmessage = (event) => {
-      let data: BackendToClientMessage;
-      try {
-        data = JSON.parse(event.data) as BackendToClientMessage;
-      } catch {
-        return;
-      }
-      onBackendMessage?.(data);
-      if (data.type === 'HARD_STOP') {
-        onHardStop?.(data);
-      }
-    };
-
     const onClose = () => {
-      // Force close the other socket to maintain consistency
-      if (liveSocket.readyState === WebSocket.OPEN) {
-        liveSocket.close(1000, 'sync_close');
-      }
-      if (emergencySocket.readyState === WebSocket.OPEN) {
-        emergencySocket.close(1000, 'sync_close');
-      }
-
+      // Manage reconnect state
       if (!shouldReconnectRef.current) {
         setStatus('disconnected');
         return;
@@ -148,16 +116,11 @@ export function useARIA({ sessionId, onBackendMessage, onHardStop }: UseARIAOpti
     };
 
     liveSocket.onclose = onClose;
-    emergencySocket.onclose = onClose;
 
     liveSocket.onerror = () => {
       liveSocket.close();
     };
-
-    emergencySocket.onerror = () => {
-      emergencySocket.close();
-    };
-  }, [clearReconnectTimer, emergencyUrl, liveUrl, onBackendMessage, onHardStop]);
+  }, [clearReconnectTimer, liveUrl, onBackendMessage, onHardStop]);
 
   const sendFrame = useCallback(
     (message: Omit<MultimodalFrameMessage, 'type' | 'session_id'>) => {
