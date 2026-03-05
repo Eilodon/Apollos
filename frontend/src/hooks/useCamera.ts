@@ -23,6 +23,30 @@ function intervalForMotionState(state: MotionSnapshot['state']): number {
   return 1000;
 }
 
+async function getOptimalCameraStream() {
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  const videoDevices = devices.filter(d => d.kind === 'videoinput');
+
+  const ultrawide = videoDevices.find(d =>
+    d.label.toLowerCase().includes('ultra') ||
+    d.label.toLowerCase().includes('0.5x') ||
+    d.label.toLowerCase().includes('wide') // Fallback a bit broader if ultra not explicitly named
+  );
+
+  const constraints: MediaStreamConstraints = {
+    video: {
+      deviceId: ultrawide ? { exact: ultrawide.deviceId } : undefined,
+      facingMode: ultrawide ? undefined : { ideal: 'environment' },
+      width: { ideal: 768 },
+      height: { ideal: 768 },
+      frameRate: { ideal: 10 }
+    },
+    audio: false,
+  };
+
+  return await navigator.mediaDevices.getUserMedia(constraints);
+}
+
 export function useCamera({ videoRef, enabled, motionSnapshot, onFrame }: UseCameraOptions): void {
   const streamRef = useRef<MediaStream | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -37,14 +61,7 @@ export function useCamera({ videoRef, enabled, motionSnapshot, onFrame }: UseCam
     let mounted = true;
     void (async () => {
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: {
-            facingMode: 'environment',
-            width: { ideal: 1280 },
-            height: { ideal: 720 },
-          },
-          audio: false,
-        });
+        const stream = await getOptimalCameraStream();
 
         if (!mounted) {
           stream.getTracks().forEach((track) => track.stop());

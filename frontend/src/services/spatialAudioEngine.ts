@@ -13,6 +13,8 @@ export class SpatialAudioEngine {
   private sirenBuffer: AudioBuffer | null = null;
   private pingInterval: number | null = null;
   private activeSources = new Set<AudioBufferSourceNode>();
+  private nextPlayTime: number = 0;
+  private readonly JITTER_DELAY = 0.1;
 
   constructor() {
     const Ctx = window.AudioContext || (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
@@ -133,7 +135,7 @@ export class SpatialAudioEngine {
       return;
     }
 
-    this.setPosition(hazardPositionX);
+    this.setPosition(hazardPositionX, 'default');
     const audioBuffer = this.ctx.createBuffer(1, pcmData.length, 24000);
     audioBuffer.getChannelData(0).set(pcmData);
 
@@ -141,7 +143,14 @@ export class SpatialAudioEngine {
     source.buffer = audioBuffer;
     source.connect(this.panner);
     this.registerSource(source);
-    source.start();
+
+    const currentTime = this.ctx.currentTime;
+    if (this.nextPlayTime < currentTime) {
+      this.nextPlayTime = currentTime + this.JITTER_DELAY;
+    }
+
+    source.start(this.nextPlayTime);
+    this.nextPlayTime += audioBuffer.duration;
   }
 
   playChunkFromBase64(pcmBase64: string, hazardPositionX = 0): void {
