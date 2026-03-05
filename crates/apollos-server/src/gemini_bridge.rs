@@ -153,7 +153,7 @@ impl GeminiBridge {
         frame: &apollos_proto::contracts::MultimodalFrameMessage,
     ) -> anyhow::Result<()> {
         if !self.live_enabled {
-            return Ok(());
+            anyhow::bail!("gemini live is disabled");
         }
 
         let mut parts = Vec::new();
@@ -204,7 +204,7 @@ impl GeminiBridge {
         chunk: &apollos_proto::contracts::AudioChunkMessage,
     ) -> anyhow::Result<()> {
         if !self.live_enabled {
-            return Ok(());
+            anyhow::bail!("gemini live is disabled");
         }
 
         let trimmed = chunk.audio_chunk_pcm16.trim();

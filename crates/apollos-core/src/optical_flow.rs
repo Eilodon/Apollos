@@ -201,17 +201,17 @@ pub fn compute_optical_expansion(previous: &LumaFrame, current: &LumaFrame) -> O
     let half_w = width / 2;
     let half_h = height / 2;
 
-    let q1 = abs_diff_average(previous, current, 0, 0, half_w, half_h);
-    let q2 = abs_diff_average(previous, current, half_w, 0, width, half_h);
-    let q3 = abs_diff_average(previous, current, 0, half_h, half_w, height);
-    let q4 = abs_diff_average(previous, current, half_w, half_h, width, height);
+    let q1 = block_match_average(previous, current, 0, 0, half_w, half_h);
+    let q2 = block_match_average(previous, current, half_w, 0, width, half_h);
+    let q3 = block_match_average(previous, current, 0, half_h, half_w, height);
+    let q4 = block_match_average(previous, current, half_w, half_h, width, height);
     let quadrants = [q1, q2, q3, q4];
 
     let center_start_x = ((width as f32) * 0.25) as usize;
     let center_end_x = ((width as f32) * 0.75) as usize;
     let center_start_y = ((height as f32) * 0.25) as usize;
     let center_end_y = ((height as f32) * 0.75) as usize;
-    let center_diff = abs_diff_average(
+    let center_diff = block_match_average(
         previous,
         current,
         center_start_x,
@@ -239,7 +239,7 @@ pub fn detect_floor_drop(previous: &LumaFrame, current: &LumaFrame) -> Option<Re
     let width = current.width;
     let height = current.height;
 
-    let top_diff = abs_diff_average(
+    let top_diff = block_match_average(
         previous,
         current,
         0,
@@ -247,7 +247,7 @@ pub fn detect_floor_drop(previous: &LumaFrame, current: &LumaFrame) -> Option<Re
         width,
         (height as f32 * 0.25) as usize,
     );
-    let bottom_diff = abs_diff_average(
+    let bottom_diff = block_match_average(
         previous,
         current,
         0,
@@ -311,7 +311,7 @@ fn classify_pattern(quadrants: &[f32; 4]) -> ExpansionPattern {
     ExpansionPattern::None
 }
 
-fn abs_diff_average(
+fn block_match_average(
     previous: &LumaFrame,
     current: &LumaFrame,
     x_start: usize,
@@ -320,16 +320,50 @@ fn abs_diff_average(
     y_end: usize,
 ) -> f32 {
     let width = current.width;
-    let mut total = 0.0_f32;
-    let mut count = 0_u64;
+    let mut total_min_sad = 0.0_f32;
+    let mut count = 0_usize;
+    let step = 8;
+    let search_range = 4_isize;
 
-    for y in y_start..y_end {
-        let row = y * width;
-        for x in x_start..x_end {
-            let idx = row + x;
-            let previous_px = previous.pixels[idx];
-            let current_px = current.pixels[idx];
-            total += (current_px - previous_px).abs();
+    for y in (y_start..y_end).step_by(step) {
+        if y + step > y_end || y + step > current.height {
+            break;
+        }
+        for x in (x_start..x_end).step_by(step) {
+            if x + step > x_end || x + step > width {
+                break;
+            }
+
+            let mut min_sad = f32::INFINITY;
+
+            for dy in -search_range..=search_range {
+                for dx in -search_range..=search_range {
+                    let py = (y as isize) + dy;
+                    let px = (x as isize) + dx;
+
+                    if py < 0 || px < 0 || py + (step as isize) > (previous.height as isize) || px + (step as isize) > (previous.width as isize) {
+                        continue;
+                    }
+
+                    let mut sad = 0.0_f32;
+                    for by in 0..step {
+                        let cur_row = (y + by) * width;
+                        let prev_row = ((py as usize) + by) * width;
+
+                        for bx in 0..step {
+                            let cur_px = current.pixels[cur_row + x + bx];
+                            let prev_px = previous.pixels[prev_row + (px as usize) + bx];
+                            sad += (cur_px - prev_px).abs();
+                        }
+                    }
+
+                    if sad < min_sad {
+                        min_sad = sad;
+                    }
+                }
+            }
+
+            total_min_sad += min_sad / (step * step) as f32;
             count += 1;
         }
     }
@@ -338,7 +372,7 @@ fn abs_diff_average(
         return 0.0;
     }
 
-    total / count as f32
+    total_min_sad / (count as f32)
 }
 
 fn compute_hazard_id(

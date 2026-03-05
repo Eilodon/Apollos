@@ -62,11 +62,11 @@ pub fn should_capture_frame(reading: KinematicReading, profile: CarryModeProfile
     };
 
     let magnitude = (accel.x * accel.x + accel.y * accel.y + accel.z * accel.z).sqrt();
-    if magnitude < 1.0 {
-        return true;
+    if magnitude < 8.0 || magnitude > 12.0 {
+        return false;
     }
 
-    let cos_tilt = accel.y.abs() / magnitude;
+    let cos_tilt = accel.y / magnitude;
     let pitch_compensation = (profile.pitch_offset / 100.0).clamp(-0.2, 0.2);
     let corrected_cos_tilt = (cos_tilt + pitch_compensation).min(1.0);
     let is_vertical = corrected_cos_tilt > profile.cos_tilt_threshold;

@@ -11,7 +11,7 @@ struct ManagedSocket {
     connection_id: String,
     client_id: Option<String>,
     connected_epoch_ms: i64,
-    tx: mpsc::UnboundedSender<BackendToClientMessage>,
+    tx: mpsc::Sender<BackendToClientMessage>,
 }
 
 #[derive(Debug, Default)]
@@ -30,7 +30,7 @@ impl WebSocketRegistry {
     pub async fn register_live(
         &self,
         session_id: &str,
-        tx: mpsc::UnboundedSender<BackendToClientMessage>,
+        tx: mpsc::Sender<BackendToClientMessage>,
         client_id: Option<String>,
     ) -> Result<String, String> {
         let mut guard = self.inner.lock().await;
@@ -58,7 +58,7 @@ impl WebSocketRegistry {
     pub async fn register_emergency(
         &self,
         session_id: &str,
-        tx: mpsc::UnboundedSender<BackendToClientMessage>,
+        tx: mpsc::Sender<BackendToClientMessage>,
         client_id: Option<String>,
     ) -> Result<String, String> {
         let mut guard = self.inner.lock().await;
@@ -129,7 +129,7 @@ impl WebSocketRegistry {
         &self,
         session_id: &str,
         viewer_id: &str,
-        tx: mpsc::UnboundedSender<BackendToClientMessage>,
+        tx: mpsc::Sender<BackendToClientMessage>,
     ) {
         let mut guard = self.inner.lock().await;
         let bucket = guard
@@ -170,7 +170,7 @@ impl WebSocketRegistry {
             return false;
         };
 
-        if target.tx.send(payload).is_err() {
+        if target.tx.send(payload).await.is_err() {
             let _ = self
                 .unregister_live(session_id, Some(target.connection_id.as_str()))
                 .await;
@@ -190,7 +190,7 @@ impl WebSocketRegistry {
             return false;
         };
 
-        if target.tx.send(payload).is_err() {
+        if target.tx.send(payload).await.is_err() {
             let _ = self
                 .unregister_emergency(session_id, Some(target.connection_id.as_str()))
                 .await;
@@ -225,7 +225,7 @@ impl WebSocketRegistry {
 
         let mut delivered = 0;
         for (viewer_id, managed) in targets {
-            if managed.tx.send(payload.clone()).is_ok() {
+            if managed.tx.send(payload.clone()).await.is_ok() {
                 delivered += 1;
             } else {
                 self.unregister_help_viewer(session_id, &viewer_id).await;
@@ -261,8 +261,8 @@ mod tests {
     async fn emergency_registration_requires_same_owner_as_live() {
         let registry = WebSocketRegistry::default();
 
-        let (live_tx, _live_rx) = mpsc::unbounded_channel();
-        let (emergency_tx, _emergency_rx) = mpsc::unbounded_channel();
+        let (live_tx, _live_rx) = mpsc::channel(8);
+        let (emergency_tx, _emergency_rx) = mpsc::channel(8);
 
         registry
             .register_live("s1", live_tx, Some("client-a".to_string()))
@@ -279,7 +279,7 @@ mod tests {
     #[tokio::test]
     async fn hard_stop_falls_back_to_live_when_emergency_missing() {
         let registry = WebSocketRegistry::default();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(8);
 
         registry
             .register_live("s2", tx, Some("client-a".to_string()))
@@ -297,8 +297,8 @@ mod tests {
     #[tokio::test]
     async fn help_watchers_receive_broadcast() {
         let registry = WebSocketRegistry::default();
-        let (tx1, mut rx1) = mpsc::unbounded_channel();
-        let (tx2, mut rx2) = mpsc::unbounded_channel();
+        let (tx1, mut rx1) = mpsc::channel(8);
+        let (tx2, mut rx2) = mpsc::channel(8);
 
         registry.register_help_viewer("s3", "v1", tx1).await;
         registry.register_help_viewer("s3", "v2", tx2).await;

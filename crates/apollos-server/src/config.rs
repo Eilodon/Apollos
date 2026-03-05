@@ -24,4 +24,29 @@ impl ServerConfig {
     pub fn bind_addr(&self) -> String {
         format!("{}:{}", self.host, self.port)
     }
+
+    pub fn validate_runtime_requirements(&self) {
+        let production = self.app_env.eq_ignore_ascii_case("production");
+        if !production {
+            return;
+        }
+
+        for required in ["OIDC_ISSUER", "OIDC_AUDIENCE", "OIDC_JWKS_URL"] {
+            assert!(
+                std::env::var(required)
+                    .ok()
+                    .map(|value| !value.trim().is_empty())
+                    .unwrap_or(false),
+                "missing required production env: {required}"
+            );
+        }
+
+        assert!(
+            std::env::var("ENABLE_GEMINI_LIVE")
+                .ok()
+                .map(|value| !matches!(value.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"))
+                .unwrap_or(true),
+            "ENABLE_GEMINI_LIVE must be enabled in production"
+        );
+    }
 }

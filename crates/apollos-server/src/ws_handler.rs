@@ -19,6 +19,9 @@ use tokio::sync::mpsc;
 
 use crate::{agent::AgentOrchestrator, auth::ws_auth, AppState};
 
+const LIVE_OUTBOUND_BUFFER: usize = 256;
+const HELP_OUTBOUND_BUFFER: usize = 128;
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Channel {
     Live,
@@ -167,7 +170,7 @@ async fn ws_loop(
     client_id: Option<String>,
     encoding: SocketEncoding,
 ) {
-    let (tx, mut rx) = mpsc::unbounded_channel::<BackendToClientMessage>();
+    let (tx, mut rx) = mpsc::channel::<BackendToClientMessage>(LIVE_OUTBOUND_BUFFER);
 
     let registration = match channel {
         Channel::Live => {
@@ -227,27 +230,31 @@ async fn ws_loop(
 
         let parsed = parse_incoming(message, encoding);
         let Ok(client_message) = parsed else {
-            let _ = tx.send(BackendToClientMessage::ConnectionState(
-                ConnectionStateMessage {
-                    state: ConnectionState::Degraded,
-                    detail: Some("invalid_payload".to_string()),
-                },
-            ));
+            let _ = tx
+                .send(BackendToClientMessage::ConnectionState(
+                    ConnectionStateMessage {
+                        state: ConnectionState::Degraded,
+                        detail: Some("invalid_payload".to_string()),
+                    },
+                ))
+                .await;
             continue;
         };
 
         if client_message_session_id(&client_message) != session_id {
-            let _ = tx.send(BackendToClientMessage::ConnectionState(
-                ConnectionStateMessage {
-                    state: ConnectionState::Degraded,
-                    detail: Some("session_id_mismatch".to_string()),
-                },
-            ));
+            let _ = tx
+                .send(BackendToClientMessage::ConnectionState(
+                    ConnectionStateMessage {
+                        state: ConnectionState::Degraded,
+                        detail: Some("session_id_mismatch".to_string()),
+                    },
+                ))
+                .await;
             continue;
         }
 
         if let Some(reply) = orchestrator.route_message(&state, client_message).await {
-            let _ = tx.send(reply);
+            let _ = tx.send(reply).await;
         }
     }
 
@@ -274,16 +281,32 @@ fn parse_incoming(
     message: Message,
     encoding: SocketEncoding,
 ) -> Result<ClientToBackendMessage, transport::TransportError> {
+    let max_bytes = ws_max_inbound_bytes();
+
     match (encoding, message) {
         (SocketEncoding::Json, Message::Text(text)) => {
+            if text.len() > max_bytes {
+                return Err(transport::TransportError::MissingPayload("payload_too_large"));
+            }
             serde_json::from_str::<ClientToBackendMessage>(&text)
                 .map_err(|_| transport::TransportError::MissingPayload("json_parse"))
         }
-        (SocketEncoding::Json, Message::Binary(bytes)) => transport::decode_client_message(&bytes),
+        (SocketEncoding::Json, Message::Binary(bytes)) => {
+            if bytes.len() > max_bytes {
+                return Err(transport::TransportError::MissingPayload("payload_too_large"));
+            }
+            transport::decode_client_message(&bytes)
+        }
         (SocketEncoding::Protobuf, Message::Binary(bytes)) => {
+            if bytes.len() > max_bytes {
+                return Err(transport::TransportError::MissingPayload("payload_too_large"));
+            }
             transport::decode_client_message(&bytes)
         }
         (SocketEncoding::Protobuf, Message::Text(text)) => {
+            if text.len() > max_bytes {
+                return Err(transport::TransportError::MissingPayload("payload_too_large"));
+            }
             serde_json::from_str::<ClientToBackendMessage>(&text)
                 .map_err(|_| transport::TransportError::MissingPayload("json_parse"))
         }
@@ -291,6 +314,14 @@ fn parse_incoming(
             "unsupported_ws_message",
         )),
     }
+}
+
+fn ws_max_inbound_bytes() -> usize {
+    std::env::var("WS_MAX_INBOUND_BYTES")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(512 * 1024)
+        .clamp(8 * 1024, 4 * 1024 * 1024)
 }
 
 fn serialize_outgoing(
@@ -316,7 +347,7 @@ async fn help_ws_loop(
     session_id: String,
     viewer_id: String,
 ) {
-    let (tx, mut rx) = mpsc::unbounded_channel::<BackendToClientMessage>();
+    let (tx, mut rx) = mpsc::channel::<BackendToClientMessage>(HELP_OUTBOUND_BUFFER);
     state
         .ws_registry
         .register_help_viewer(&session_id, &viewer_id, tx)

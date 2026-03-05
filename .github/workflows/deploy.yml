@@ -92,12 +92,11 @@ jobs:
         env:
           OIDC_ISSUER: ${{ secrets.OIDC_ISSUER }}
           OIDC_AUDIENCE: ${{ secrets.OIDC_AUDIENCE }}
-          OIDC_BROKER_SIGNING_KEY: ${{ secrets.OIDC_BROKER_SIGNING_KEY }}
-          HUMAN_HELP_SIGNING_KEY: ${{ secrets.HUMAN_HELP_SIGNING_KEY }}
+          OIDC_JWKS_URL: ${{ secrets.OIDC_JWKS_URL }}
           FRONTEND_ORIGIN: ${{ vars.FRONTEND_ORIGIN }}
         run: |
-          if [ -z "$OIDC_ISSUER" ] || [ -z "$OIDC_AUDIENCE" ] || [ -z "$OIDC_BROKER_SIGNING_KEY" ] || [ -z "$HUMAN_HELP_SIGNING_KEY" ]; then
-            echo "Missing required secret: OIDC_ISSUER, OIDC_AUDIENCE, OIDC_BROKER_SIGNING_KEY, or HUMAN_HELP_SIGNING_KEY"
+          if [ -z "$OIDC_ISSUER" ] || [ -z "$OIDC_AUDIENCE" ] || [ -z "$OIDC_JWKS_URL" ]; then
+            echo "Missing required secret: OIDC_ISSUER, OIDC_AUDIENCE, OIDC_JWKS_URL"
             exit 1
           fi
 
@@ -105,4 +104,5 @@ jobs:
             --image ${{ secrets.BACKEND_IMAGE_URI }} \
             --region ${{ vars.GCP_REGION }} \
             --project ${{ secrets.GCP_PROJECT_ID }} \
-            --update-env-vars APP_ENV=production,ENABLE_GEMINI_LIVE=1,WS_AUTH_MODE=oidc,OIDC_ISSUER=$OIDC_ISSUER,OIDC_AUDIENCE=$OIDC_AUDIENCE,OIDC_BROKER_ENABLED=1,OIDC_BROKER_SIGNING_KEY=$OIDC_BROKER_SIGNING_KEY,HUMAN_FALLBACK_ENABLED=1,HUMAN_HELP_SIGNING_KEY=$HUMAN_HELP_SIGNING_KEY,ENABLE_DEV_ENDPOINTS=0,CORS_ALLOW_ORIGINS=${FRONTEND_ORIGIN}
+            --max-instances=1 \
+            --update-env-vars APP_ENV=production,ENABLE_GEMINI_LIVE=1,WS_AUTH_MODE=oidc,OIDC_REQUIRE_STRICT=1,OIDC_ISSUER=$OIDC_ISSUER,OIDC_AUDIENCE=$OIDC_AUDIENCE,OIDC_JWKS_URL=$OIDC_JWKS_URL,USE_FIRESTORE=1,FIRESTORE_REQUIRED=1,TWILIO_REQUIRED=1,ENABLE_DEV_ENDPOINTS=0,CORS_ALLOW_ORIGINS=${FRONTEND_ORIGIN}

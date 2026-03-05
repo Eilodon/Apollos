@@ -10,8 +10,15 @@ pub mod tools;
 pub mod ws_handler;
 pub mod ws_registry;
 
-use axum::{routing::get, routing::post, Json, Router};
+use axum::{
+    extract::DefaultBodyLimit,
+    http::{HeaderName, HeaderValue, Method},
+    routing::get,
+    routing::post,
+    Json, Router,
+};
 use serde::Serialize;
+use tower_http::{cors::Any, cors::CorsLayer, trace::TraceLayer};
 use tracing::info;
 
 #[derive(Debug, Clone, Default)]
@@ -47,6 +54,9 @@ pub fn build_router(state: AppState) -> Router {
             "/auth/help-ticket/exchange",
             post(human_fallback::help_ticket_exchange_handler),
         )
+        .layer(DefaultBodyLimit::max(http_max_body_bytes()))
+        .layer(build_cors_layer())
+        .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
 
@@ -66,13 +76,53 @@ async fn healthz() -> Json<HealthResponse> {
 
 #[derive(Debug, Serialize)]
 struct ConfigResponse {
-    ws_auth_mode: &'static str,
+    ws_auth_mode: String,
     help_enabled: bool,
 }
 
 async fn config() -> Json<ConfigResponse> {
     Json(ConfigResponse {
-        ws_auth_mode: "oidc_broker",
+        ws_auth_mode: std::env::var("WS_AUTH_MODE").unwrap_or_else(|_| "oidc_broker".to_string()),
         help_enabled: true,
     })
+}
+
+fn build_cors_layer() -> CorsLayer {
+    let raw = std::env::var("CORS_ALLOW_ORIGINS").unwrap_or_else(|_| "*".to_string());
+    let origins = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+
+    let mut cors = CorsLayer::new()
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers(Any);
+
+    if origins.is_empty() || origins.iter().any(|value| *value == "*") {
+        cors = cors.allow_origin(Any);
+    } else {
+        let parsed = origins
+            .iter()
+            .filter_map(|origin| HeaderValue::from_str(origin).ok())
+            .collect::<Vec<_>>();
+        if parsed.is_empty() {
+            cors = cors.allow_origin(Any);
+        } else {
+            cors = cors.allow_origin(parsed);
+        }
+    }
+
+    cors.expose_headers([
+        HeaderName::from_static("x-request-id"),
+        HeaderName::from_static("sec-websocket-protocol"),
+    ])
+}
+
+fn http_max_body_bytes() -> usize {
+    std::env::var("HTTP_MAX_BODY_BYTES")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(2 * 1024 * 1024)
+        .clamp(64 * 1024, 8 * 1024 * 1024)
 }

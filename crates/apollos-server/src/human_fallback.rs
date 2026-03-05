@@ -79,15 +79,11 @@ impl TwilioConfig {
 
         let account_sid = account_sid?;
         let Some(api_key_sid) = api_key_sid else {
-            warn!(
-                "TWILIO_ACCOUNT_SID is set but TWILIO_VIDEO_API_KEY_SID missing; using RTC stub token"
-            );
+            warn!("TWILIO_ACCOUNT_SID is set but TWILIO_VIDEO_API_KEY_SID missing");
             return None;
         };
         let Some(api_key_secret) = api_key_secret else {
-            warn!(
-                "TWILIO_ACCOUNT_SID is set but TWILIO_VIDEO_API_KEY_SECRET missing; using RTC stub token"
-            );
+            warn!("TWILIO_ACCOUNT_SID is set but TWILIO_VIDEO_API_KEY_SECRET missing");
             return None;
         };
 
@@ -151,11 +147,23 @@ struct TwilioAccessClaims {
 
 impl Default for HumanFallbackService {
     fn default() -> Self {
+        let app_env = std::env::var("APP_ENV").unwrap_or_else(|_| "development".to_string());
+        let twilio_required = env_flag(
+            "TWILIO_REQUIRED",
+            app_env.eq_ignore_ascii_case("production"),
+        );
+
         let viewer_ttl_seconds = std::env::var("HELP_VIEWER_TTL_S")
             .ok()
             .and_then(|raw| raw.parse::<i64>().ok())
             .unwrap_or(300)
             .max(30);
+        let twilio = TwilioConfig::from_env(viewer_ttl_seconds);
+
+        assert!(
+            !(twilio_required && twilio.is_none()),
+            "TWILIO_REQUIRED is enabled but Twilio config is missing"
+        );
 
         Self {
             public_help_base: std::env::var("PUBLIC_HELP_BASE")
@@ -166,7 +174,7 @@ impl Default for HumanFallbackService {
                 .unwrap_or(300)
                 .max(30),
             viewer_ttl_seconds,
-            twilio: TwilioConfig::from_env(viewer_ttl_seconds),
+            twilio,
             state: Arc::new(RwLock::new(FallbackState::default())),
         }
     }
@@ -351,6 +359,17 @@ fn mint_token(prefix: &str, value: &str) -> String {
         Uuid::new_v4()
     );
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw)
+}
+
+fn env_flag(name: &str, default: bool) -> bool {
+    let Ok(raw) = std::env::var(name) else {
+        return default;
+    };
+
+    !matches!(
+        raw.trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "off" | "no"
+    )
 }
 
 pub async fn help_ticket_exchange_handler(

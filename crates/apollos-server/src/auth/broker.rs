@@ -197,7 +197,8 @@ pub async fn oidc_exchange_handler(
     State(state): State<AppState>,
     Json(payload): Json<OidcExchangeRequest>,
 ) -> Result<Json<OidcExchangeResponse>, StatusCode> {
-    let identity = crate::auth::oidc::verify_opaque_token(&payload.id_token)
+    let identity = crate::auth::oidc::verify_id_token(&payload.id_token)
+        .await
         .ok_or(StatusCode::UNAUTHORIZED)?;
 
     let session_token = state.broker.create_session(identity.subject).await;

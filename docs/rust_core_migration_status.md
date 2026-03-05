@@ -2,7 +2,7 @@
 
 ## Completed
 
-1. ONNX inference integration in `apollos-core/depth_engine` with runtime model loading (`APOLLOS_DEPTH_ONNX_MODEL`) and heuristic fallback.
+1. ONNX inference integration in `apollos-core/depth_engine` with runtime model loading (`APOLLOS_DEPTH_ONNX_MODEL`).
 2. Gemini Live parity in `apollos-server/gemini_bridge`:
    - Bidi WebSocket session lifecycle
    - realtime frame/audio/user-command forwarding

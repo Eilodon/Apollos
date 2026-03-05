@@ -714,11 +714,21 @@ impl FirestorePersistence {
             return None;
         }
 
+        let app_env = std::env::var("APP_ENV").unwrap_or_else(|_| "development".to_string());
+        let firestore_required = env_flag(
+            "FIRESTORE_REQUIRED",
+            app_env.eq_ignore_ascii_case("production"),
+        );
+
         let Some(project_id) = std::env::var("GOOGLE_CLOUD_PROJECT")
             .ok()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
         else {
+            assert!(
+                !firestore_required,
+                "FIRESTORE_REQUIRED is enabled but GOOGLE_CLOUD_PROJECT is missing"
+            );
             warn!("USE_FIRESTORE=1 but GOOGLE_CLOUD_PROJECT is missing; disabling Firestore persistence");
             return None;
         };

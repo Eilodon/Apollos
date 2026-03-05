@@ -67,6 +67,12 @@ impl AgentOrchestrator {
                         error = %error,
                         "failed to forward multimodal frame to gemini live"
                     );
+                    return Some(BackendToClientMessage::ConnectionState(
+                        ConnectionStateMessage {
+                            state: ConnectionState::Degraded,
+                            detail: Some("gemini_live_unavailable".to_string()),
+                        },
+                    ));
                 }
 
                 Some(BackendToClientMessage::ConnectionState(
@@ -88,18 +94,24 @@ impl AgentOrchestrator {
                     )
                     .await;
 
-                if let Err(error) = state.gemini.forward_audio_chunk(state, &chunk).await {
+                if !allowed {
+                    return Some(BackendToClientMessage::ConnectionState(
+                        ConnectionStateMessage {
+                            state: ConnectionState::Connected,
+                            detail: Some("audio_rate_limited".to_string()),
+                        },
+                    ));
+                }
+
+                let detail = if let Err(error) = state.gemini.forward_audio_chunk(state, &chunk).await {
                     warn!(
                         session_id = %chunk.session_id,
                         error = %error,
                         "failed to forward audio chunk to gemini live"
                     );
-                }
-
-                let detail = if allowed {
-                    "audio_ingested"
+                    "gemini_live_unavailable"
                 } else {
-                    "audio_rate_limited"
+                    "audio_ingested"
                 };
 
                 Some(BackendToClientMessage::ConnectionState(
@@ -269,7 +281,7 @@ mod tests {
     #[tokio::test]
     async fn edge_hazard_triggers_hard_stop_delivery() {
         let state = AppState::default();
-        let (emergency_tx, mut emergency_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (emergency_tx, mut emergency_rx) = tokio::sync::mpsc::channel(8);
 
         state
             .ws_registry
