@@ -76,9 +76,10 @@ if [[ -z "$OLD_GEMINI_API_KEY" ]]; then
 fi
 
 echo "Creating new Gemini API key..."
-NEW_GEMINI_API_KEY="$(gcloud services api-keys create \
+NEW_KEY_OUTPUT="$(gcloud services api-keys create \
   --display-name="apollos-gemini-$(date +%Y%m%d-%H%M%S)" \
-  --project="$PROJECT_ID" 2>&1 | grep -o '"keyString":"[^"]*"' | head -n1 | cut -d'"' -f4)"
+  --project="$PROJECT_ID" 2>&1 || true)"
+NEW_GEMINI_API_KEY="$(echo "$NEW_KEY_OUTPUT" | grep -o '"keyString":"[^"]*"' | head -n1 | cut -d'"' -f4)"
 
 if [[ -z "$NEW_GEMINI_API_KEY" ]]; then
   echo "Failed to create new Gemini API key"
