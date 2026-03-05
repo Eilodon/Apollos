@@ -1,42 +1,91 @@
-# VisionGPT (ARIA) Contest MVP
+# Apollos — ARIA Navigation Assistant
 
-Real-time AI navigation assistant blueprint implementation for blind and low-vision users.
+Real-time AI navigation assistant for blind and low-vision users. Built on **Dual-Brain Architecture**: Edge reflexes protect lives, Cloud cognition decodes the world.
+
+## Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────┐
+│  DUAL-BRAIN ARCHITECTURE (The Eidolon Standard)      │
+├──────────────────┬──────────────────────────────────┤
+│   SPINAL CORD    │          CORTEX                  │
+│   (Edge / Local) │          (Cloud / Gemini)        │
+├──────────────────┼──────────────────────────────────┤
+│ Layer 0          │  Layer 2                         │
+│ Survival Reflex  │  Semantic Cognition              │
+│ Optical Flow TTC │  Gemini Live 2.5 Flash           │
+│ <16ms latency    │  Scene understanding             │
+│                  │  Empathic dialogue               │
+├──────────────────┼──────────────────────────────────┤
+│ Layer 0.5        │  Layer 3                         │
+│ Pocket Shield    │  Cloud Fallback                  │
+│ Ghost Touch block│  ADK Tool Calls                  │
+│ AmbientLight API │  HARD_STOP dispatch              │
+├──────────────────┼──────────────────────────────────┤
+│ Layer 1          │                                  │
+│ Kinematic Gating │                                  │
+│ Dot Product tilt │                                  │
+│ Anti-blur filter │                                  │
+└──────────────────┴──────────────────────────────────┘
+```
 
 ## What is implemented
 
-- React + TypeScript PWA frontend with:
-  - Live camera capture (adaptive duty cycling by motion state)
-  - Mic streaming with `echoCancellation: true`
-  - Dual websocket channels (`/ws/live` + `/ws/emergency`)
-  - HRTF spatial audio engine + sonar ping matrix (`100/400/800ms`)
-  - Wake Lock + OLED black mode + keepalive fallback
-  - Gesture mapping (tap, double tap, long press, swipe up/down, shake SOS)
-  - Hazard compass + transcript + mode indicator
-- FastAPI backend with:
-  - Gemini Live API bridge in stream path (audio realtime + multimodal frame turns)
-  - Live tool-calling dispatch to local safety tools (`log_hazard_event` etc.)
-  - Session store + optional Firestore persistence
-  - Tool-style functions:
-    - `log_hazard_event(hazard_type, position_x, distance_category, confidence, description, session_id)`
-    - `set_navigation_mode(mode)`
-    - `log_emotion_event(state, confidence)`
-    - `get_context_summary()`
-    - `request_human_help()`
-  - HARD_STOP pipeline over emergency websocket channel
-  - HARD_STOP server timestamp fields for latency benchmarking (`server_emit_ts_ms`)
-  - RunConfig builder with ADK-compatible path + local fallback
-- Infra and delivery:
-  - Terraform for Cloud Run + Firestore + IAM
-  - GitHub Actions deployment/test workflow
-  - Submission docs and script checklist
+### Frontend (React + TypeScript PWA)
+- **Layer 0 — Survival Reflex Worker** (`survivalReflex.worker.ts`): Optical Flow TTC detection at 10 FPS. Fires `CRITICAL_EDGE_HAZARD` if Time-To-Collision < 1.5s — completely local, <16ms latency, no network dependency.
+- **Layer 0.5 — Pocket Shield** (`usePocketMode.ts`): `AmbientLightSensor` API detects in-pocket state (<5 lux). Blocks all `touchstart` events to prevent Ghost Touch (accidental mode changes from fabric friction).
+- **Layer 1 — Kinematic Frame Gating** (`kinematicGating.ts`): Dot Product tilt check (`cos θ > 0.82`) + angular velocity guard (`<45°/s`). Only captures frames when device is vertical and stable — eliminates Motion Blur from lanyard pendulum effect.
+- **Semantic Odometry**: Accumulates `yaw_delta_deg` (gyroscope rotation) per frame interval. Injected into every frame payload so Gemini can infer hazard positions between frames without waiting for visual confirmation.
+- Live camera capture with adaptive duty cycling by motion state
+- Mic streaming with `echoCancellation` + `noiseSuppression`
+- Dual WebSocket channels (`/ws/live` + `/ws/emergency`)
+- HRTF spatial audio engine + sonar ping matrix (`100/400/800ms`)
+- Wake Lock + OLED black mode (also activates in-pocket) + keepalive fallback
+- Gesture mapping: tap (mic), double-tap (repeat), long press (human help), swipe up/down (mode/describe), shake (SOS)
+- Hazard compass + transcript panel + mode indicator
+
+### Backend (FastAPI + Gemini Live)
+- Gemini Live API bridge (audio realtime + multimodal frame turns)
+- **Semantic Odometry injection** in `live_bridge.py`: when `|yaw_delta| > 5°`, injects `[ODOMETRY: rotated X-deg RIGHT. Hazard may now be DIRECTLY AHEAD.]` context hint before frame — Gemini reasons about hazard position between frames.
+- Hazard confirmation pipeline (`HAZARD_CONFIRMATION_FRAMES` config)
+- Live tool-calling dispatch to local safety tools
+- Tool-style functions:
+  - `log_hazard_event(hazard_type, position_x, distance_category, confidence, description, session_id)`
+  - `set_navigation_mode(mode)`
+  - `log_emotion_event(state, confidence)`
+  - `get_context_summary()`
+  - `request_human_help()`
+- HARD_STOP pipeline over emergency WebSocket channel
+- HARD_STOP latency benchmarking (`server_emit_ts_ms`)
+- Session store + optional Firestore persistence
+- RunConfig builder with ADK-compatible path + local fallback
+
+### Infrastructure
+- Terraform for Cloud Run + Firestore + IAM
+- GitHub Actions deployment/test workflow
 
 ## Repository layout
 
-- `frontend/`: PWA app
-- `backend/`: FastAPI + agent orchestration
-- `infra/`: Terraform IaC
-- `docs/`: architecture, system prompt, submission checklist
-- `assets/`: local alert audio asset placeholder
+```
+frontend/         PWA app
+  src/
+    hooks/
+      useCamera.ts          Camera pipeline (Dual-Brain wiring)
+      usePocketMode.ts      Ghost Touch Shield (Layer 0.5)
+      useMotionSensor.ts    Accelerometer / Gyroscope
+    services/
+      kinematicGating.ts    Dot Product Frame Gating (Layer 1)
+      spatialAudioEngine.ts HRTF Audio
+    workers/
+      survivalReflex.worker.ts  Optical Flow TTC (Layer 0)
+backend/          FastAPI + agent orchestration
+  agent/
+    live_bridge.py          Gemini Live + Semantic Odometry
+    aria_agent.py           Multi-agent orchestrator
+infra/            Terraform IaC
+docs/             Architecture, system prompt, submission checklist
+scripts/          Hardening, benchmark, integration tests
+```
 
 ## Local development
 
@@ -76,11 +125,7 @@ Open `http://localhost:5173`.
 
 ### 3) Environment
 
-Copy `.env.example` values into:
-
-- root `.env` (for reference)
-- `frontend/.env`
-- `backend/.env`
+Copy `.env.example` values into `frontend/.env` and `backend/.env`.
 
 For Gemini Live production path, set at least:
 
@@ -96,32 +141,35 @@ Optional Vertex path:
 
 ## WebSocket contracts
 
-### Client -> backend: `multimodal_frame`
+### Client → backend: `multimodal_frame`
 
 ```json
 {
   "type": "multimodal_frame",
   "session_id": "...",
-  "timestamp": "2026-03-04T00:00:00Z",
+  "timestamp": "2026-03-05T00:00:00Z",
   "frame_jpeg_base64": "...",
   "motion_state": "walking_fast",
   "pitch": 8.2,
-  "velocity": 2.1
+  "velocity": 2.1,
+  "yaw_delta_deg": 12.5
 }
 ```
 
-### Client -> backend: `audio_chunk`
+> `yaw_delta_deg`: accumulated gyroscope yaw rotation (degrees) since last frame capture. Used to inject Semantic Odometry context into Gemini prompts.
+
+### Client → backend: `audio_chunk`
 
 ```json
 {
   "type": "audio_chunk",
   "session_id": "...",
-  "timestamp": "2026-03-04T00:00:00Z",
+  "timestamp": "2026-03-05T00:00:00Z",
   "audio_chunk_pcm16": "...base64..."
 }
 ```
 
-### Backend -> client: `HARD_STOP`
+### Backend → client: `HARD_STOP`
 
 ```json
 {
@@ -133,6 +181,8 @@ Optional Vertex path:
   "server_emit_ts_ms": 1772580000123
 }
 ```
+
+> `HARD_STOP` can be triggered by **either** the Edge Survival Reflex Worker (Layer 0, <16ms) or the Cloud Gemini agent (Layer 2, ~600ms+). Edge fires first.
 
 ## Testing
 
@@ -148,19 +198,25 @@ Run hardening static checks:
 python3 scripts/hardening_pass.py
 ```
 
-Run hardening with integration checks against a running backend:
+Default hardening includes:
+- Backend unit tests
+- AEC mic constraint audit
+- Internal tool latency benchmark
+- Internal reconnect/resume simulation
+
+Optional in-process ASGI checks (no live backend required):
 
 ```bash
-python3 scripts/hardening_pass.py --integration --budget-ms 100 --iterations 20
+python3 scripts/hardening_pass.py --asgi --budget-ms 100 --iterations 20
 ```
 
 Run benchmark only:
 
 ```bash
-python3 scripts/benchmark_hard_stop.py --iterations 20 --budget-ms 100
+python3 scripts/benchmark_hard_stop_asgi.py --iterations 20 --budget-ms 100
 ```
 
-If integration dependencies are unavailable, run internal latency benchmark:
+Internal latency benchmark (no network):
 
 ```bash
 PYTHONPATH=backend python3 scripts/benchmark_hard_stop_internal.py --iterations 100 --budget-ms 100
@@ -176,17 +232,14 @@ terraform apply \
   -var="container_image=gcr.io/YOUR_PROJECT/aria-backend:latest"
 ```
 
-## Architecture: Layer 0 Fallback (Upcoming)
+## Known limitations
 
-Whilst Gemini Live API BIDI streaming (Layer 2/3) provides the core multimodal intelligence, we are planning a **Layer 0 TFLite Fallback** stub. This will utilize on-device Firebase ML Kit / TFLite object detection to ensure basic obstacle and drop-off alerts remain functional even during complete network drops.
-
-## Known limitations in this MVP
-
-- **iOS Web Audio Quirks:** Background execution on iOS Safari is heavily restricted. The app may suspend spatial audio or microphone streaming when the screen is locked unless specific PWA capabilities are granted.
+- **iOS Web Audio Quirks:** Background execution on iOS Safari is restricted. The app may suspend audio/mic when screen is locked without specific PWA capabilities.
+- `AmbientLightSensor` (Pocket Shield) requires `generic-sensor` permission policy in browser. Falls back gracefully if unavailable.
+- `DeviceMotionEvent` requires explicit permission grant on iOS 13+.
 - Exact Live API config compatibility can vary by SDK/model version.
-- `assets/alert_ping.mp3` spatial depths are mapped but may vary slightly based on the HRTF implementation of the user's browser.
 
 ## Hardware Requirements & Safety Note
 
-**Mandatory:** For real-world usage, **open-ear or bone-conduction headphones (e.g., Shokz)** are strongly required. 
-Using standard noise-canceling or in-ear headphones will block environmental sounds (traffic, pedestrians), which is a critical safety hazard for blind and low-vision users. Always preserve your natural acoustic awareness.
+**Mandatory:** For real-world usage, **open-ear or bone-conduction headphones (e.g., Shokz)** are strongly required.
+Using standard noise-canceling or in-ear headphones blocks environmental sounds (traffic, pedestrians) — a critical safety hazard for blind and low-vision users. Always preserve natural acoustic awareness.

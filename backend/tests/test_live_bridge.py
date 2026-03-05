@@ -34,6 +34,7 @@ class LiveBridgeTests(unittest.IsolatedAsyncioTestCase):
                 pass
         
         self.bridge._session = FakeSession()
+        self.bridge._hazard_confirmation_frames = 2
 
     async def test_single_frame_does_not_fire(self):
         call = [{'name': 'log_hazard_event', 'id': 'call1', 'args': {'position_x': 0.5}}]
@@ -78,6 +79,31 @@ class LiveBridgeTests(unittest.IsolatedAsyncioTestCase):
         # Should still be 0 dispatches because the first one expired
         self.assertEqual(len(self.dispatched_calls), 0)
         self.assertEqual(self.bridge._consecutive_hazard_frames, 1)
+
+    async def test_default_config_fires_on_first_frame(self):
+        dispatched_calls = []
+
+        async def fake_dispatcher(name: str, args: dict[str, Any]) -> dict[str, Any]:
+            dispatched_calls.append((name, args))
+            return {'ok': True, 'position_x': args.get('position_x', 0.0)}
+
+        bridge = GeminiLiveBridge(
+            session_id='default-threshold',
+            session_store=FakeSessionStore(),
+            websocket_registry=FakeWebSocketRegistry(),
+            tool_dispatcher=fake_dispatcher,
+        )
+
+        class FakeSession:
+            async def send_tool_response(self, function_responses):
+                pass
+
+        bridge._session = FakeSession()
+        self.assertEqual(bridge._hazard_confirmation_frames, 1)
+
+        call = [{'name': 'log_hazard_event', 'id': 'call1', 'args': {'position_x': 0.2}}]
+        await bridge._handle_tool_calls(call)
+        self.assertEqual(len(dispatched_calls), 1)
 
 if __name__ == '__main__':
     unittest.main()

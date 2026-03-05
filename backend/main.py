@@ -1,169 +1,184 @@
-import asyncio
-import base64
+from __future__ import annotations
+
 import json
 import logging
-from typing import Any
+import os
+from datetime import datetime, timezone
+from typing import Literal
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from google.adk.runners import Runner
-from google.adk.sessions import InMemorySessionService
-from google.genai import types
+from pydantic import BaseModel, Field
 
-from .agent.aria_agent import create_aria_agent
-from .agent.run_config import get_run_config
+try:
+    from agent.aria_agent import AriaAgentOrchestrator
+    from agent.session_manager import SessionStore
+    from agent.websocket_handler import WebSocketRegistry
+except ModuleNotFoundError:  # pragma: no cover - fallback for package-style import
+    from backend.agent.aria_agent import AriaAgentOrchestrator
+    from backend.agent.session_manager import SessionStore
+    from backend.agent.websocket_handler import WebSocketRegistry
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="VisionGPT ARIA - Pure ADK Backend")
 
-# Khởi tạo Pure ADK
-root_agent = create_aria_agent()
-session_service = InMemorySessionService()
-runner = Runner(
-    agent=root_agent,
-    session_service=session_service,
-    app_name="visiongpt-aria",
-)
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {'0', 'false', 'off', 'no'}
 
-# Lưu active WS cho HARD_STOP emit (chỉ còn /ws/live)
-active_connections: dict[str, WebSocket] = {}
 
-async def receive_loop(websocket: WebSocket, session_id: str, queue: asyncio.Queue[types.LiveClientContent]) -> None:
-    """Read websocket messages and push them into ADK runner's input queue."""
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+class HazardTriggerRequest(BaseModel):
+    hazard_type: str = Field(default='manual_hazard', min_length=1, max_length=64)
+    position_x: float = Field(default=0.0, ge=-1.0, le=1.0)
+    distance: Literal['very_close', 'mid', 'far'] = 'very_close'
+    confidence: float = Field(default=0.95, ge=0.0, le=1.0)
+    description: str = Field(default='manual trigger from dev endpoint', max_length=400)
+
+
+USE_FIRESTORE = _env_flag('USE_FIRESTORE', False)
+session_store = SessionStore(use_firestore=USE_FIRESTORE)
+websocket_registry = WebSocketRegistry()
+orchestrator = AriaAgentOrchestrator(session_store=session_store, websocket_registry=websocket_registry)
+
+app = FastAPI(title='VisionGPT ARIA Backend')
+
+
+@app.get('/healthz')
+async def healthz() -> dict[str, object]:
+    stats = await orchestrator.stats()
+    return {
+        'status': 'ok',
+        'timestamp': _now(),
+        'use_firestore': USE_FIRESTORE,
+        **stats,
+    }
+
+
+@app.get('/config')
+async def config() -> dict[str, object]:
+    return {
+        'timestamp': _now(),
+        'live_enabled': orchestrator.live_enabled,
+        'use_firestore': USE_FIRESTORE,
+        'model': os.getenv('GEMINI_MODEL', 'gemini-live-2.5-flash-native-audio'),
+        'model_fallbacks': [
+            item.strip()
+            for item in os.getenv(
+                'GEMINI_MODEL_FALLBACKS',
+                'gemini-2.5-flash-native-audio-preview-12-2025,gemini-live-2.5-flash-preview',
+            ).split(',')
+            if item.strip()
+        ],
+        'use_vertex': _env_flag('GEMINI_USE_VERTEX', False),
+    }
+
+
+@app.post('/dev/hazard/{session_id}')
+async def dev_hazard(session_id: str, payload: HazardTriggerRequest) -> dict[str, object]:
+    result = await orchestrator.dispatch_tool_call(
+        'log_hazard_event',
+        {
+            'hazard_type': payload.hazard_type,
+            'position_x': payload.position_x,
+            'distance_category': payload.distance,
+            'confidence': payload.confidence,
+            'description': payload.description,
+            'session_id': session_id,
+        },
+        session_id=session_id,
+    )
+
+    return {
+        'ok': bool(result.get('ok', False)),
+        'session_id': session_id,
+        'result': result,
+    }
+
+
+@app.websocket('/ws/live/{session_id}')
+async def websocket_live(websocket: WebSocket, session_id: str) -> None:
+    await websocket.accept()
+    await websocket_registry.register_live(session_id, websocket)
+
+    await websocket_registry.send_live(
+        session_id,
+        {
+            'type': 'connection_state',
+            'state': 'connected',
+            'session_id': session_id,
+            'timestamp': _now(),
+            'detail': 'Live websocket ready',
+        },
+    )
+
     try:
         while True:
-            data = await websocket.receive_json()
-            msg_type = data.get("type")
-
-            if msg_type == "audio_chunk":
-                b64_audio = data.get("audio_chunk_pcm16", "")
-                if b64_audio:
-                    audio_bytes = base64.b64decode(b64_audio)
-                    # Create LiveClientContent Realtime Input
-                    content = types.LiveClientContent(
-                        realtime_input=types.LiveClientRealtimeInput(
-                            media_chunks=[
-                                types.Blob(
-                                    data=audio_bytes,
-                                    mime_type="audio/pcm;rate=16000"
-                                )
-                            ]
-                        )
-                    )
-                    await queue.put(content)
-
-            elif msg_type == "multimodal_frame":
-                b64_frame = data.get("frame_jpeg_base64", "")
-                parts: list[Any] = []
-                
-                if b64_frame:
-                    parts.append(
-                        types.Part.from_bytes(
-                            data=base64.b64decode(b64_frame),
-                            mime_type="image/jpeg",
-                        )
-                    )
-                
-                motion_state = data.get("motion_state", "stationary")
-                pitch = data.get("pitch", 0.0)
-                vel = data.get("velocity", 0.0)
-                
-                text_content = f"[KINEMATIC: User is {motion_state}. Pitch: {pitch:.1f}deg. Velocity: {vel:.2f}. Treat visible hazards with safety-first urgency.]"
-                parts.append(types.Part.from_text(text=text_content))
-
-                content = types.LiveClientContent(
-                    turns=[types.Content(role="user", parts=parts)],
-                    turn_complete=True
-                )
-                await queue.put(content)
-            
-            elif msg_type == "user_command":
-                cmd = data.get("command", "")
-                if cmd:
-                    content = types.LiveClientContent(
-                        turns=[types.Content(role="user", parts=[types.Part.from_text(text=cmd)])],
-                        turn_complete=True
-                    )
-                    await queue.put(content)
-
+            payload = await websocket.receive_json()
+            if not isinstance(payload, dict):
+                continue
+            payload.setdefault('session_id', session_id)
+            await orchestrator.handle_client_message(session_id, payload)
     except WebSocketDisconnect:
         pass
-    except Exception as e:
-        logger.error(f"Receive loop error for {session_id}: {e}")
-
-async def send_loop(websocket: WebSocket, session_id: str, queue: asyncio.Queue[types.LiveClientContent]) -> None:
-    """Read ADK runner events and send them out via websocket."""
-    run_config = get_run_config()
-    try:
-        async for event in runner.run_live(
-            session_id=session_id,
-            run_config=run_config,
-            live_request_queue=queue
-        ):
-            if event.type == "audio":
-                await websocket.send_bytes(event.audio_data)
-
-            elif event.type == "function_call":
-                # Send out HARD_STOP if applicable
-                await handle_function_call(event, websocket, session_id)
-                
-                # Push back function response to unblock the LLM turn
-                func_responses = []
-                for fc in event.function_calls or []:
-                    func_responses.append(
-                        types.FunctionResponse(
-                            id=fc.id,
-                            name=fc.name,
-                            response={"status": "OK", "session_id": session_id}
-                        )
-                    )
-                
-                if func_responses:
-                    content = types.LiveClientContent(
-                        tool_response=types.LiveClientToolResponse(
-                            function_responses=func_responses
-                        )
-                    )
-                    await queue.put(content)
-
-    except Exception as e:
-        logger.error(f"Send loop error for {session_id}: {e}")
-        try:
-            await websocket.close()
-        except Exception:
-            pass
-
-@app.websocket("/ws/live/{session_id}")
-async def websocket_live_endpoint(websocket: WebSocket, session_id: str):
-    await websocket.accept()
-    active_connections[session_id] = websocket
-    
-    # ADK's native live input queue
-    live_queue: asyncio.Queue[types.LiveClientContent] = asyncio.Queue()
-    
-    # Create bidirectional tasks
-    recv_task = asyncio.create_task(receive_loop(websocket, session_id, live_queue))
-    send_task = asyncio.create_task(send_loop(websocket, session_id, live_queue))
-    
-    try:
-        done, pending = await asyncio.wait(
-            [recv_task, send_task],
-            return_when=asyncio.FIRST_COMPLETED
+    except Exception as exc:
+        logger.exception('Live websocket failure for %s: %s', session_id, exc)
+        await websocket_registry.send_live(
+            session_id,
+            {
+                'type': 'connection_state',
+                'state': 'reconnecting',
+                'session_id': session_id,
+                'timestamp': _now(),
+                'detail': f'Live websocket error: {exc}',
+            },
         )
-        for t in pending:
-            t.cancel()
-    except Exception as e:
-        logger.error(f"Endpoint error: {e}")
     finally:
-        active_connections.pop(session_id, None)
+        await websocket_registry.unregister_live(session_id, websocket)
+        await orchestrator.close_session(session_id)
 
-async def handle_function_call(event, websocket: WebSocket, session_id: str):
-    """Xử lý HARD_STOP khi Gemini gọi tool"""
-    if event.tool_name == "log_hazard_event":
-        payload = {
-            "type": "HARD_STOP",
-            "position_x": event.args.get("position_x", 0.0),
-            "distance": event.args.get("distance_category", "mid"),
-            "hazard_type": event.args.get("hazard_type")
+
+@app.websocket('/ws/emergency/{session_id}')
+async def websocket_emergency(websocket: WebSocket, session_id: str) -> None:
+    await websocket.accept()
+    await websocket_registry.register_emergency(session_id, websocket)
+    await websocket.send_json(
+        {
+            'type': 'emergency_ready',
+            'session_id': session_id,
+            'timestamp': _now(),
         }
-        await websocket.send_json(payload)   # Trigger siren ngay lập tức
+    )
+
+    try:
+        while True:
+            raw_message = await websocket.receive_text()
+            if not raw_message:
+                continue
+
+            try:
+                payload = json.loads(raw_message)
+            except json.JSONDecodeError:
+                continue
+
+            if payload.get('type') == 'heartbeat':
+                await websocket.send_json(
+                    {
+                        'type': 'heartbeat_ack',
+                        'session_id': session_id,
+                        'timestamp': _now(),
+                    }
+                )
+    except WebSocketDisconnect:
+        pass
+    finally:
+        await websocket_registry.unregister_emergency(session_id, websocket)
+
+
+@app.on_event('shutdown')
+async def on_shutdown() -> None:
+    await orchestrator.shutdown()

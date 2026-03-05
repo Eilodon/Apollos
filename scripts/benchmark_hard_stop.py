@@ -18,8 +18,12 @@ import websockets
 @dataclass(slots=True)
 class IterationResult:
     idx: int
+    trigger_client_ts_ms: float
+    server_emit_ts_ms: float | None
+    receive_client_ts_ms: float
     e2e_ms: float
-    server_to_client_ms: float | None
+    trigger_to_emit_ms: float | None
+    emit_to_receive_ms: float | None
     request_status: int
 
 
@@ -80,26 +84,40 @@ async def run(args: argparse.Namespace) -> int:
 
             e2e_ms = (t1_perf - t0_perf) * 1000
             emit_ts_ms = event.get('server_emit_ts_ms')
-            server_to_client_ms = (t1_epoch_ms - float(emit_ts_ms)) if emit_ts_ms is not None else None
+            server_emit_ts_ms = float(emit_ts_ms) if emit_ts_ms is not None else None
+            trigger_to_emit_ms = (server_emit_ts_ms - t0_epoch_ms) if server_emit_ts_ms is not None else None
+            if trigger_to_emit_ms is not None and trigger_to_emit_ms < 0:
+                trigger_to_emit_ms = 0.0
+            emit_to_receive_ms = (t1_epoch_ms - server_emit_ts_ms) if server_emit_ts_ms is not None else None
 
             results.append(
                 IterationResult(
                     idx=idx,
+                    trigger_client_ts_ms=t0_epoch_ms,
+                    server_emit_ts_ms=server_emit_ts_ms,
+                    receive_client_ts_ms=t1_epoch_ms,
                     e2e_ms=e2e_ms,
-                    server_to_client_ms=server_to_client_ms,
+                    trigger_to_emit_ms=trigger_to_emit_ms,
+                    emit_to_receive_ms=emit_to_receive_ms,
                     request_status=response.status_code,
                 )
             )
 
             print(
-                f"[{idx:02d}] status={response.status_code} e2e={e2e_ms:.2f}ms"
-                + (f" server->client={server_to_client_ms:.2f}ms" if server_to_client_ms is not None else '')
+                f"[{idx:02d}] status={response.status_code} "
+                f"trigger_ms={t0_epoch_ms:.0f} "
+                f"server_emit_ms={(f'{server_emit_ts_ms:.0f}' if server_emit_ts_ms is not None else 'NA')} "
+                f"recv_ms={t1_epoch_ms:.0f} "
+                f"e2e={e2e_ms:.2f}ms"
+                + (f" trigger->emit={trigger_to_emit_ms:.2f}ms" if trigger_to_emit_ms is not None else '')
+                + (f" emit->recv={emit_to_receive_ms:.2f}ms" if emit_to_receive_ms is not None else '')
             )
 
             await asyncio.sleep(args.sleep_ms / 1000.0)
 
     e2e_values = [item.e2e_ms for item in results]
-    s2c_values = [item.server_to_client_ms for item in results if item.server_to_client_ms is not None]
+    t2e_values = [item.trigger_to_emit_ms for item in results if item.trigger_to_emit_ms is not None]
+    e2r_values = [item.emit_to_receive_ms for item in results if item.emit_to_receive_ms is not None]
 
     p50 = percentile(sorted(e2e_values), 0.50)
     p95 = percentile(sorted(e2e_values), 0.95)
@@ -112,9 +130,13 @@ async def run(args: argparse.Namespace) -> int:
     print(f'e2e p50: {p50:.2f}ms')
     print(f'e2e p95: {p95:.2f}ms')
 
-    if s2c_values:
-        print(f'server->client avg: {statistics.mean(s2c_values):.2f}ms')
-        print(f'server->client p95: {percentile(sorted(s2c_values), 0.95):.2f}ms')
+    if t2e_values:
+        print(f'trigger->server_emit avg: {statistics.mean(t2e_values):.2f}ms')
+        print(f'trigger->server_emit p95: {percentile(sorted(t2e_values), 0.95):.2f}ms')
+
+    if e2r_values:
+        print(f'server_emit->receive avg: {statistics.mean(e2r_values):.2f}ms')
+        print(f'server_emit->receive p95: {percentile(sorted(e2r_values), 0.95):.2f}ms')
 
     failures = [item for item in results if item.request_status >= 400]
     if failures:

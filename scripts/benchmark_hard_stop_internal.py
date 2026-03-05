@@ -22,6 +22,11 @@ from agent.websocket_handler import WebSocketRegistry
 class Sample:
     idx: int
     latency_ms: float
+    trigger_client_ts_ms: float
+    server_emit_ts_ms: float | None
+    receive_client_ts_ms: float
+    trigger_to_emit_ms: float | None
+    emit_to_receive_ms: float | None
 
 
 class FakeEmergencySocket:
@@ -58,6 +63,7 @@ async def run(iterations: int, budget_ms: float) -> int:
 
     for idx in range(1, iterations + 1):
         token = set_current_session(session_id)
+        t0_epoch_ms = time.time() * 1000
         t0 = time.perf_counter()
         try:
             await log_hazard_event(
@@ -71,12 +77,40 @@ async def run(iterations: int, budget_ms: float) -> int:
         finally:
             reset_current_session(token)
         t1 = time.perf_counter()
+        t1_epoch_ms = time.time() * 1000
 
         latency = (t1 - t0) * 1000
-        samples.append(Sample(idx=idx, latency_ms=latency))
-        print(f'[{idx:02d}] latency={latency:.3f}ms')
+        payload = fake_ws.messages[-1] if fake_ws.messages else {}
+        server_emit_raw = payload.get('server_emit_ts_ms')
+        server_emit_ts_ms = float(server_emit_raw) if server_emit_raw is not None else None
+        trigger_to_emit_ms = (server_emit_ts_ms - t0_epoch_ms) if server_emit_ts_ms is not None else None
+        if trigger_to_emit_ms is not None and trigger_to_emit_ms < 0:
+            trigger_to_emit_ms = 0.0
+        emit_to_receive_ms = (t1_epoch_ms - server_emit_ts_ms) if server_emit_ts_ms is not None else None
+
+        samples.append(
+            Sample(
+                idx=idx,
+                latency_ms=latency,
+                trigger_client_ts_ms=t0_epoch_ms,
+                server_emit_ts_ms=server_emit_ts_ms,
+                receive_client_ts_ms=t1_epoch_ms,
+                trigger_to_emit_ms=trigger_to_emit_ms,
+                emit_to_receive_ms=emit_to_receive_ms,
+            )
+        )
+        print(
+            f"[{idx:02d}] e2e={latency:.3f}ms "
+            f"trigger_ms={t0_epoch_ms:.0f} "
+            f"server_emit_ms={(f'{server_emit_ts_ms:.0f}' if server_emit_ts_ms is not None else 'NA')} "
+            f"recv_ms={t1_epoch_ms:.0f}"
+            + (f" trigger->emit={trigger_to_emit_ms:.3f}ms" if trigger_to_emit_ms is not None else '')
+            + (f" emit->recv={emit_to_receive_ms:.3f}ms" if emit_to_receive_ms is not None else '')
+        )
 
     values = [item.latency_ms for item in samples]
+    t2e_values = [item.trigger_to_emit_ms for item in samples if item.trigger_to_emit_ms is not None]
+    e2r_values = [item.emit_to_receive_ms for item in samples if item.emit_to_receive_ms is not None]
     p50 = percentile(sorted(values), 0.5)
     p95 = percentile(sorted(values), 0.95)
     avg = statistics.mean(values)
@@ -86,6 +120,12 @@ async def run(iterations: int, budget_ms: float) -> int:
     print(f'avg: {avg:.3f}ms')
     print(f'p50: {p50:.3f}ms')
     print(f'p95: {p95:.3f}ms')
+    if t2e_values:
+        print(f'trigger->server_emit avg: {statistics.mean(t2e_values):.3f}ms')
+        print(f'trigger->server_emit p95: {percentile(sorted(t2e_values), 0.95):.3f}ms')
+    if e2r_values:
+        print(f'server_emit->receive avg: {statistics.mean(e2r_values):.3f}ms')
+        print(f'server_emit->receive p95: {percentile(sorted(e2r_values), 0.95):.3f}ms')
 
     if p95 > budget_ms:
         print(f'FAIL: p95 {p95:.3f}ms > budget {budget_ms:.3f}ms')
