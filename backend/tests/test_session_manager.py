@@ -45,6 +45,12 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(geohash), 7)
         self.assertEqual(clock_face_from_delta(-90), 9)
 
+    async def test_mark_edge_hazard_sets_active_window(self) -> None:
+        store = SessionStore(use_firestore=False)
+        await store.mark_edge_hazard('session-5', hazard_type='DROP_AHEAD', suppress_seconds=2.0)
+        active = await store.is_edge_hazard_active('session-5')
+        self.assertTrue(active)
+
 
 if __name__ == '__main__':
     unittest.main()

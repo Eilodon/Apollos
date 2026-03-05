@@ -67,6 +67,17 @@ class GeminiLiveBridge:
         self._last_heading_deg: float | None = None
         self._last_voice_emit_ts = 0.0
         self._last_location_context = ''
+        self._edge_suppress_until = 0.0
+        self._edge_suppress_window_s = max(0.5, float(os.getenv('EDGE_HAZARD_SUPPRESS_SECONDS', '2.5')))
+
+    def note_edge_hazard(self, hazard_type: str = 'EDGE_REFLEX') -> None:
+        self._edge_suppress_until = time.monotonic() + self._edge_suppress_window_s
+        logger.info(
+            'Edge hazard suppress active (session=%s, hazard=%s, window=%.2fs)',
+            self._session_id,
+            hazard_type,
+            self._edge_suppress_window_s,
+        )
 
     async def ensure_started(self) -> bool:
         if self._stopped:
@@ -183,6 +194,7 @@ class GeminiLiveBridge:
         risk_score = self._compute_risk_multiplier(motion_state, pitch, velocity, yaw_delta)
         effective_mode = await self._session_store.get_effective_mode(self._session_id)
         spatial_context = await self._session_store.get_spatial_context(self._session_id, current_yaw=heading_value)
+        edge_reflex_active = await self._session_store.is_edge_hazard_active(self._session_id, now_epoch=time.time())
         location_hint = ''
         if isinstance(lat, (int, float)) and isinstance(lng, (int, float)):
             location_hint = f' [LOCATION: lat={float(lat):.5f}, lng={float(lng):.5f}, heading={heading_value or 0:.1f}deg]'
@@ -209,6 +221,8 @@ class GeminiLiveBridge:
             f"Velocity: {velocity:.2f}. Mode: {effective_mode}. RiskScore: {risk_score:.2f}. "
             f"Treat visible hazards with safety-first urgency.]{odometry_hint}{spatial_context}{location_hint}"
         )
+        if edge_reflex_active:
+            motion_text += ' [EDGE_HAZARD: local reflex already active. Defer voice; confirm/enrich only if needed.]'
 
 
         # Avoid repeating identical motion hints too aggressively.
@@ -498,6 +512,8 @@ class GeminiLiveBridge:
     async def _handle_live_response(self, response: Any) -> None:
         texts = self._extract_texts(response)
         for text in texts:
+            if self._is_edge_suppressed():
+                continue
             if not self._should_emit_text(text):
                 continue
             await self._websocket_registry.send_live(
@@ -512,6 +528,8 @@ class GeminiLiveBridge:
 
         audio_chunks = self._extract_audio_base64_chunks(response)
         for chunk_base64 in audio_chunks:
+            if self._is_edge_suppressed():
+                continue
             await self._websocket_registry.send_live(
                 self._session_id,
                 {
@@ -687,6 +705,9 @@ class GeminiLiveBridge:
             self._last_voice_emit_ts = now
             return True
         return False
+
+    def _is_edge_suppressed(self) -> bool:
+        return time.monotonic() < self._edge_suppress_until
 
     @staticmethod
     def _now() -> str:

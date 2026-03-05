@@ -116,5 +116,10 @@ class LiveBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(risky, calm)
         self.assertLessEqual(risky, 4.0)
 
+    async def test_edge_hazard_suppresses_cloud_audio_and_text(self):
+        self.bridge.note_edge_hazard('DROP_AHEAD')
+        await self.bridge._handle_live_response({'text': 'Stop now', 'data': 'ZmFrZV9hdWRpbw=='})
+        self.assertEqual(len(self.bridge._websocket_registry.messages), 0)
+
 if __name__ == '__main__':
     unittest.main()

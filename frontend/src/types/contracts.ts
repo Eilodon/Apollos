@@ -38,6 +38,17 @@ export interface UserCommandMessage {
   command: string;
 }
 
+export interface EdgeHazardMessage {
+  type: 'EDGE_HAZARD';
+  session_id: string;
+  timestamp: string;
+  hazard_type: string;
+  position_x?: number;
+  distance?: DistanceCategory;
+  confidence?: number;
+  suppress_seconds?: number;
+}
+
 export interface AssistantTextMessage {
   type: 'assistant_text';
   session_id: string;

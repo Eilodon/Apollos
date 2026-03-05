@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AudioChunkMessage,
   BackendToClientMessage,
+  EdgeHazardMessage,
   HardStopMessage,
   MultimodalFrameMessage,
   UserCommandMessage,
@@ -20,6 +21,7 @@ interface UseARIAResult {
   sendFrame: (message: Omit<MultimodalFrameMessage, 'type' | 'session_id'>) => void;
   sendAudioChunk: (chunkBase64: string) => void;
   sendUserCommand: (command: string) => void;
+  sendEdgeHazard: (payload: Omit<EdgeHazardMessage, 'type' | 'session_id' | 'timestamp'>) => void;
 }
 
 const MAX_RETRIES = 6;
@@ -266,6 +268,22 @@ export function useARIA({ sessionId, onBackendMessage, onHardStop }: UseARIAOpti
     [sessionId],
   );
 
+  const sendEdgeHazard = useCallback(
+    (payload: Omit<EdgeHazardMessage, 'type' | 'session_id' | 'timestamp'>) => {
+      const message: EdgeHazardMessage = {
+        type: 'EDGE_HAZARD',
+        session_id: sessionId,
+        timestamp: new Date().toISOString(),
+        ...payload,
+      };
+
+      if (emergencySocketRef.current?.readyState === WebSocket.OPEN) {
+        emergencySocketRef.current.send(JSON.stringify(message));
+      }
+    },
+    [sessionId],
+  );
+
   useEffect(() => {
     return () => {
       disconnect();
@@ -279,5 +297,6 @@ export function useARIA({ sessionId, onBackendMessage, onHardStop }: UseARIAOpti
     sendFrame,
     sendAudioChunk,
     sendUserCommand,
+    sendEdgeHazard,
   };
 }

@@ -24,6 +24,7 @@ interface UseCameraOptions {
   motionSnapshot: MotionSnapshot;
   onFrame: (payload: CameraFramePayload) => void;
   onHazard?: (message: HardStopMessage) => void;
+  onEdgeHazard?: (message: HardStopMessage) => void;
   locationSnapshot?: LocationSnapshot | null;
 }
 
@@ -61,7 +62,7 @@ async function getOptimalCameraStream() {
   return await navigator.mediaDevices.getUserMedia(constraints);
 }
 
-export function useCamera({ videoRef, enabled, motionSnapshot, onFrame, onHazard, locationSnapshot }: UseCameraOptions): void {
+export function useCamera({ videoRef, enabled, motionSnapshot, onFrame, onHazard, onEdgeHazard, locationSnapshot }: UseCameraOptions): void {
   const streamRef = useRef<MediaStream | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const edgeCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -97,13 +98,15 @@ export function useCamera({ videoRef, enabled, motionSnapshot, onFrame, onHazard
           return;
         }
         lastEdgeHazardAtRef.current = now;
-        onHazard?.({
+        const message: HardStopMessage = {
           type: 'HARD_STOP',
           position_x: e.data.positionX,
           distance: e.data.distance,
           hazard_type: e.data.hazard_type,
           confidence: 0.99
-        });
+        };
+        onHazard?.(message);
+        onEdgeHazard?.(message);
       }
     };
 
@@ -114,13 +117,15 @@ export function useCamera({ videoRef, enabled, motionSnapshot, onFrame, onHazard
           return;
         }
         lastDepthHazardAtRef.current = now;
-        onHazard?.({
+        const message: HardStopMessage = {
           type: 'HARD_STOP',
           position_x: e.data.positionX ?? 0,
           distance: e.data.distance ?? 'very_close',
           hazard_type: e.data.hazard_type ?? 'DROP_AHEAD',
           confidence: Number(e.data.confidence ?? 0.8),
-        });
+        };
+        onHazard?.(message);
+        onEdgeHazard?.(message);
       }
     };
 
@@ -130,7 +135,7 @@ export function useCamera({ videoRef, enabled, motionSnapshot, onFrame, onHazard
       reflexWorkerRef.current = null;
       depthWorkerRef.current = null;
     };
-  }, [onHazard]);
+  }, [onEdgeHazard, onHazard]);
 
   useEffect(() => {
     const handler = (e: DeviceMotionEvent) => {

@@ -77,6 +77,7 @@ async def config() -> dict[str, object]:
         'use_vertex': _env_flag('GEMINI_USE_VERTEX', False),
         'maps_grounding_enabled': _env_flag('ENABLE_MAPS_GROUNDING', False),
         'hazard_confirmation_frames': int(os.getenv('HAZARD_CONFIRMATION_FRAMES', '1')),
+        'edge_hazard_suppress_seconds': float(os.getenv('EDGE_HAZARD_SUPPRESS_SECONDS', '2.5')),
     }
 
 
@@ -171,6 +172,17 @@ async def websocket_emergency(websocket: WebSocket, session_id: str) -> None:
                 await websocket.send_json(
                     {
                         'type': 'heartbeat_ack',
+                        'session_id': session_id,
+                        'timestamp': _now(),
+                    }
+                )
+                continue
+
+            if payload.get('type') == 'EDGE_HAZARD':
+                await orchestrator.handle_emergency_message(session_id, payload)
+                await websocket.send_json(
+                    {
+                        'type': 'edge_hazard_ack',
                         'session_id': session_id,
                         'timestamp': _now(),
                     }

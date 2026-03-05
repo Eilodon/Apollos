@@ -103,6 +103,29 @@ class AriaAgentOrchestrator:
 
         await self._send_assistant_text(session_id, f'Unsupported message type: {message_type}')
 
+    async def handle_emergency_message(self, session_id: str, payload: dict[str, Any]) -> None:
+        message_type = str(payload.get('type', '')).strip()
+        if message_type != 'EDGE_HAZARD':
+            return
+
+        hazard_type = str(payload.get('hazard_type', 'EDGE_REFLEX') or 'EDGE_REFLEX')
+        suppress_seconds_raw = payload.get('suppress_seconds')
+        try:
+            suppress_seconds = float(suppress_seconds_raw) if suppress_seconds_raw is not None else 2.5
+        except (TypeError, ValueError):
+            suppress_seconds = 2.5
+
+        await self._session_store.mark_edge_hazard(
+            session_id=session_id,
+            hazard_type=hazard_type,
+            suppress_seconds=suppress_seconds,
+        )
+
+        async with self._bridge_lock:
+            bridge = self._bridges.get(session_id)
+        if bridge is not None:
+            bridge.note_edge_hazard(hazard_type)
+
     async def dispatch_tool_call(self, name: str, args: dict[str, Any], session_id: str) -> ToolResult:
         tool = self._tools.get(name)
         if tool is None:

@@ -134,6 +134,16 @@ export default function App(): JSX.Element {
     onHardStop,
   });
 
+  const onEdgeHazard = useCallback((message: HardStopMessage) => {
+    aria.sendEdgeHazard({
+      hazard_type: message.hazard_type,
+      position_x: message.position_x,
+      distance: message.distance,
+      confidence: message.confidence,
+      suppress_seconds: 2.5,
+    });
+  }, [aria]);
+
   const { micActive, startMic, stopMic, toggleMic } = useAudioStream({
     onAudioChunk: aria.sendAudioChunk,
   });
@@ -143,6 +153,7 @@ export default function App(): JSX.Element {
     enabled: sessionActive && aria.status === 'connected',
     motionSnapshot,
     onHazard: onHardStop,
+    onEdgeHazard,
     locationSnapshot,
     onFrame: ({ frameBase64, timestamp, yaw_delta_deg }) => {
       aria.sendFrame({

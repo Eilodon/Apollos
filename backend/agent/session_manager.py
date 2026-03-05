@@ -83,6 +83,8 @@ class SessionState:
     frame_sequence: int = 0
     spatial_memories: list[HazardMemory] = field(default_factory=list)
     last_location_lookup_epoch: float = 0.0
+    edge_hazard_until_epoch: float = 0.0
+    edge_hazard_type: str = ''
 
 
 class SessionStore:
@@ -196,7 +198,12 @@ class SessionStore:
         summary = state.context_summary.strip()
         if summary:
             return summary
-        return f"Mode={state.mode}; motion={state.motion_state}; last_seen={state.last_seen}"
+        edge_state = (
+            f"; edge_reflex={state.edge_hazard_type or 'none'}"
+            if state.edge_hazard_until_epoch > time.time()
+            else ''
+        )
+        return f"Mode={state.mode}; motion={state.motion_state}; last_seen={state.last_seen}{edge_state}"
 
     async def get_spatial_context(self, session_id: str, current_yaw: float | None) -> str:
         state = await self.touch_session(session_id)
@@ -289,6 +296,24 @@ class SessionStore:
     async def get_location_snapshot(self, session_id: str) -> tuple[float | None, float | None, float | None]:
         state = await self.touch_session(session_id)
         return state.lat, state.lng, state.heading_deg
+
+    async def mark_edge_hazard(
+        self,
+        session_id: str,
+        hazard_type: str,
+        suppress_seconds: float = 2.5,
+    ) -> None:
+        state = await self.touch_session(session_id)
+        async with self._lock:
+            state.edge_hazard_type = hazard_type
+            state.edge_hazard_until_epoch = time.time() + max(0.5, suppress_seconds)
+            state.last_seen = self._now()
+            await self._persist_session(state)
+
+    async def is_edge_hazard_active(self, session_id: str, now_epoch: float | None = None) -> bool:
+        state = await self.touch_session(session_id)
+        reference = now_epoch if now_epoch is not None else time.time()
+        return state.edge_hazard_until_epoch > reference
 
     async def get_crowd_hazard_hints(self, lat: float, lng: float, limit: int = 3) -> list[str]:
         if not self._use_firestore or not self._firestore_client:
@@ -391,6 +416,8 @@ class SessionStore:
                 }
                 for memory in state.spatial_memories
             ],
+            'edge_hazard_until_epoch': state.edge_hazard_until_epoch,
+            'edge_hazard_type': state.edge_hazard_type,
         }
         await asyncio.to_thread(
             self._firestore_client.collection('sessions').document(state.session_id).set,

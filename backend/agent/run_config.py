@@ -4,8 +4,8 @@ from google.adk.agents.run_config import RunConfig, StreamingMode
 from google.genai import types
 
 
-def get_run_config() -> RunConfig:
-    """Builds ADK run config compatible with current google-adk/google-genai SDKs."""
+def get_dual_brain_run_config() -> RunConfig:
+    """Builds ADK run config for the cloud cortex in a dual-brain architecture."""
     return RunConfig(
         streaming_mode=StreamingMode.BIDI,
         response_modalities=['AUDIO'],
@@ -27,3 +27,8 @@ def get_run_config() -> RunConfig:
             automatic_activity_detection=types.AutomaticActivityDetection(disabled=False)
         ),
     )
+
+
+def get_run_config() -> RunConfig:
+    """Backward-compatible alias."""
+    return get_dual_brain_run_config()
