@@ -13,8 +13,10 @@ REQUIRED_PATTERNS = {
     'autoGainControl': r'autoGainControl\s*:\s*true',
     'sampleRate': r'sampleRate\s*:\s*16000',
     'channelCount': r'channelCount\s*:\s*1',
-    'voiceGateThreshold': r'VOICE_THRESHOLD\s*=\s*0\.02',
-    'voiceGateHold': r'GATE_HOLD_FRAMES\s*=\s*8',
+    'audioWorkletGate': r'AudioWorkletNode\s*\(',
+    'zcrMin': r'ZCR_MIN\s*=\s*25',
+    'zcrMax': r'ZCR_MAX\s*=\s*150',
+    'energyFloor': r'ENERGY_FLOOR\s*=\s*0\.015',
 }
 
 

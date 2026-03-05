@@ -14,6 +14,35 @@ export interface KinematicReading {
     gyro: DeviceMotionEventRotationRate | null;
 }
 
+export function computeRiskScore(
+    motionState: 'stationary' | 'walking_slow' | 'walking_fast' | 'running',
+    pitch: number,
+    velocity: number,
+    yawDeltaDeg: number,
+): number {
+    let score = 1;
+
+    if (motionState === 'walking_fast') {
+        score *= 1.5;
+    } else if (motionState === 'running') {
+        score *= 2;
+    }
+
+    if (Math.abs(pitch) > 20) {
+        score *= 1.3;
+    }
+
+    if (Math.abs(yawDeltaDeg) > 30) {
+        score *= 1.4;
+    }
+
+    if (velocity > 2.5 && Math.abs(pitch) > 15) {
+        score *= 1.5;
+    }
+
+    return Math.min(4, Math.max(1, score));
+}
+
 /**
  * Kiểm tra xem có nên chụp khung hình gửi lên Cloud không.
  *

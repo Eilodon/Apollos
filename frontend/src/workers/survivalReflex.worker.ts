@@ -19,6 +19,8 @@ const SUSTAINED_THRESHOLD = 40;
 
 const diffHistory: number[] = [];
 let previousFrame: ImageData | null = null;
+let dynamicInterval = 33;
+let reflexLastProcessTime = performance.now();
 
 function toGrayLuma(frame: ImageData): Float32Array {
   const gray = new Float32Array(frame.width * frame.height);
@@ -153,11 +155,21 @@ function buildHazardPayload(centerDiff: number, avgDiff: number, pattern: Expans
   };
 }
 
-self.onmessage = (event: MessageEvent<{ currentFrame?: ImageData }>) => {
+self.onmessage = (event: MessageEvent<{ currentFrame?: ImageData; riskScore?: number }>) => {
   const currentFrame = event.data?.currentFrame;
+  const riskScore = Number.isFinite(event.data?.riskScore) ? Number(event.data.riskScore) : 1;
   if (!currentFrame) {
     return;
   }
+
+  // Thermal-kinematic governor:
+  // risk=1 => ~150ms (6fps), risk=4 => ~16ms (60fps)
+  dynamicInterval = Math.max(16, 150 - riskScore * 33);
+  const now = performance.now();
+  if (now - reflexLastProcessTime < dynamicInterval) {
+    return;
+  }
+  reflexLastProcessTime = now;
 
   if (!previousFrame) {
     previousFrame = currentFrame;

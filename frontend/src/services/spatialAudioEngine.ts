@@ -12,13 +12,15 @@ export type SemanticPingType =
   | 'approaching_object'
   | 'soft_obstacle'
   | 'turning_recommended'
-  | 'destination_near';
+  | 'destination_near'
+  | 'pocket_mode_active';
 
 const PING_SEMANTIC: Record<SemanticPingType, { interval: number; pitch: number; holdMs: number }> = {
   approaching_object: { interval: 100, pitch: 880, holdMs: 3000 },
   soft_obstacle: { interval: 400, pitch: 440, holdMs: 2000 },
   turning_recommended: { interval: 600, pitch: 330, holdMs: 1800 },
   destination_near: { interval: 200, pitch: 660, holdMs: 2200 },
+  pocket_mode_active: { interval: 900, pitch: 240, holdMs: 1200 },
 };
 
 export class SpatialAudioEngine {

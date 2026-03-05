@@ -1,6 +1,6 @@
 import unittest
 
-from agent.session_manager import SessionStore
+from agent.session_manager import SessionStore, clock_face_from_delta, encode_geohash
 
 
 class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
@@ -39,6 +39,11 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
         await store.apply_stress_mode_override('session-4', reason='test', revert_after_seconds=120)
         mode = await store.get_effective_mode('session-4')
         self.assertEqual(mode, 'NAVIGATION')
+
+    def test_geohash_precision_and_clock_mapping(self) -> None:
+        geohash = encode_geohash(10.3602, 106.3598, precision=7)
+        self.assertEqual(len(geohash), 7)
+        self.assertEqual(clock_face_from_delta(-90), 9)
 
 
 if __name__ == '__main__':

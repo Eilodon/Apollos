@@ -1,5 +1,5 @@
 import { MutableRefObject, useEffect, useMemo, useRef } from 'react';
-import { KinematicReading, computeYawDelta, shouldCaptureFrame } from '../services/kinematicGating';
+import { KinematicReading, computeRiskScore, computeYawDelta, shouldCaptureFrame } from '../services/kinematicGating';
 import { HardStopMessage, MotionSnapshot } from '../types/contracts';
 
 interface CameraFramePayload {
@@ -65,18 +65,38 @@ export function useCamera({ videoRef, enabled, motionSnapshot, onFrame, onHazard
   const streamRef = useRef<MediaStream | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const edgeCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const workerRef = useRef<Worker | null>(null);
+  const reflexWorkerRef = useRef<Worker | null>(null);
+  const depthWorkerRef = useRef<Worker | null>(null);
   const kinematicRef = useRef<KinematicReading>({ accel: null, gyro: null });
   const lastCloudPostRef = useRef<number>(Date.now());
   const accumulatedYawRef = useRef<number>(0);
   const lastMotionEventTsRef = useRef<number>(Date.now());
+  const lastYawDeltaDegRef = useRef<number>(0);
+  const lastEdgeHazardAtRef = useRef<number>(0);
+  const lastDepthHazardAtRef = useRef<number>(0);
 
   const intervalMs = useMemo(() => intervalForMotionState(motionSnapshot.state), [motionSnapshot.state]);
 
   useEffect(() => {
-    workerRef.current = new Worker(new URL('../workers/survivalReflex.worker.ts', import.meta.url), { type: 'module' });
-    workerRef.current.onmessage = (e) => {
+    reflexWorkerRef.current = new Worker(new URL('../workers/survivalReflex.worker.ts', import.meta.url), { type: 'module' });
+    depthWorkerRef.current = new Worker(new URL('../workers/depthGuard.worker.ts', import.meta.url));
+    const configuredModelUrl = import.meta.env.VITE_DEPTH_MODEL_URL;
+    const depthModelUrl = typeof configuredModelUrl === 'string'
+      ? configuredModelUrl
+      : '/models/depth_anything_v2_small_fp16.tflite';
+
+    depthWorkerRef.current.postMessage({
+      type: 'init_depth_model',
+      modelUrl: depthModelUrl,
+    });
+
+    reflexWorkerRef.current.onmessage = (e) => {
       if (e.data.type === 'CRITICAL_EDGE_HAZARD') {
+        const now = Date.now();
+        if (now - lastEdgeHazardAtRef.current < 1200) {
+          return;
+        }
+        lastEdgeHazardAtRef.current = now;
         onHazard?.({
           type: 'HARD_STOP',
           position_x: e.data.positionX,
@@ -86,9 +106,29 @@ export function useCamera({ videoRef, enabled, motionSnapshot, onFrame, onHazard
         });
       }
     };
+
+    depthWorkerRef.current.onmessage = (e) => {
+      if (e.data.type === 'DROP_AHEAD_HAZARD') {
+        const now = Date.now();
+        if (now - lastDepthHazardAtRef.current < 1800) {
+          return;
+        }
+        lastDepthHazardAtRef.current = now;
+        onHazard?.({
+          type: 'HARD_STOP',
+          position_x: e.data.positionX ?? 0,
+          distance: e.data.distance ?? 'very_close',
+          hazard_type: e.data.hazard_type ?? 'DROP_AHEAD',
+          confidence: Number(e.data.confidence ?? 0.8),
+        });
+      }
+    };
+
     return () => {
-      workerRef.current?.terminate();
-      workerRef.current = null;
+      reflexWorkerRef.current?.terminate();
+      depthWorkerRef.current?.terminate();
+      reflexWorkerRef.current = null;
+      depthWorkerRef.current = null;
     };
   }, [onHazard]);
 
@@ -104,7 +144,9 @@ export function useCamera({ videoRef, enabled, motionSnapshot, onFrame, onHazard
       };
 
       // Tích lũy yaw delta để bơm vào từng frame khi chụp
-      accumulatedYawRef.current += computeYawDelta(e.rotationRate, dtMs);
+      const yawDelta = computeYawDelta(e.rotationRate, dtMs);
+      lastYawDeltaDegRef.current = yawDelta;
+      accumulatedYawRef.current += yawDelta;
     };
     window.addEventListener('devicemotion', handler);
     return () => window.removeEventListener('devicemotion', handler);
@@ -151,10 +193,17 @@ export function useCamera({ videoRef, enabled, motionSnapshot, onFrame, onHazard
       return;
     }
 
-    const EDGE_INTERVAL = 100;
-    const timer = window.setInterval(() => {
+    let timer = 0;
+    let cancelled = false;
+
+    const tick = () => {
+      if (cancelled) {
+        return;
+      }
+
       const video = videoRef.current;
       if (!video || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+        timer = window.setTimeout(tick, 120);
         return;
       }
 
@@ -191,7 +240,16 @@ export function useCamera({ videoRef, enabled, motionSnapshot, onFrame, onHazard
 
       edgeCtx.drawImage(video, sx, sy, sw, sh, 0, 0, 64, 64);
       const edgeImageData = edgeCtx.getImageData(0, 0, 64, 64);
-      workerRef.current?.postMessage({ currentFrame: edgeImageData, timestamp: Date.now() });
+      const riskScore = computeRiskScore(
+        motionSnapshot.state,
+        motionSnapshot.pitch,
+        motionSnapshot.velocity,
+        lastYawDeltaDegRef.current,
+      );
+      const edgeInterval = Math.max(16, 150 - riskScore * 33);
+
+      reflexWorkerRef.current?.postMessage({ currentFrame: edgeImageData, riskScore });
+      depthWorkerRef.current?.postMessage({ type: 'depth_frame', currentFrame: edgeImageData, riskScore });
 
       const now = Date.now();
       const timeSinceLastPost = now - lastCloudPostRef.current;
@@ -217,10 +275,13 @@ export function useCamera({ videoRef, enabled, motionSnapshot, onFrame, onHazard
         });
         lastCloudPostRef.current = now;
       }
-    }, EDGE_INTERVAL);
+      timer = window.setTimeout(tick, edgeInterval);
+    };
+    tick();
 
     return () => {
-      window.clearInterval(timer);
+      cancelled = true;
+      window.clearTimeout(timer);
     };
-  }, [enabled, intervalMs, locationSnapshot, onFrame, videoRef]);
+  }, [enabled, intervalMs, locationSnapshot, motionSnapshot.pitch, motionSnapshot.state, motionSnapshot.velocity, onFrame, videoRef]);
 }

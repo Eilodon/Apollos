@@ -9,12 +9,60 @@ from typing import Any
 
 from .types import NavigationMode
 
+GEOHASH_BASE32 = '0123456789bcdefghjkmnpqrstuvwxyz'
+
+
+def encode_geohash(lat: float, lng: float, precision: int = 7) -> str:
+    lat_interval = [-90.0, 90.0]
+    lng_interval = [-180.0, 180.0]
+    geohash: list[str] = []
+    bits = [16, 8, 4, 2, 1]
+    bit = 0
+    ch = 0
+    even = True
+
+    while len(geohash) < precision:
+        if even:
+            mid = (lng_interval[0] + lng_interval[1]) / 2
+            if lng > mid:
+                ch |= bits[bit]
+                lng_interval[0] = mid
+            else:
+                lng_interval[1] = mid
+        else:
+            mid = (lat_interval[0] + lat_interval[1]) / 2
+            if lat > mid:
+                ch |= bits[bit]
+                lat_interval[0] = mid
+            else:
+                lat_interval[1] = mid
+        even = not even
+        if bit < 4:
+            bit += 1
+        else:
+            geohash.append(GEOHASH_BASE32[ch])
+            bit = 0
+            ch = 0
+
+    return ''.join(geohash)
+
+
+def normalize_delta_deg(value: float) -> float:
+    return ((value + 180.0) % 360.0) - 180.0
+
+
+def clock_face_from_delta(delta_deg: float) -> int:
+    step = int(round(delta_deg / 30.0))
+    hour = step % 12
+    return 12 if hour == 0 else hour
+
 
 @dataclass(slots=True)
 class HazardMemory:
     hazard_type: str
     position_description: str
     yaw_at_detection: float
+    detected_epoch: float
     frame_sequence: int
     confirmed_count: int
     last_seen_frame: int
@@ -155,16 +203,33 @@ class SessionStore:
         if current_yaw is None:
             return ''
         async with self._lock:
-            relevant: list[HazardMemory] = []
-            for memory in state.spatial_memories:
-                if abs(memory.yaw_at_detection - current_yaw) <= 30:
-                    relevant.append(memory)
-            if not relevant:
+            now_epoch = time.time()
+            recent_memories = [
+                memory
+                for memory in state.spatial_memories
+                if (now_epoch - memory.detected_epoch) <= 300
+            ]
+            if not recent_memories:
                 return ''
-            return '[SPATIAL MEMORY: ' + '; '.join(
-                f"{memory.hazard_type} ahead ({memory.confirmed_count}x confirmed)"
-                for memory in relevant
-            ) + ']'
+
+            contextualized: list[str] = []
+            for memory in recent_memories[-4:]:
+                delta = normalize_delta_deg(memory.yaw_at_detection - current_yaw)
+                clock_face = clock_face_from_delta(delta)
+                if abs(delta) < 15:
+                    bearing = 'ahead'
+                elif delta > 0:
+                    bearing = f'{abs(delta):.0f}deg right'
+                else:
+                    bearing = f'{abs(delta):.0f}deg left'
+                age_s = int(max(0, now_epoch - memory.detected_epoch))
+                contextualized.append(
+                    f"{memory.hazard_type} around {clock_face} o'clock ({bearing}, {age_s}s ago)"
+                )
+
+            if not contextualized:
+                return ''
+            return '[SPATIAL MEMORY: ' + '; '.join(contextualized) + ']'
 
     async def add_spatial_hazard_memory(
         self,
@@ -189,12 +254,14 @@ class SessionStore:
             if existing is not None:
                 existing.confirmed_count += 1
                 existing.last_seen_frame = state.frame_sequence
+                existing.detected_epoch = time.time()
             else:
                 state.spatial_memories.append(
                     HazardMemory(
                         hazard_type=hazard_type,
                         position_description=position_description,
                         yaw_at_detection=yaw_at_detection,
+                        detected_epoch=time.time(),
                         frame_sequence=state.frame_sequence,
                         confirmed_count=1,
                         last_seen_frame=state.frame_sequence,
@@ -222,6 +289,33 @@ class SessionStore:
     async def get_location_snapshot(self, session_id: str) -> tuple[float | None, float | None, float | None]:
         state = await self.touch_session(session_id)
         return state.lat, state.lng, state.heading_deg
+
+    async def get_crowd_hazard_hints(self, lat: float, lng: float, limit: int = 3) -> list[str]:
+        if not self._use_firestore or not self._firestore_client:
+            return []
+
+        prefix5 = encode_geohash(lat, lng, precision=5)
+
+        def query_docs() -> list[Any]:
+            query = (
+                self._firestore_client.collection('hazard_map')
+                .where('geohash_prefix5', '==', prefix5)
+                .limit(limit)
+            )
+            return list(query.stream())
+
+        try:
+            docs = await asyncio.to_thread(query_docs)
+        except Exception:
+            return []
+
+        hints: list[str] = []
+        for doc in docs:
+            payload = doc.to_dict() or {}
+            hazard = str(payload.get('hazard_type', 'unknown'))
+            count = int(payload.get('confirmed_count', 1) or 1)
+            hints.append(f'{hazard} ({count} confirmations)')
+        return hints
 
     async def log_hazard(
         self,
@@ -290,6 +384,7 @@ class SessionStore:
                     'hazard_type': memory.hazard_type,
                     'position_description': memory.position_description,
                     'yaw_at_detection': memory.yaw_at_detection,
+                    'detected_epoch': memory.detected_epoch,
                     'frame_sequence': memory.frame_sequence,
                     'confirmed_count': memory.confirmed_count,
                     'last_seen_frame': memory.last_seen_frame,
@@ -316,14 +411,29 @@ class SessionStore:
         if not state or state.lat is None or state.lng is None:
             return
 
-        geohash = f"{round(state.lat, 3)}:{round(state.lng, 3)}"
+        geohash = encode_geohash(state.lat, state.lng, precision=7)
+        geohash_prefix5 = geohash[:5]
+        hazard_type = str(hazard_payload.get('hazard_type', 'unknown'))
         seed_payload = {
             'geohash': geohash,
+            'geohash_prefix5': geohash_prefix5,
             'lat': state.lat,
             'lng': state.lng,
-            'hazard_type': hazard_payload.get('hazard_type', 'unknown'),
+            'hazard_type': hazard_type,
             'confirmed_count': 1,
             'last_confirmed': self._now(),
             'description_vi': str(hazard_payload.get('description', '')),
+            'heading_deg': state.heading_deg,
         }
-        await asyncio.to_thread(self._firestore_client.collection('hazard_map').add, seed_payload)
+        doc_id = f'{geohash}-{hazard_type}'.replace('/', '_')
+        doc_ref = self._firestore_client.collection('hazard_map').document(doc_id)
+
+        def upsert_payload() -> None:
+            snapshot = doc_ref.get()
+            if snapshot.exists:
+                current = snapshot.to_dict() or {}
+                current_count = int(current.get('confirmed_count', 1) or 1)
+                seed_payload['confirmed_count'] = current_count + 1
+            doc_ref.set(seed_payload, merge=True)
+
+        await asyncio.to_thread(upsert_payload)

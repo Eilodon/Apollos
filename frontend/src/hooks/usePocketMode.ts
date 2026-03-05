@@ -9,9 +9,10 @@ import { useEffect, useRef, useState } from 'react';
  *
  * Fallback: Sử dụng proximity sensor nếu có (ít phổ biến hơn trên Chrome).
  */
-export function usePocketMode(): boolean {
+export function usePocketMode(onPocketModeActive?: () => void): boolean {
     const [inPocket, setInPocket] = useState(false);
     const inPocketRef = useRef(false);
+    const announcedRef = useRef(false);
 
     useEffect(() => {
         let sensorCleanup: (() => void) | null = null;
@@ -26,6 +27,14 @@ export function usePocketMode(): boolean {
                     const isPocket = (sensor.illuminance as number) < 5;
                     inPocketRef.current = isPocket;
                     setInPocket(isPocket);
+                    document.body.style.pointerEvents = isPocket ? 'none' : 'auto';
+                    if (isPocket && !announcedRef.current) {
+                        announcedRef.current = true;
+                        onPocketModeActive?.();
+                    }
+                    if (!isPocket) {
+                        announcedRef.current = false;
+                    }
                 };
 
                 const onError = () => {
@@ -63,8 +72,9 @@ export function usePocketMode(): boolean {
         return () => {
             sensorCleanup?.();
             document.removeEventListener('touchstart', preventTouch);
+            document.body.style.pointerEvents = 'auto';
         };
-    }, []);
+    }, [onPocketModeActive]);
 
     return inPocket;
 }

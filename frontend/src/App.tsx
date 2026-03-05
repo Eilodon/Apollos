@@ -76,7 +76,10 @@ export default function App(): JSX.Element {
   } = useMotionSensor();
 
   const { oledBlackMode, wakeLockActive, activateNavigationMode, deactivateNavigationMode } = useWakeLock();
-  const inPocket = usePocketMode();
+  const onPocketModeActive = useCallback(() => {
+    spatialRef.current?.fireSemanticCue('pocket_mode_active', 0);
+  }, []);
+  const inPocket = usePocketMode(onPocketModeActive);
   const locationSnapshot = useLocationContext(sessionActive);
 
   const onBackendMessage = useCallback((message: BackendToClientMessage) => {

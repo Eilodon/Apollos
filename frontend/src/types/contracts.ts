@@ -56,7 +56,7 @@ export interface AssistantAudioMessage {
 
 export interface SemanticCueMessage {
   type: 'semantic_cue';
-  cue: 'approaching_object' | 'soft_obstacle' | 'turning_recommended' | 'destination_near';
+  cue: 'approaching_object' | 'soft_obstacle' | 'turning_recommended' | 'destination_near' | 'pocket_mode_active';
   position_x?: number;
 }
 
