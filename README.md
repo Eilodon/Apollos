@@ -202,11 +202,20 @@ When `HUMAN_FALLBACK_ENABLED=1`, `request_human_help()` and safety-escalation ca
 1. Backend issues short-lived signed `help_ticket` embedded in link (`PUBLIC_HELP_BASE?help_ticket=...`).
 2. Helper page exchanges it once via `POST /auth/help-ticket/exchange`.
 3. Backend returns short-lived `viewer_token`.
-4. Helper websocket connects to `GET /ws/help/{session_id}` using `Sec-WebSocket-Protocol: apollos.help.v1,authb64.<viewer_token>`.
-5. Backend relays camera frames and PCM16 audio chunks for remote assistance.
+4. If Twilio Video is configured, exchange response also includes short-lived WebRTC room token for helper viewer.
+5. Patient app receives `human_help_session` message and publishes A/V to Twilio room (WebRTC).
+6. Helper page joins Twilio room for low-latency live audio/video.
+7. Fallback path remains available: helper websocket `GET /ws/help/{session_id}` using `Sec-WebSocket-Protocol: apollos.help.v1,authb64.<viewer_token>`.
 
 Optional SMS dispatch:
 - Configure `EMERGENCY_CONTACTS` and Twilio credentials to send helper links automatically.
+
+Twilio Video environment:
+- `HELP_RTC_PROVIDER=twilio`
+- `TWILIO_ACCOUNT_SID=...`
+- `TWILIO_VIDEO_API_KEY_SID=...`
+- `TWILIO_VIDEO_API_KEY_SECRET=...`
+- `TWILIO_VIDEO_ROOM_PREFIX=apollos-help`
 
 ## WebSocket contracts
 
@@ -274,6 +283,24 @@ Optional SMS dispatch:
   "sensor_health_flags": ["depth_error", "location_missing"],
   "localization_uncertainty_m": 120,
   "tier": "voice"
+}
+```
+
+### Backend → client: `human_help_session`
+
+```json
+{
+  "type": "human_help_session",
+  "session_id": "...",
+  "timestamp": "2026-03-05T00:00:00Z",
+  "help_link": "https://.../help?help_ticket=...",
+  "rtc": {
+    "provider": "twilio",
+    "room_name": "apollos-help-...",
+    "identity": "patient-...",
+    "token": "eyJ...",
+    "expires_in": 900
+  }
 }
 ```
 

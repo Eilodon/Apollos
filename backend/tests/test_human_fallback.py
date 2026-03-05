@@ -19,6 +19,11 @@ class HumanFallbackTests(unittest.TestCase):
             twilio_account_sid='',
             twilio_auth_token='',
             twilio_from_number='',
+            rtc_provider='twilio',
+            twilio_video_api_key_sid='',
+            twilio_video_api_key_secret='',
+            twilio_video_room_prefix='apollos-help',
+            twilio_video_token_ttl_seconds=900,
         )
 
     def test_help_ticket_exchange_only_once(self) -> None:
@@ -40,6 +45,31 @@ class HumanFallbackTests(unittest.TestCase):
         self.assertEqual(claims.get('sub'), 'session-abc')
         with self.assertRaises(HumanFallbackError):
             manager.verify_viewer_token(viewer_token, session_id='session-other')
+
+    def test_twilio_rtc_payload_when_configured(self) -> None:
+        cfg = HumanFallbackConfig(
+            enabled=True,
+            signing_key='unit-test-human-fallback-signing-key-1234567890',
+            issuer='apollos-human-help',
+            public_help_base='https://example.com/help',
+            help_ticket_ttl_seconds=180,
+            viewer_token_ttl_seconds=300,
+            emergency_contacts=(),
+            twilio_account_sid='AC1234567890abcdef1234567890abcd',
+            twilio_auth_token='',
+            twilio_from_number='',
+            rtc_provider='twilio',
+            twilio_video_api_key_sid='SK1234567890abcdef1234567890abcd',
+            twilio_video_api_key_secret='twilio-video-api-secret-test-0123456789',
+            twilio_video_room_prefix='apollos-help',
+            twilio_video_token_ttl_seconds=900,
+        )
+        manager = HumanFallbackManager(cfg)
+        session = manager.create_help_session('session-rtc')
+        self.assertIsInstance(session.get('rtc'), dict)
+        link = str(session.get('help_link'))
+        exchange = manager.exchange_help_ticket(link.split('help_ticket=', 1)[1])
+        self.assertIsInstance(exchange.get('rtc'), dict)
 
 
 if __name__ == '__main__':

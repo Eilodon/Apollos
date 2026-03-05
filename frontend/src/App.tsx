@@ -21,9 +21,10 @@ import { AudioCache } from './services/audioCache';
 import type { CarryMode } from './services/carryMode';
 import { OIDCBrokerClient } from './services/oidcBroker';
 import { SpatialAudioEngine } from './services/spatialAudioEngine';
+import { connectTwilioRoom, disconnectTwilioRoom } from './services/twilioVideo';
 import { vibrateHardStop, vibrateReconnect, vibrateSoftConfirm } from './services/haptics';
 import { getPlatformCapabilities } from './services/platformDetect';
-import { BackendToClientMessage, HardStopMessage, NavigationMode, SafetyStateMessage, SafetyTier, SemanticCueMessage } from './types/contracts';
+import { BackendToClientMessage, HardStopMessage, HumanHelpSessionMessage, NavigationMode, SafetyStateMessage, SafetyTier, SemanticCueMessage } from './types/contracts';
 
 type TranscriptEntry = {
   id: string;
@@ -180,6 +181,8 @@ export default function App(): JSX.Element {
   const lastDeterministicStatusRef = useRef('');
   const consecutiveBadFramesRef = useRef(0);
   const lastFrameQualityAlertRef = useRef('');
+  const humanHelpRoomRef = useRef<any | null>(null);
+  const humanHelpRoomNameRef = useRef('');
 
   const {
     motionSnapshot,
@@ -243,6 +246,39 @@ export default function App(): JSX.Element {
     return minInterval;
   }, [battery.highDischarge, battery.lowBattery, indoorLikely]);
 
+  const startHumanHelpRtcPublisher = useCallback(async (message: HumanHelpSessionMessage) => {
+    const rtc = message.rtc;
+    const provider = String(rtc?.provider || '').toLowerCase();
+    const roomName = String(rtc?.room_name || '').trim();
+    const token = String(rtc?.token || '').trim();
+    if (provider !== 'twilio' || !roomName || !token) {
+      return;
+    }
+
+    if (humanHelpRoomNameRef.current === roomName && humanHelpRoomRef.current) {
+      return;
+    }
+
+    disconnectTwilioRoom(humanHelpRoomRef.current);
+    humanHelpRoomRef.current = null;
+    humanHelpRoomNameRef.current = '';
+
+    try {
+      const room = await connectTwilioRoom(token, roomName, { publishAudio: true, publishVideo: true });
+      humanHelpRoomRef.current = room;
+      humanHelpRoomNameRef.current = roomName;
+      setTranscriptEntries((prev) => {
+        const updated = [...prev, createEntry('system', 'Human helper live WebRTC channel connected.')];
+        return updated.length > MAX_TRANSCRIPT_ENTRIES ? updated.slice(-MAX_TRANSCRIPT_ENTRIES) : updated;
+      });
+    } catch (error) {
+      setTranscriptEntries((prev) => {
+        const updated = [...prev, createEntry('system', `Human helper WebRTC failed: ${String(error)}`)];
+        return updated.length > MAX_TRANSCRIPT_ENTRIES ? updated.slice(-MAX_TRANSCRIPT_ENTRIES) : updated;
+      });
+    }
+  }, []);
+
   const onBackendMessage = useCallback((message: BackendToClientMessage) => {
     lastActivityAtRef.current = Date.now();
     if (message.type === 'assistant_text') {
@@ -292,8 +328,19 @@ export default function App(): JSX.Element {
       if (safety.degraded) {
         vibrateReconnect();
       }
+      return;
     }
-  }, [hazardPosition]);
+
+    if (message.type === 'human_help_session') {
+      const help = message as HumanHelpSessionMessage;
+      const roomName = String(help.rtc?.room_name || '').trim();
+      setTranscriptEntries((prev) => {
+        const updated = [...prev, createEntry('system', roomName ? `Human helper joining room ${roomName}.` : 'Human helper session issued.')];
+        return updated.length > MAX_TRANSCRIPT_ENTRIES ? updated.slice(-MAX_TRANSCRIPT_ENTRIES) : updated;
+      });
+      void startHumanHelpRtcPublisher(help);
+    }
+  }, [hazardPosition, startHumanHelpRtcPublisher]);
 
   const onHardStop = useCallback((message: HardStopMessage) => {
     lastActivityAtRef.current = Date.now();
@@ -608,6 +655,9 @@ export default function App(): JSX.Element {
     ariaDisconnect();
     spatialRef.current?.stopAll();
     await deactivateNavigationMode();
+    disconnectTwilioRoom(humanHelpRoomRef.current);
+    humanHelpRoomRef.current = null;
+    humanHelpRoomNameRef.current = '';
 
     setSessionActive(false);
     setHazardVisible(false);
@@ -671,6 +721,12 @@ export default function App(): JSX.Element {
     appendSystemEntry('Shake detected. SOS sent.');
     vibrateHardStop();
   }, [appendSystemEntry, sendUserCommand, sessionActive, shakeSignal]);
+
+  useEffect(() => () => {
+    disconnectTwilioRoom(humanHelpRoomRef.current);
+    humanHelpRoomRef.current = null;
+    humanHelpRoomNameRef.current = '';
+  }, []);
 
   useEffect(() => {
     if (!sessionActive || !locationSnapshot) {

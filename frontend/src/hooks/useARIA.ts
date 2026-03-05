@@ -97,7 +97,14 @@ export function useARIA({ sessionId, clientId, authToken, tokenProvider, onBacke
       return;
     }
 
-    if (type === 'assistant_text' || type === 'audio_chunk' || type === 'connection_state' || type === 'semantic_cue' || type === 'safety_state') {
+    if (
+      type === 'assistant_text'
+      || type === 'audio_chunk'
+      || type === 'connection_state'
+      || type === 'semantic_cue'
+      || type === 'safety_state'
+      || type === 'human_help_session'
+    ) {
       onBackendMessage?.(payload as BackendToClientMessage);
     }
   }, [onBackendMessage, onHardStop]);

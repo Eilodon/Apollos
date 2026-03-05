@@ -293,6 +293,7 @@ Implemented in current codebase upgrade pass:
   - signed `help_ticket` link generation
   - one-time ticket exchange endpoint (`/auth/help-ticket/exchange`)
   - short-lived helper viewer token + dedicated helper websocket (`/ws/help/{session_id}`)
+  - Twilio Video WebRTC upgrade (patient publisher + helper subscriber) while preserving ticket/security model
   - optional SMS dispatch to emergency contacts when configured.
 - Added release-blocking safety gate:
   - policy recall/false-stop KPI checks

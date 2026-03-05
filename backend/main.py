@@ -289,6 +289,7 @@ async def config() -> dict[str, object]:
         'oidc_broker_enabled': bool(OIDC_BROKER_ENABLED and _broker_manager is not None),
         'oidc_broker_ws_ttl_seconds': _broker_manager.ws_ttl_seconds if _broker_manager else 0,
         'human_fallback_enabled': bool(_human_fallback_manager is not None and _human_fallback_manager.enabled),
+        'human_fallback_rtc_provider': HUMAN_FALLBACK_CONFIG.rtc_provider if _human_fallback_manager else '',
         'dev_endpoints_enabled': ENABLE_DEV_ENDPOINTS,
         'max_ws_message_bytes': MAX_WS_MESSAGE_BYTES,
     }

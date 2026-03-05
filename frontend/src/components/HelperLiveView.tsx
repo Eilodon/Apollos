@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { connectTwilioRoom, disconnectTwilioRoom } from '../services/twilioVideo';
 import { pcm16Base64ToFloat32 } from '../utils/pcm';
 
 interface HelperLiveViewProps {
@@ -9,6 +10,13 @@ interface HelpExchangeResponse {
   session_id?: string;
   viewer_token?: string;
   expires_in?: number;
+  rtc?: {
+    provider?: string;
+    room_name?: string;
+    token?: string;
+    identity?: string;
+    expires_in?: number;
+  } | null;
 }
 
 function encodeBase64Url(value: string): string {
@@ -50,6 +58,8 @@ export function HelperLiveView({ helpTicket }: HelperLiveViewProps): JSX.Element
   const [audioEnabled, setAudioEnabled] = useState(false);
   const [lastHeartbeat, setLastHeartbeat] = useState('');
   const socketRef = useRef<WebSocket | null>(null);
+  const twilioRoomRef = useRef<any | null>(null);
+  const twilioMediaRef = useRef<HTMLDivElement | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const nextPlayTimeRef = useRef(0);
 
@@ -92,6 +102,75 @@ export function HelperLiveView({ helpTicket }: HelperLiveViewProps): JSX.Element
     nextPlayTimeRef.current = startAt + buffer.duration;
   };
 
+  const connectTwilioHelper = async (
+    rtc: { provider?: string; room_name?: string; token?: string } | null | undefined,
+  ): Promise<boolean> => {
+    if (!rtc || String(rtc.provider || '').toLowerCase() !== 'twilio') {
+      return false;
+    }
+    const token = String(rtc.token || '').trim();
+    const roomName = String(rtc.room_name || '').trim();
+    if (!token || !roomName) {
+      return false;
+    }
+    try {
+      const room = await connectTwilioRoom(token, roomName, { publishAudio: false, publishVideo: false });
+      twilioRoomRef.current = room;
+      const attachTrack = (track: any) => {
+        if (!track || typeof track.attach !== 'function' || !twilioMediaRef.current) {
+          return;
+        }
+        const media = track.attach();
+        if (!(media instanceof HTMLElement)) {
+          return;
+        }
+        media.setAttribute('data-track-sid', String(track.sid || ''));
+        media.style.maxWidth = '100%';
+        media.style.width = '100%';
+        media.style.display = 'block';
+        if (track.kind === 'audio') {
+          media.setAttribute('autoplay', 'true');
+          media.setAttribute('controls', 'true');
+        }
+        twilioMediaRef.current.appendChild(media);
+      };
+      const detachTrack = (track: any) => {
+        if (!track || typeof track.detach !== 'function') {
+          return;
+        }
+        const detached = track.detach();
+        if (!Array.isArray(detached)) {
+          return;
+        }
+        detached.forEach((el: unknown) => {
+          if (el instanceof HTMLElement) {
+            el.remove();
+          }
+        });
+      };
+      const wireParticipant = (participant: any) => {
+        if (!participant) {
+          return;
+        }
+        participant.tracks?.forEach((publication: any) => {
+          if (publication?.track) {
+            attachTrack(publication.track);
+          }
+        });
+        participant.on?.('trackSubscribed', (track: any) => attachTrack(track));
+        participant.on?.('trackUnsubscribed', (track: any) => detachTrack(track));
+      };
+      room.participants?.forEach((participant: any) => wireParticipant(participant));
+      room.on?.('participantConnected', (participant: any) => wireParticipant(participant));
+      setStatus('connected');
+      setLastHeartbeat(new Date().toISOString());
+      return true;
+    } catch (error) {
+      setError(`Twilio helper join failed: ${String(error)}`);
+      return false;
+    }
+  };
+
   useEffect(() => {
     let cancelled = false;
     const connect = async () => {
@@ -117,6 +196,11 @@ export function HelperLiveView({ helpTicket }: HelperLiveViewProps): JSX.Element
           return;
         }
         setSessionId(sid);
+
+        const rtcConnected = await connectTwilioHelper(payload.rtc);
+        if (rtcConnected) {
+          return;
+        }
 
         const wsUrl = `${wsBase}/help/${encodeURIComponent(sid)}`;
         const protocols = ['apollos.help.v1', `authb64.${encodeBase64Url(viewerToken)}`];
@@ -198,6 +282,11 @@ export function HelperLiveView({ helpTicket }: HelperLiveViewProps): JSX.Element
         socketRef.current.close(1000, 'helper_view_closed');
         socketRef.current = null;
       }
+      disconnectTwilioRoom(twilioRoomRef.current);
+      twilioRoomRef.current = null;
+      if (twilioMediaRef.current) {
+        twilioMediaRef.current.innerHTML = '';
+      }
       if (audioContextRef.current) {
         void audioContextRef.current.close();
         audioContextRef.current = null;
@@ -228,6 +317,7 @@ export function HelperLiveView({ helpTicket }: HelperLiveViewProps): JSX.Element
         </button>
       </section>
       <section style={{ border: '1px solid rgba(255,255,255,0.2)', borderRadius: 12, overflow: 'hidden', minHeight: 240 }}>
+        <div ref={twilioMediaRef} />
         {lastFrame ? (
           <img
             src={lastFrame}
