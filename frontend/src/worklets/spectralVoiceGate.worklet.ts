@@ -21,13 +21,16 @@ class SpectralVoiceGateProcessor extends AudioWorkletProcessor {
   private readonly ENERGY_FLOOR = 0.015;
   private readonly SPECTRAL_MIN = 0.2;
   private readonly SPECTRAL_MAX = 6.5;
-  private readonly holdFramesTarget: number;
+  private readonly AMBIENT_NOISY_RMS = 0.05;
+  private readonly HOLD_NOISY_MS = 400;
+  private readonly HOLD_QUIET_MS = 150;
   private holdFrames = 0;
+  private ambientRms = 0;
 
-  constructor() {
-    super();
-    // Keep gate open for ~500ms to avoid clipping words mid-syllable.
-    this.holdFramesTarget = Math.max(8, Math.round((sampleRate * 0.5) / 128));
+  private holdFramesFor(channelLength: number, noisy: boolean): number {
+    const frameMs = (channelLength / Math.max(sampleRate, 1)) * 1000;
+    const holdMs = noisy ? this.HOLD_NOISY_MS : this.HOLD_QUIET_MS;
+    return Math.max(1, Math.ceil(holdMs / Math.max(frameMs, 1)));
   }
 
   process(
@@ -60,9 +63,12 @@ class SpectralVoiceGateProcessor extends AudioWorkletProcessor {
     const enoughEnergy = energy >= this.ENERGY_FLOOR;
     const spectralRatio = spectralEnergy / Math.max(energy, 1e-6);
     const spectralInRange = spectralRatio >= this.SPECTRAL_MIN && spectralRatio <= this.SPECTRAL_MAX;
+    const rms = Math.sqrt(energy / Math.max(channel.length, 1));
+    this.ambientRms = this.ambientRms * 0.99 + rms * 0.01;
+    const holdFramesTarget = this.holdFramesFor(channel.length, this.ambientRms > this.AMBIENT_NOISY_RMS);
 
     if (zcrInRange && enoughEnergy && spectralInRange) {
-      this.holdFrames = Math.max(this.holdFrames, this.holdFramesTarget);
+      this.holdFrames = Math.max(this.holdFrames, holdFramesTarget);
     }
 
     if (this.holdFrames > 0) {

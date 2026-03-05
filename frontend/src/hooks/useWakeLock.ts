@@ -22,11 +22,16 @@ export function useWakeLock(): UseWakeLockResult {
 
   const wakeLockRef = useRef<WakeLockSentinelLike | null>(null);
   const keepAliveIntervalRef = useRef<number | null>(null);
+  const keepAliveContextRef = useRef<AudioContext | null>(null);
 
   const stopSilentKeepalive = useCallback(() => {
     if (keepAliveIntervalRef.current !== null) {
       window.clearInterval(keepAliveIntervalRef.current);
       keepAliveIntervalRef.current = null;
+    }
+    if (keepAliveContextRef.current) {
+      void keepAliveContextRef.current.close();
+      keepAliveContextRef.current = null;
     }
   }, []);
 
@@ -35,9 +40,27 @@ export function useWakeLock(): UseWakeLockResult {
       return;
     }
 
-    keepAliveIntervalRef.current = window.setInterval(() => {
+    const ensureContext = (): AudioContext | null => {
       try {
-        const ctx = new AudioContext();
+        if (!keepAliveContextRef.current) {
+          keepAliveContextRef.current = new AudioContext();
+        }
+        return keepAliveContextRef.current;
+      } catch {
+        return null;
+      }
+    };
+
+    keepAliveIntervalRef.current = window.setInterval(() => {
+      const ctx = ensureContext();
+      if (!ctx) {
+        return;
+      }
+
+      try {
+        if (ctx.state === 'suspended') {
+          void ctx.resume();
+        }
         const oscillator = ctx.createOscillator();
         const gain = ctx.createGain();
         gain.gain.value = 0;
@@ -45,9 +68,6 @@ export function useWakeLock(): UseWakeLockResult {
         gain.connect(ctx.destination);
         oscillator.start();
         oscillator.stop(ctx.currentTime + 0.02);
-        window.setTimeout(() => {
-          void ctx.close();
-        }, 150);
       } catch {
         // Ignore keepalive errors.
       }

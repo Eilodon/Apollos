@@ -39,6 +39,7 @@ def main() -> None:
 
     env = os.environ.copy()
     env.setdefault('PYTHONPATH', 'backend')
+    env.setdefault('ENABLE_DEV_ENDPOINTS', '1')
     py = resolve_python()
 
     failures = 0
@@ -90,6 +91,8 @@ def main() -> None:
             env,
         )
     else:
+        if env.get('HARDENING_HTTP_BASE') and env.get('HARDENING_WS_BASE'):
+            print('\nWARNING: HARDENING_HTTP_BASE/HARDENING_WS_BASE are set but --integration is disabled.')
         print('\nSkipping external socket integration checks (pass --integration to enable).')
 
     if failures:

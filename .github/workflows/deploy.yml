@@ -101,8 +101,17 @@ jobs:
           docker build -t ${{ secrets.BACKEND_IMAGE_URI }} backend/
           docker push ${{ secrets.BACKEND_IMAGE_URI }}
       - name: Deploy to Cloud Run
+        env:
+          OIDC_ISSUER: ${{ secrets.OIDC_ISSUER }}
+          OIDC_AUDIENCE: ${{ secrets.OIDC_AUDIENCE }}
+          FRONTEND_ORIGIN: ${{ vars.FRONTEND_ORIGIN }}
         run: |
+          if [ -z "$OIDC_ISSUER" ] || [ -z "$OIDC_AUDIENCE" ]; then
+            echo "Missing required secret: OIDC_ISSUER or OIDC_AUDIENCE"
+            exit 1
+          fi
           gcloud run deploy aria-backend \
             --image ${{ secrets.BACKEND_IMAGE_URI }} \
             --region ${{ vars.GCP_REGION }} \
-            --project ${{ secrets.GCP_PROJECT_ID }}
+            --project ${{ secrets.GCP_PROJECT_ID }} \
+            --update-env-vars APP_ENV=production,WS_AUTH_MODE=oidc,OIDC_ISSUER=$OIDC_ISSUER,OIDC_AUDIENCE=$OIDC_AUDIENCE,ENABLE_DEV_ENDPOINTS=0,CORS_ALLOW_ORIGINS=${FRONTEND_ORIGIN}

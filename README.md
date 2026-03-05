@@ -132,6 +132,43 @@ For Gemini Live production path, set at least:
 - `ENABLE_GEMINI_LIVE=1`
 - `GOOGLE_API_KEY=...` (or `GEMINI_API_KEY`)
 - `GEMINI_MODEL=gemini-live-2.5-flash-native-audio`
+- `APP_ENV=production`
+- `WS_AUTH_MODE=oidc`
+- `OIDC_ISSUER=<your-oidc-issuer>`
+- `OIDC_AUDIENCE=<your-api-audience>`
+- `CORS_ALLOW_ORIGINS=https://<your-frontend-domain>`
+- `ENABLE_DEV_ENDPOINTS=0`
+
+Security hardening notes:
+
+- Never commit `backend/.env`, `frontend/.env`, or service-account JSON keys.
+- Keep `/dev/*` endpoints disabled outside local development.
+- Avoid wildcard CORS in production.
+- Frontend WebSocket client reads OIDC token from localStorage key `apollos_oidc_token`
+  (override with `VITE_OIDC_TOKEN_STORAGE_KEY`).
+
+### Key Rotation (Gemini + Firebase)
+
+Automated script:
+
+```bash
+scripts/rotate_keys_gcp.sh
+```
+
+Optional flags:
+
+```bash
+PROJECT_ID=apollos-c7028 \
+SERVICE_ACCOUNT_KEY_FILE=/abs/path/firebase-adminsdk.json \
+BACKEND_ENV_FILE=/abs/path/backend/.env \
+scripts/rotate_keys_gcp.sh
+```
+
+The script rotates:
+
+- Firebase service-account key (replaces local JSON file)
+- `GEMINI_API_KEY` in `backend/.env`
+- Deletes old keys unless `SKIP_DELETE_OLD_KEYS=1`
 
 Optional Vertex path:
 

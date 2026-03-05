@@ -114,6 +114,7 @@ class AriaAgentOrchestrator:
             suppress_seconds = float(suppress_seconds_raw) if suppress_seconds_raw is not None else 2.5
         except (TypeError, ValueError):
             suppress_seconds = 2.5
+        suppress_seconds = min(5.0, max(0.5, suppress_seconds))
 
         await self._session_store.mark_edge_hazard(
             session_id=session_id,

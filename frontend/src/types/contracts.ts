@@ -1,6 +1,7 @@
 export type MotionState = 'stationary' | 'walking_slow' | 'walking_fast' | 'running';
 export type DistanceCategory = 'very_close' | 'mid' | 'far';
 export type NavigationMode = 'NAVIGATION' | 'EXPLORE' | 'READ' | 'QUIET';
+export type CarryMode = 'hand_held' | 'necklace' | 'chest_clip' | 'pocket';
 
 export interface MotionSnapshot {
   state: MotionState;
@@ -19,6 +20,8 @@ export interface MultimodalFrameMessage {
   user_text?: string;
   /** Góc xoay ngang tích lũy (độ) kể từ frame trước → Semantic Odometry */
   yaw_delta_deg?: number;
+  carry_mode?: CarryMode;
+  sensor_unavailable?: boolean;
   lat?: number;
   lng?: number;
   heading_deg?: number;

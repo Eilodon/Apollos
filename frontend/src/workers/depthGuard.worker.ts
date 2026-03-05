@@ -6,6 +6,7 @@ declare const tflite: any;
 interface DepthInitMessage {
   type: 'init_depth_model';
   modelUrl?: string;
+  wasmBaseUrl?: string;
 }
 
 interface DepthFrameMessage {
@@ -38,16 +39,23 @@ let modelReady = false;
 let modelAvailable = false;
 let depthLastProcessTime = performance.now();
 let runtimeLoaded = false;
+let runtimeBaseUrl = '/tflite-wasm/';
 
-function ensureTfRuntimeLoaded(): void {
+function ensureTrailingSlash(url: string): string {
+  return url.endsWith('/') ? url : `${url}/`;
+}
+
+function ensureTfRuntimeLoaded(wasmBaseUrl: string): void {
   if (runtimeLoaded) {
     return;
   }
+  const normalizedBase = ensureTrailingSlash(wasmBaseUrl);
   self.importScripts(
-    '/tflite-wasm/tf-core.min.js',
-    '/tflite-wasm/tf-backend-cpu.min.js',
-    '/tflite-wasm/tf-tflite.min.js',
+    `${normalizedBase}tf-core.min.js`,
+    `${normalizedBase}tf-backend-cpu.min.js`,
+    `${normalizedBase}tf-tflite.min.js`,
   );
+  runtimeBaseUrl = normalizedBase;
   runtimeLoaded = true;
 }
 
@@ -116,7 +124,7 @@ async function loadModelBytes(modelUrl: string): Promise<ArrayBuffer> {
   return bytes;
 }
 
-async function ensureDepthModel(modelUrl: string): Promise<void> {
+async function ensureDepthModel(modelUrl: string, wasmBaseUrl: string): Promise<void> {
   if (modelReady || modelLoading) {
     return;
   }
@@ -125,10 +133,10 @@ async function ensureDepthModel(modelUrl: string): Promise<void> {
   postStatus('loading', 'Loading depth model...');
 
   try {
-    ensureTfRuntimeLoaded();
+    ensureTfRuntimeLoaded(wasmBaseUrl);
     const modelBytes = await loadModelBytes(modelUrl);
     const blobUrl = URL.createObjectURL(new Blob([modelBytes], { type: 'application/octet-stream' }));
-    tflite.setWasmPath('/tflite-wasm/');
+    tflite.setWasmPath(runtimeBaseUrl);
     await tf.setBackend('cpu');
     await tf.ready();
     depthModel = await tflite.loadTFLiteModel(blobUrl, {
@@ -310,7 +318,8 @@ self.onmessage = (event: MessageEvent<InboundMessage>) => {
 
   if (payload.type === 'init_depth_model') {
     const modelUrl = payload.modelUrl || '/models/depth_anything_v2_small_fp16.tflite';
-    void ensureDepthModel(modelUrl);
+    const wasmBaseUrl = payload.wasmBaseUrl || '/tflite-wasm/';
+    void ensureDepthModel(modelUrl, wasmBaseUrl);
     return;
   }
 

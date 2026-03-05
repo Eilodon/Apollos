@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from time import time
 
+from ..hazard_taxonomy import normalize_hazard_type
 from .decorators import tool
 from .runtime import get_current_session, get_runtime
 
@@ -18,6 +19,7 @@ async def log_hazard_event(
 ) -> str:
     runtime = get_runtime()
     sid = session_id or get_current_session()
+    normalized_hazard = normalize_hazard_type(hazard_type)
     emitted_at_ms = int(time() * 1000)
     emitted_at = datetime.now(timezone.utc).isoformat()
 
@@ -25,7 +27,7 @@ async def log_hazard_event(
         'type': 'HARD_STOP',
         'position_x': max(-1.0, min(1.0, position_x)),
         'distance': distance_category,
-        'hazard_type': hazard_type,
+        'hazard_type': normalized_hazard,
         'confidence': confidence,
         'server_emit_ts': emitted_at,
         'server_emit_ts_ms': emitted_at_ms,
@@ -34,11 +36,11 @@ async def log_hazard_event(
     await runtime.websocket_registry.emit_hard_stop(sid, payload)
     await runtime.session_store.log_hazard(
         sid,
-        hazard_type,
+        normalized_hazard,
         payload['position_x'],
         distance_category,
         confidence,
         description,
     )
 
-    return f"Interrupt fired. {hazard_type} at x={payload['position_x']}"
+    return f"Interrupt fired. {normalized_hazard} at x={payload['position_x']}"

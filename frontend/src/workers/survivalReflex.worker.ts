@@ -5,6 +5,7 @@ interface EdgeHazardPayload {
   urgency: 'high';
   positionX: number;
   hazard_type: string;
+  subtype?: 'floor_drop';
   distance: 'very_close';
   diagnostics: {
     centerDiff: number;
@@ -16,6 +17,9 @@ interface EdgeHazardPayload {
 const RING_SIZE = 3;
 const BASELINE_THRESHOLD = 50;
 const SUSTAINED_THRESHOLD = 40;
+const FLOOR_DROP_BOTTOM_THRESHOLD = 60;
+const FLOOR_DROP_TOP_MAX = 20;
+const FLICKER_SUPPRESS_LUMA_DELTA = 28;
 
 const diffHistory: number[] = [];
 let previousFrame: ImageData | null = null;
@@ -92,7 +96,7 @@ function classifyPattern(quadrants: number[]): ExpansionPattern {
 function computeOpticalExpansion(
   prev: ImageData,
   curr: ImageData,
-): { centerDiff: number; avgDiff: number; pattern: ExpansionPattern } {
+): { centerDiff: number; avgDiff: number; pattern: ExpansionPattern; lateralBias: number } {
   const width = curr.width;
   const height = curr.height;
   const prevGray = toGrayLuma(prev);
@@ -115,11 +119,15 @@ function computeOpticalExpansion(
 
   const avgDiff = (q1 + q2 + q3 + q4) / 4;
   const pattern = classifyPattern(quadrants);
+  const leftEnergy = q1 + q3;
+  const rightEnergy = q2 + q4;
+  const lateralBias = clamp((rightEnergy - leftEnergy) / Math.max(leftEnergy + rightEnergy, 1e-3), -1, 1);
 
   return {
     centerDiff,
     avgDiff,
     pattern,
+    lateralBias,
   };
 }
 
@@ -139,18 +147,74 @@ function isSustainedThreat(pattern: ExpansionPattern): boolean {
   return sustained && pattern === 'radial';
 }
 
-function buildHazardPayload(centerDiff: number, avgDiff: number, pattern: ExpansionPattern): EdgeHazardPayload {
-  const normalized = clamp((centerDiff - SUSTAINED_THRESHOLD) / 35, -1, 1);
+function buildHazardPayload(centerDiff: number, avgDiff: number, pattern: ExpansionPattern, lateralBias: number): EdgeHazardPayload {
   return {
     type: 'CRITICAL_EDGE_HAZARD',
     urgency: 'high',
-    positionX: normalized,
+    positionX: lateralBias,
     hazard_type: 'EDGE_APPROACHING_OBJECT',
     distance: 'very_close',
     diagnostics: {
       centerDiff,
       avgDiff,
       pattern,
+    },
+  };
+}
+
+function averageLuma(gray: Float32Array): number {
+  if (gray.length === 0) {
+    return 0;
+  }
+  let sum = 0;
+  for (let i = 0; i < gray.length; i += 1) {
+    sum += gray[i] ?? 0;
+  }
+  return sum / gray.length;
+}
+
+function detectFloorDrop(prev: ImageData, curr: ImageData): EdgeHazardPayload | null {
+  const width = curr.width;
+  const height = curr.height;
+  const prevGray = toGrayLuma(prev);
+  const currGray = toGrayLuma(curr);
+
+  const topDiff = absDiffAverage(prevGray, currGray, width, 0, 0, width, Math.floor(height * 0.25));
+  const bottomDiff = absDiffAverage(
+    prevGray,
+    currGray,
+    width,
+    0,
+    Math.floor(height * 0.75),
+    width,
+    height,
+  );
+  const lumaDelta = Math.abs(averageLuma(currGray) - averageLuma(prevGray));
+
+  // Regression guard: neon sign flicker often changes whole-frame luminance.
+  if (lumaDelta > FLICKER_SUPPRESS_LUMA_DELTA && topDiff > 18) {
+    return null;
+  }
+  const isDrop = (
+    bottomDiff >= FLOOR_DROP_BOTTOM_THRESHOLD
+    && topDiff <= FLOOR_DROP_TOP_MAX
+    && bottomDiff > topDiff * 2.4
+  );
+  if (!isDrop) {
+    return null;
+  }
+
+  return {
+    type: 'CRITICAL_EDGE_HAZARD',
+    urgency: 'high',
+    positionX: 0,
+    hazard_type: 'EDGE_DROP_HAZARD',
+    subtype: 'floor_drop',
+    distance: 'very_close',
+    diagnostics: {
+      centerDiff: bottomDiff,
+      avgDiff: (topDiff + bottomDiff) / 2,
+      pattern: 'directional',
     },
   };
 }
@@ -176,14 +240,20 @@ self.onmessage = (event: MessageEvent<{ currentFrame?: ImageData; riskScore?: nu
     return;
   }
 
-  const { centerDiff, avgDiff, pattern } = computeOpticalExpansion(previousFrame, currentFrame);
+  const { centerDiff, avgDiff, pattern, lateralBias } = computeOpticalExpansion(previousFrame, currentFrame);
+  const floorDrop = detectFloorDrop(previousFrame, currentFrame);
+  if (floorDrop) {
+    self.postMessage(floorDrop);
+    previousFrame = currentFrame;
+    return;
+  }
   pushDiff(avgDiff);
 
   const immediateThreat = avgDiff > BASELINE_THRESHOLD && pattern === 'radial';
   const sustainedThreat = isSustainedThreat(pattern);
 
   if (immediateThreat || sustainedThreat) {
-    self.postMessage(buildHazardPayload(centerDiff, avgDiff, pattern));
+    self.postMessage(buildHazardPayload(centerDiff, avgDiff, pattern, lateralBias));
   }
 
   previousFrame = currentFrame;

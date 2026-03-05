@@ -7,6 +7,18 @@ import time
 from .decorators import tool
 from .runtime import get_current_session, get_runtime
 
+PRIORITY_TYPES = (
+    ('bus_stop_xe_buyt', 'Tram xe buyt'),
+    ('xe_om_stand', 'Diem xe om'),
+    ('atm', 'May ATM'),
+    ('cho_truyen_thong', 'Cho truyen thong'),
+)
+
+
+def _pick_priority_type(lat: float, lng: float, heading_deg: float) -> tuple[str, str]:
+    seed = int(abs(lat * 10_000) + abs(lng * 10_000) + abs(heading_deg))
+    return PRIORITY_TYPES[seed % len(PRIORITY_TYPES)]
+
 
 @tool
 async def identify_location(lat: float, lng: float, heading_deg: float) -> dict[str, object]:
@@ -21,6 +33,7 @@ async def identify_location(lat: float, lng: float, heading_deg: float) -> dict[
     await runtime.session_store.mark_location_lookup(session_id, now_epoch=now_epoch)
 
     crowd_hints = await runtime.session_store.get_crowd_hazard_hints(lat, lng, limit=3)
+    priority_type, priority_label = _pick_priority_type(lat, lng, heading_deg)
 
     # Graceful fallback when maps grounding is unavailable.
     maps_enabled = os.getenv('ENABLE_MAPS_GROUNDING', '0').strip() in {'1', 'true', 'TRUE'}
@@ -29,9 +42,10 @@ async def identify_location(lat: float, lng: float, heading_deg: float) -> dict[
         return {
             'action': 'fallback',
             'name': 'Nearby area',
-            'type': 'unknown',
-            'distance_m': 0,
-            'relevant_info': f'Maps grounding unavailable; using visual context only. Crowd memory: {hint_text}',
+            'type': priority_type,
+            'priority_label_vi': priority_label,
+            'distance_m': None,
+            'relevant_info': f'Maps grounding unavailable; using visual context only. VN priority context: {priority_label}. Crowd memory: {hint_text}',
             'heading_deg': heading_deg,
             'crowd_hazards': crowd_hints,
         }
@@ -43,10 +57,12 @@ async def identify_location(lat: float, lng: float, heading_deg: float) -> dict[
     return {
         'action': 'identified',
         'name': f'POI {rounded_lat},{rounded_lng}',
-        'type': 'transit' if synthetic_distance < 20 else 'shop',
+        'type': priority_type,
+        'priority_label_vi': priority_label,
         'distance_m': synthetic_distance,
+        'destination_near': synthetic_distance <= 30,
         'relevant_info': (
-            'Use caution around curb cuts and parked motorbikes.'
+            f'{priority_label} nearby. Use caution around hem exits, parked motorbikes, and wet pavement.'
             + (f" Crowd memory: {'; '.join(crowd_hints[:2])}." if crowd_hints else '')
         ),
         'heading_deg': heading_deg,

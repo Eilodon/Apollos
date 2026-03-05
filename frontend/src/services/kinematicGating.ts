@@ -9,6 +9,8 @@
  * Khi điện thoại thẳng đứng, accel.y ≈ 9.8 và accel.z ≈ 0.
  */
 
+import type { CarryModeProfile } from './carryMode';
+
 export interface KinematicReading {
     accel: DeviceMotionEventAcceleration | null;
     gyro: DeviceMotionEventRotationRate | null;
@@ -49,8 +51,11 @@ export function computeRiskScore(
  * @param reading - dữ liệu gia tốc và con quay hồi chuyển từ DeviceMotion
  * @returns true nếu thiết bị thẳng đứng và ít bị lắc (OK để chụp)
  */
-export function shouldCaptureFrame(reading: KinematicReading): boolean {
+export function shouldCaptureFrame(reading: KinematicReading, profile: CarryModeProfile): boolean {
     const { accel, gyro } = reading;
+    if (!profile.cloudEnabled) {
+        return false;
+    }
 
     if (!accel || !gyro) {
         // Không có sensor → cho phép chụp bình thường (graceful degradation)
@@ -72,13 +77,20 @@ export function shouldCaptureFrame(reading: KinematicReading): boolean {
     // Góc giữa vector gia tốc và trục Y (thẳng đứng): cos(θ) = ay / |a|
     // θ ≈ 0 → điện thoại đứng thẳng.
     const cosTilt = Math.abs(ay) / magnitude;
-    const isVertical = cosTilt > 0.82; // ≈ cos(35°) → cho phép nghiêng tới 35°
+    // Necklace/chest modes can be naturally pitched forward.
+    const pitchCompensation = Math.max(-0.2, Math.min(0.2, profile.pitchOffset / 100));
+    const correctedCosTilt = Math.min(1, cosTilt + pitchCompensation);
+    const isVertical = correctedCosTilt > profile.cosTiltThreshold;
 
-    // Angular stability: không được xoay quá 45°/s
+    // Angular stability: threshold depends on carry mode.
     const alpha = gyro.alpha ?? 0;
     const beta = gyro.beta ?? 0;
     const gamma = gyro.gamma ?? 0;
-    const isStable = Math.abs(alpha) < 45 && Math.abs(beta) < 45 && Math.abs(gamma) < 45;
+    const isStable = (
+        Math.abs(alpha) < profile.gyroThreshold
+        && Math.abs(beta) < profile.gyroThreshold
+        && Math.abs(gamma) < profile.gyroThreshold
+    );
 
     return isVertical && isStable;
 }

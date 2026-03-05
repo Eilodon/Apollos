@@ -17,7 +17,9 @@ const ZCR_MAX = 150;
 const ENERGY_FLOOR = 0.015;
 const SPECTRAL_MIN = 0.2;
 const SPECTRAL_MAX = 6.5;
-const FALLBACK_HOLD_FRAMES = 8;
+const HOLD_NOISY_MS = 400;
+const HOLD_QUIET_MS = 150;
+const AMBIENT_NOISY_RMS = 0.05;
 
 function isSpeechLike(buffer: Float32Array): boolean {
   if (buffer.length < 2) {
@@ -46,6 +48,18 @@ function isSpeechLike(buffer: Float32Array): boolean {
   return zcrInRange && enoughEnergy && spectralInRange;
 }
 
+function computeRms(buffer: Float32Array): number {
+  if (buffer.length === 0) {
+    return 0;
+  }
+  let energy = 0;
+  for (let i = 0; i < buffer.length; i += 1) {
+    const sample = buffer[i] ?? 0;
+    energy += sample * sample;
+  }
+  return Math.sqrt(energy / buffer.length);
+}
+
 type WorkletGateMessage = {
   type?: string;
   chunk?: Float32Array;
@@ -61,6 +75,7 @@ export function useAudioStream({ onAudioChunk }: UseAudioStreamOptions): UseAudi
   const workletNodeRef = useRef<AudioWorkletNode | null>(null);
   const sinkGainRef = useRef<GainNode | null>(null);
   const fallbackHoldFramesRef = useRef(0);
+  const fallbackAmbientRmsRef = useRef(0);
 
   const stopMic = useCallback(() => {
     workletNodeRef.current?.disconnect();
@@ -84,6 +99,7 @@ export function useAudioStream({ onAudioChunk }: UseAudioStreamOptions): UseAudi
     mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
     mediaStreamRef.current = null;
     fallbackHoldFramesRef.current = 0;
+    fallbackAmbientRmsRef.current = 0;
 
     setMicActive(false);
   }, []);
@@ -109,6 +125,11 @@ export function useAudioStream({ onAudioChunk }: UseAudioStreamOptions): UseAudi
       const source = context.createMediaStreamSource(stream);
       const sinkGain = context.createGain();
       sinkGain.gain.value = 0;
+      try {
+        context.destination.channelCount = Math.max(2, context.destination.channelCount);
+      } catch {
+        // Some browsers expose this as read-only.
+      }
 
       let workletStarted = false;
       if ('audioWorklet' in context) {
@@ -145,8 +166,17 @@ export function useAudioStream({ onAudioChunk }: UseAudioStreamOptions): UseAudi
           const chunk = new Float32Array(input.length);
           chunk.set(input);
 
+          const rms = computeRms(chunk);
+          fallbackAmbientRmsRef.current = fallbackAmbientRmsRef.current * 0.99 + rms * 0.01;
+          const isNoisy = fallbackAmbientRmsRef.current > AMBIENT_NOISY_RMS;
+          const frameMs = (chunk.length / Math.max(context.sampleRate, 1)) * 1000;
+          const holdFrames = Math.max(
+            1,
+            Math.ceil((isNoisy ? HOLD_NOISY_MS : HOLD_QUIET_MS) / Math.max(frameMs, 1)),
+          );
+
           if (isSpeechLike(chunk)) {
-            fallbackHoldFramesRef.current = FALLBACK_HOLD_FRAMES;
+            fallbackHoldFramesRef.current = holdFrames;
           } else if (fallbackHoldFramesRef.current > 0) {
             fallbackHoldFramesRef.current -= 1;
           }

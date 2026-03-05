@@ -3,9 +3,14 @@
 # Example deployment script for Google Cloud Run
 set -e
 
-PROJECT_ID="your_gcp_project_id"
+PROJECT_ID="apollos-c7028"
 REGION="us-central1"
 SERVICE_NAME="apollos-backend"
+FRONTEND_ORIGIN="${FRONTEND_ORIGIN:-https://example.com}"
+
+: "${GEMINI_API_KEY:?Set GEMINI_API_KEY env var before deploying}"
+: "${OIDC_ISSUER:?Set OIDC_ISSUER env var before deploying}"
+: "${OIDC_AUDIENCE:?Set OIDC_AUDIENCE env var before deploying}"
 
 echo "Deploying Apollos Backend to Cloud Run..."
 
@@ -20,12 +25,10 @@ gcloud run deploy ${SERVICE_NAME} \
   --region ${REGION} \
   --project ${PROJECT_ID} \
   --allow-unauthenticated \
-  --use-http2 \
   --session-affinity \
   --timeout=3600 \
   --cpu=2 \
   --memory=2Gi \
-  --set-env-vars="ENABLE_GEMINI_LIVE=1,GEMINI_MODEL=gemini-live-2.5-flash-native-audio" \
-  --set-secrets="GEMINI_API_KEY=your_secret_name:latest"
+  --set-env-vars="APP_ENV=production,ENABLE_GEMINI_LIVE=1,GEMINI_MODEL=gemini-live-2.5-flash-native-audio,GEMINI_API_KEY=${GEMINI_API_KEY},USE_FIRESTORE=1,GOOGLE_CLOUD_PROJECT=apollos-c7028,WS_AUTH_MODE=oidc,OIDC_ISSUER=${OIDC_ISSUER},OIDC_AUDIENCE=${OIDC_AUDIENCE},ENABLE_DEV_ENDPOINTS=0,CORS_ALLOW_ORIGINS=${FRONTEND_ORIGIN}"
 
 echo "✅ Deployment complete!"

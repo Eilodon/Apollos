@@ -2,7 +2,10 @@ import unittest
 import time
 from typing import Any
 
-from agent.live_bridge import GeminiLiveBridge
+try:
+    from agent.live_bridge import GeminiLiveBridge
+except ModuleNotFoundError:  # pragma: no cover - package-style fallback
+    from backend.agent.live_bridge import GeminiLiveBridge
 
 
 class FakeSessionStore:
@@ -120,6 +123,36 @@ class LiveBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.bridge.note_edge_hazard('DROP_AHEAD')
         await self.bridge._handle_live_response({'text': 'Stop now', 'data': 'ZmFrZV9hdWRpbw=='})
         self.assertEqual(len(self.bridge._websocket_registry.messages), 0)
+
+    async def test_identify_location_emits_destination_near_when_within_30m(self):
+        sent_messages = []
+
+        class LocalRegistry(FakeWebSocketRegistry):
+            async def send_live(self, session_id: str, payload: dict[str, Any]) -> bool:
+                sent_messages.append((session_id, payload))
+                return True
+
+        async def location_dispatcher(name: str, args: dict[str, Any]) -> dict[str, Any]:
+            if name == 'identify_location':
+                return {'ok': True, 'distance_m': 24, 'destination_near': True}
+            return {'ok': True}
+
+        bridge = GeminiLiveBridge(
+            session_id='destination-near',
+            session_store=FakeSessionStore(),
+            websocket_registry=LocalRegistry(),
+            tool_dispatcher=location_dispatcher,
+        )
+
+        class FakeSession:
+            async def send_tool_response(self, function_responses):
+                pass
+
+        bridge._session = FakeSession()
+        await bridge._handle_tool_calls([{'name': 'identify_location', 'id': 'loc1', 'args': {}}])
+
+        cues = [payload for _, payload in sent_messages if payload.get('type') == 'semantic_cue']
+        self.assertTrue(any(cue.get('cue') == 'destination_near' for cue in cues))
 
 if __name__ == '__main__':
     unittest.main()

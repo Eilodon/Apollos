@@ -1,5 +1,6 @@
 import { MutableRefObject, useEffect, useMemo, useRef } from 'react';
 import { KinematicReading, computeRiskScore, computeYawDelta, shouldCaptureFrame } from '../services/kinematicGating';
+import type { CarryMode, CarryModeProfile } from '../services/carryMode';
 import { HardStopMessage, MotionSnapshot } from '../types/contracts';
 
 interface CameraFramePayload {
@@ -7,6 +8,7 @@ interface CameraFramePayload {
   timestamp: string;
   /** Góc xoay ngang tích lũy (độ) kể từ frame trước → Semantic Odometry */
   yaw_delta_deg: number;
+  carry_mode?: CarryMode;
   lat?: number;
   lng?: number;
   heading_deg?: number;
@@ -25,7 +27,11 @@ interface UseCameraOptions {
   onFrame: (payload: CameraFramePayload) => void;
   onHazard?: (message: HardStopMessage) => void;
   onEdgeHazard?: (message: HardStopMessage) => void;
+  onDepthStatus?: (state: 'loading' | 'ready' | 'fallback' | 'error', detail: string) => void;
   locationSnapshot?: LocationSnapshot | null;
+  carryMode: CarryMode;
+  carryProfile: CarryModeProfile;
+  minCloudIntervalMs?: number;
 }
 
 function intervalForMotionState(state: MotionSnapshot['state']): number {
@@ -62,7 +68,19 @@ async function getOptimalCameraStream() {
   return await navigator.mediaDevices.getUserMedia(constraints);
 }
 
-export function useCamera({ videoRef, enabled, motionSnapshot, onFrame, onHazard, onEdgeHazard, locationSnapshot }: UseCameraOptions): void {
+export function useCamera({
+  videoRef,
+  enabled,
+  motionSnapshot,
+  onFrame,
+  onHazard,
+  onEdgeHazard,
+  onDepthStatus,
+  locationSnapshot,
+  carryMode,
+  carryProfile,
+  minCloudIntervalMs = 0,
+}: UseCameraOptions): void {
   const streamRef = useRef<MediaStream | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const edgeCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -85,10 +103,14 @@ export function useCamera({ videoRef, enabled, motionSnapshot, onFrame, onHazard
     const depthModelUrl = typeof configuredModelUrl === 'string'
       ? configuredModelUrl
       : '/models/depth_anything_v2_small_fp16.tflite';
+    const configuredWasmBase = import.meta.env.VITE_TFLITE_WASM_BASE as string | undefined;
+    const defaultWasmBase = `${import.meta.env.BASE_URL}tflite-wasm/`;
+    const wasmBaseUrl = (configuredWasmBase && configuredWasmBase.trim()) || defaultWasmBase;
 
     depthWorkerRef.current.postMessage({
       type: 'init_depth_model',
       modelUrl: depthModelUrl,
+      wasmBaseUrl,
     });
 
     reflexWorkerRef.current.onmessage = (e) => {
@@ -111,6 +133,10 @@ export function useCamera({ videoRef, enabled, motionSnapshot, onFrame, onHazard
     };
 
     depthWorkerRef.current.onmessage = (e) => {
+      if (e.data.type === 'DEPTH_STATUS') {
+        onDepthStatus?.(e.data.state, String(e.data.detail ?? ''));
+        return;
+      }
       if (e.data.type === 'DROP_AHEAD_HAZARD') {
         const now = Date.now();
         if (now - lastDepthHazardAtRef.current < 1800) {
@@ -135,7 +161,7 @@ export function useCamera({ videoRef, enabled, motionSnapshot, onFrame, onHazard
       reflexWorkerRef.current = null;
       depthWorkerRef.current = null;
     };
-  }, [onEdgeHazard, onHazard]);
+  }, [onDepthStatus, onEdgeHazard, onHazard]);
 
   useEffect(() => {
     const handler = (e: DeviceMotionEvent) => {
@@ -260,11 +286,12 @@ export function useCamera({ videoRef, enabled, motionSnapshot, onFrame, onHazard
       const timeSinceLastPost = now - lastCloudPostRef.current;
 
       // Kinematic Gating: toán học vector → chỉ chụp khi thẳng đứng và ổn định
-      const isKinematicallyStable = shouldCaptureFrame(kinematicRef.current);
-      const isTimeout = timeSinceLastPost > intervalMs + 500;
-      const isTimeToPost = timeSinceLastPost >= intervalMs;
+      const isKinematicallyStable = shouldCaptureFrame(kinematicRef.current, carryProfile);
+      const effectiveCloudIntervalMs = Math.max(intervalMs, minCloudIntervalMs);
+      const isTimeout = timeSinceLastPost > effectiveCloudIntervalMs + 500;
+      const isTimeToPost = timeSinceLastPost >= effectiveCloudIntervalMs;
 
-      if (isTimeToPost && (isKinematicallyStable || isTimeout)) {
+      if (isTimeToPost && carryProfile.cloudEnabled && (isKinematicallyStable || isTimeout)) {
         ctx.drawImage(video, sx, sy, sw, sh, 0, 0, 768, 768);
         const dataUrl = canvas.toDataURL('image/jpeg', 0.72);
         const frameBase64 = dataUrl.split(',')[1] ?? '';
@@ -274,6 +301,7 @@ export function useCamera({ videoRef, enabled, motionSnapshot, onFrame, onHazard
           frameBase64,
           timestamp: new Date().toISOString(),
           yaw_delta_deg: yawSnapshot,
+          carry_mode: carryMode,
           lat: locationSnapshot?.lat,
           lng: locationSnapshot?.lng,
           heading_deg: locationSnapshot?.headingDeg,
@@ -288,5 +316,17 @@ export function useCamera({ videoRef, enabled, motionSnapshot, onFrame, onHazard
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [enabled, intervalMs, locationSnapshot, motionSnapshot.pitch, motionSnapshot.state, motionSnapshot.velocity, onFrame, videoRef]);
+  }, [
+    carryMode,
+    carryProfile,
+    enabled,
+    intervalMs,
+    minCloudIntervalMs,
+    locationSnapshot,
+    motionSnapshot.pitch,
+    motionSnapshot.state,
+    motionSnapshot.velocity,
+    onFrame,
+    videoRef,
+  ]);
 }

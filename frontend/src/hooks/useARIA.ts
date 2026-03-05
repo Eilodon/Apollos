@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   AudioChunkMessage,
   BackendToClientMessage,
@@ -10,6 +10,8 @@ import {
 
 interface UseARIAOptions {
   sessionId: string;
+  clientId?: string;
+  authToken?: string;
   onBackendMessage?: (message: BackendToClientMessage) => void;
   onHardStop?: (message: HardStopMessage) => void;
 }
@@ -25,25 +27,43 @@ interface UseARIAResult {
 }
 
 const MAX_RETRIES = 6;
+const MAX_PENDING_EDGE_HAZARDS = 8;
 
-function buildWsUrl(path: string): string {
+function buildWsUrl(path: string, params?: Record<string, string | undefined>): string {
   const configuredBase = import.meta.env.VITE_BACKEND_WS_BASE as string | undefined;
-  const base = configuredBase || `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.hostname}:8000/ws`;
-  return `${base}${path}`;
+  const defaultBase = `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.hostname}:8000/ws`;
+  const base = configuredBase && /^(wss?:)?\/\//.test(configuredBase)
+    ? configuredBase
+    : configuredBase
+      ? `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}${configuredBase}`
+      : defaultBase;
+  const url = new URL(`${base}${path}`);
+  if (params) {
+    for (const [key, value] of Object.entries(params)) {
+      if (!value) {
+        continue;
+      }
+      url.searchParams.set(key, value);
+    }
+  }
+  return url.toString();
 }
 
-export function useARIA({ sessionId, onBackendMessage, onHardStop }: UseARIAOptions): UseARIAResult {
+export function useARIA({ sessionId, clientId, authToken, onBackendMessage, onHardStop }: UseARIAOptions): UseARIAResult {
   const [status, setStatus] = useState<UseARIAResult['status']>('disconnected');
 
   const liveSocketRef = useRef<WebSocket | null>(null);
   const emergencySocketRef = useRef<WebSocket | null>(null);
+  const pendingEdgeHazardsRef = useRef<EdgeHazardMessage[]>([]);
   const reconnectAttempts = useRef(0);
   const reconnectTimer = useRef<number | null>(null);
   const emergencyRetryTimer = useRef<number | null>(null);
   const shouldReconnectRef = useRef(false);
-
-  const liveUrl = useMemo(() => buildWsUrl(`/live/${sessionId}`), [sessionId]);
-  const emergencyUrl = useMemo(() => buildWsUrl(`/emergency/${sessionId}`), [sessionId]);
+  const staticWsToken = (import.meta.env.VITE_WS_AUTH_TOKEN as string | undefined)?.trim();
+  const oidcTokenStorageKey = (
+    (import.meta.env.VITE_OIDC_TOKEN_STORAGE_KEY as string | undefined)?.trim()
+    || 'apollos_oidc_token'
+  );
 
   const handleInboundMessage = useCallback((payload: unknown) => {
     if (!payload || typeof payload !== 'object') {
@@ -78,9 +98,28 @@ export function useARIA({ sessionId, onBackendMessage, onHardStop }: UseARIAOpti
     }
   }, []);
 
+  const resolveWsToken = useCallback((): string | undefined => {
+    if (authToken && authToken.trim()) {
+      return authToken.trim();
+    }
+    try {
+      const stored = localStorage.getItem(oidcTokenStorageKey);
+      if (stored && stored.trim()) {
+        return stored.trim();
+      }
+    } catch {
+      // localStorage may be unavailable in hardened browser modes.
+    }
+    if (staticWsToken && staticWsToken.trim()) {
+      return staticWsToken.trim();
+    }
+    return undefined;
+  }, [authToken, oidcTokenStorageKey, staticWsToken]);
+
   const disconnect = useCallback(() => {
     shouldReconnectRef.current = false;
     clearReconnectTimer();
+    pendingEdgeHazardsRef.current = [];
 
     if (liveSocketRef.current) {
       liveSocketRef.current.close(1000, 'client_disconnect');
@@ -104,6 +143,9 @@ export function useARIA({ sessionId, onBackendMessage, onHardStop }: UseARIAOpti
     clearReconnectTimer();
 
     setStatus(reconnectAttempts.current > 0 ? 'reconnecting' : 'connecting');
+    const wsToken = resolveWsToken();
+    const liveUrl = buildWsUrl(`/live/${sessionId}`, { client_id: clientId, token: wsToken });
+    const emergencyUrl = buildWsUrl(`/emergency/${sessionId}`, { client_id: clientId, token: wsToken });
 
     const openEmergencyChannel = () => {
       if (!shouldReconnectRef.current) {
@@ -121,6 +163,13 @@ export function useARIA({ sessionId, onBackendMessage, onHardStop }: UseARIAOpti
 
       emergencySocket.onopen = () => {
         emergencySocket.send(JSON.stringify({ type: 'heartbeat', session_id: sessionId, timestamp: new Date().toISOString() }));
+        if (pendingEdgeHazardsRef.current.length > 0) {
+          const pending = [...pendingEdgeHazardsRef.current];
+          pendingEdgeHazardsRef.current = [];
+          pending.forEach((message) => {
+            emergencySocket.send(JSON.stringify(message));
+          });
+        }
       };
 
       emergencySocket.onmessage = (event) => {
@@ -213,7 +262,7 @@ export function useARIA({ sessionId, onBackendMessage, onHardStop }: UseARIAOpti
     liveSocket.onerror = () => {
       liveSocket.close();
     };
-  }, [clearReconnectTimer, emergencyUrl, handleInboundMessage, liveUrl, sessionId]);
+  }, [clearReconnectTimer, clientId, handleInboundMessage, resolveWsToken, sessionId]);
 
   const sendFrame = useCallback(
     (message: Omit<MultimodalFrameMessage, 'type' | 'session_id'>) => {
@@ -279,6 +328,11 @@ export function useARIA({ sessionId, onBackendMessage, onHardStop }: UseARIAOpti
 
       if (emergencySocketRef.current?.readyState === WebSocket.OPEN) {
         emergencySocketRef.current.send(JSON.stringify(message));
+        return;
+      }
+      pendingEdgeHazardsRef.current.push(message);
+      if (pendingEdgeHazardsRef.current.length > MAX_PENDING_EDGE_HAZARDS) {
+        pendingEdgeHazardsRef.current.shift();
       }
     },
     [sessionId],

@@ -175,6 +175,8 @@ class GeminiLiveBridge:
         lat = payload.get('lat')
         lng = payload.get('lng')
         heading_deg = payload.get('heading_deg')
+        carry_mode = str(payload.get('carry_mode', '') or '').strip()
+        sensor_unavailable = bool(payload.get('sensor_unavailable', False))
         heading_value = float(heading_deg) if isinstance(heading_deg, (float, int)) else self._last_heading_deg
         self._last_heading_deg = heading_value
         self._last_pitch = pitch
@@ -193,7 +195,12 @@ class GeminiLiveBridge:
 
         risk_score = self._compute_risk_multiplier(motion_state, pitch, velocity, yaw_delta)
         effective_mode = await self._session_store.get_effective_mode(self._session_id)
-        spatial_context = await self._session_store.get_spatial_context(self._session_id, current_yaw=heading_value)
+        spatial_context = await self._session_store.get_spatial_context(
+            self._session_id,
+            current_yaw=heading_value,
+            current_lat=float(lat) if isinstance(lat, (int, float)) else None,
+            current_lng=float(lng) if isinstance(lng, (int, float)) else None,
+        )
         edge_reflex_active = await self._session_store.is_edge_hazard_active(self._session_id, now_epoch=time.time())
         location_hint = ''
         if isinstance(lat, (int, float)) and isinstance(lng, (int, float)):
@@ -221,6 +228,10 @@ class GeminiLiveBridge:
             f"Velocity: {velocity:.2f}. Mode: {effective_mode}. RiskScore: {risk_score:.2f}. "
             f"Treat visible hazards with safety-first urgency.]{odometry_hint}{spatial_context}{location_hint}"
         )
+        if carry_mode:
+            motion_text += f" [CARRY_MODE: {carry_mode}]"
+        if sensor_unavailable:
+            motion_text += ' [POCKET_SENSOR: unavailable; manual fallback active]'
         if edge_reflex_active:
             motion_text += ' [EDGE_HAZARD: local reflex already active. Defer voice; confirm/enrich only if needed.]'
 
@@ -469,7 +480,7 @@ class GeminiLiveBridge:
             item.strip()
             for item in os.getenv(
                 'GEMINI_MODEL_FALLBACKS',
-                'gemini-2.5-flash-native-audio-preview-12-2025,gemini-live-2.5-flash-preview',
+                '',
             ).split(',')
             if item.strip()
         ]
@@ -617,15 +628,23 @@ class GeminiLiveBridge:
                         'position_x': self._last_hazard_position,
                     },
                 )
-            if name == 'identify_location' and str(result.get('type', '')).lower() in {'transit', 'hospital', 'pharmacy'}:
-                await self._websocket_registry.send_live(
-                    self._session_id,
-                    {
-                        'type': 'semantic_cue',
-                        'cue': 'destination_near',
-                        'position_x': 0,
-                    },
+            if name == 'identify_location':
+                near_flag = bool(result.get('destination_near', False))
+                distance_raw = result.get('distance_m')
+                distance_m = (
+                    float(distance_raw)
+                    if isinstance(distance_raw, (int, float))
+                    else None
                 )
+                if near_flag or (distance_m is not None and 0 <= distance_m <= 30):
+                    await self._websocket_registry.send_live(
+                        self._session_id,
+                        {
+                            'type': 'semantic_cue',
+                            'cue': 'destination_near',
+                            'position_x': 0,
+                        },
+                    )
 
             response_payload = {
                 'ok': bool(result.get('ok', True)),

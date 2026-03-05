@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import statistics
 import sys
 import time
@@ -56,7 +57,13 @@ async def receive_hard_stop(ws: websockets.WebSocketClientProtocol, timeout_s: f
 async def run(args: argparse.Namespace) -> int:
     session_id = args.session_id or f'bench-{uuid.uuid4()}'
     ws_url = f"{args.ws_base.rstrip('/')}/ws/emergency/{session_id}"
+    if args.ws_token:
+        joiner = '&' if '?' in ws_url else '?'
+        ws_url = f'{ws_url}{joiner}token={args.ws_token}'
     hazard_url = f"{args.http_base.rstrip('/')}/dev/hazard/{session_id}"
+    headers: dict[str, str] = {}
+    if args.dev_token:
+        headers['x-dev-token'] = args.dev_token
 
     results: list[IterationResult] = []
 
@@ -67,16 +74,17 @@ async def run(args: argparse.Namespace) -> int:
             t0_perf = time.perf_counter()
             t0_epoch_ms = time.time() * 1000
 
-            response = await client.post(
-                hazard_url,
-                json={
+                response = await client.post(
+                    hazard_url,
+                    json={
                     'hazard_type': args.hazard_type,
                     'position_x': args.position_x,
                     'distance': args.distance,
                     'confidence': args.confidence,
-                    'description': f'benchmark iteration {idx}',
-                },
-            )
+                        'description': f'benchmark iteration {idx}',
+                    },
+                    headers=headers,
+                )
             event = await receive_hard_stop(ws, timeout_s=args.event_timeout)
 
             t1_perf = time.perf_counter()
@@ -165,6 +173,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--position-x', type=float, default=0.8)
     parser.add_argument('--distance', choices=['very_close', 'mid', 'far'], default='very_close')
     parser.add_argument('--confidence', type=float, default=0.95)
+    parser.add_argument('--ws-token', default=os.getenv('WS_AUTH_TOKEN', ''), help='Optional websocket auth token')
+    parser.add_argument('--dev-token', default=os.getenv('DEV_ENDPOINT_TOKEN', ''), help='Optional dev endpoint token')
     return parser.parse_args()
 
 

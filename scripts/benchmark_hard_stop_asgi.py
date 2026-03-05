@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import statistics
 import sys
 import time
@@ -69,9 +70,15 @@ def receive_hard_stop(ws: Any, max_messages: int = 20) -> dict[str, Any]:
 def run(args: argparse.Namespace) -> int:
     session_id = args.session_id or f'asgi-bench-{uuid.uuid4()}'
     results: list[IterationResult] = []
+    emergency_path = f'/ws/emergency/{session_id}'
+    if args.ws_token:
+        emergency_path = f'{emergency_path}?token={args.ws_token}'
+    headers: dict[str, str] = {}
+    if args.dev_token:
+        headers['x-dev-token'] = args.dev_token
 
     with TestClient(backend_main.app) as client:
-        with client.websocket_connect(f'/ws/emergency/{session_id}') as ws:
+        with client.websocket_connect(emergency_path) as ws:
             ws.send_json({'type': 'heartbeat', 'session_id': session_id, 'timestamp': time.time()})
             ready = ws.receive_json()
             if ready.get('type') not in {'emergency_ready', 'heartbeat_ack'}:
@@ -91,6 +98,7 @@ def run(args: argparse.Namespace) -> int:
                         'confidence': args.confidence,
                         'description': f'asgi benchmark iteration {idx}',
                     },
+                    headers=headers,
                 )
                 event = receive_hard_stop(ws)
 
@@ -176,6 +184,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--position-x', type=float, default=0.8)
     parser.add_argument('--distance', choices=['very_close', 'mid', 'far'], default='very_close')
     parser.add_argument('--confidence', type=float, default=0.95)
+    parser.add_argument('--ws-token', default=os.getenv('WS_AUTH_TOKEN', ''), help='Optional websocket auth token')
+    parser.add_argument('--dev-token', default=os.getenv('DEV_ENDPOINT_TOKEN', ''), help='Optional dev endpoint token')
     return parser.parse_args()
 
 

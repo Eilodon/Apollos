@@ -160,6 +160,18 @@ export class SpatialAudioEngine {
     }, profile.holdMs);
   }
 
+  fireHeartbeatPing(): void {
+    const oscillator = this.ctx.createOscillator();
+    const gain = this.ctx.createGain();
+    this.setPosition(0, 'default');
+    oscillator.frequency.value = 220;
+    gain.gain.value = 0.025;
+    oscillator.connect(gain);
+    gain.connect(this.panner);
+    oscillator.start();
+    oscillator.stop(this.ctx.currentTime + 0.05);
+  }
+
   stopPing(): void {
     if (this.pingInterval !== null) {
       window.clearInterval(this.pingInterval);
