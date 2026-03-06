@@ -17,11 +17,11 @@ Apollos is split into highly optimized Rust crates and Native Shells:
 
 Apollos operates strictly on Causal reasoning (Pearl's do-calculus), rejecting standard AI correlation.
 
-1. **Anti-OOM Backpressure (Gemini Bridge):** Realtime duplex streaming using Bounded Channels (`mpsc::channel(1024)`) with `try_send`. Frames are intelligently dropped during network congestion to preserve memory, but audio is prioritized. Tool calls are strictly decoupled via `tokio::spawn` to prevent blocking the WebSocket loop (Vòng Lặp Tử Thần).
-2. **Strict Kinematic Gating:** The Edge Brain refuses to capture data during Free Fall (Magnitude outside 8.0 - 12.0) or when upside-down. The FFI consumes dual Quaternions (not error-prone Gyro) for exact Semantic Odometry (Yaw/Pitch/Roll).
-3. **Block Matching Algorithm (BMA):** Frame Differencing has been replaced by a rigorous Data-Oriented BMA for Optical Expansion, calculating pure depth-threats and ignoring ego-motion (walking side-to-side).
-4. **Zero-Guess Depth Engine:** ONNX heuristics fallbacks are forbidden. If the Depth ML fails, the system safely degrades. We don't guess with human lives.
-5. **Global Trauma Registry:** `apollos-server/session.rs` persists Hazard logs via Firestore (`USE_FIRESTORE=1`), building a collective Crowd Hazard Map for immediate system recoil upon repeated failures.
+1. **Bounded Realtime Backpressure:** Gemini live duplex uses bounded channels (`mpsc::channel`) with drop-on-congestion behavior for non-critical payloads, keeping the WS loop stable under burst load.
+2. **Kinematic + Sensor Gating:** `apollos-core` evaluates motion/tilt/risk before expensive operations and tags degraded sensor conditions for downstream policy decisions.
+3. **Depth Engine with Source Tagging:** ONNX inference is used when runtime/model is available; deterministic heuristic fallback is used otherwise, with `source` explicitly attached to outputs.
+4. **Policy-Driven Safety Tiers:** `apollos-server/safety_policy.rs` maps confidence, distance, motion, sensor health, and edge reflex into `Silent/Ping/Voice/HardStop/HumanEscalation`.
+5. **Session Persistence + Human Escalation:** Firestore persistence and Twilio help escalation are first-class runtime paths with production strictness controls.
 
 ## Workspace Layout
 
@@ -40,18 +40,10 @@ scripts/
 
 ## Running the Engine
 
-### Local Development / CI Checks
-
 ```bash
-cargo fmt --all
-cargo check --workspace
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
+# Production server boot
+cargo run -p apollos-server --release
 ```
-
-### Server Boot
-```bash
-cargo run -p apollos-server
 
 # Health check
 curl http://127.0.0.1:8000/healthz
