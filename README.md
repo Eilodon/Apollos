@@ -2,8 +2,6 @@
 
 Apollos is a **Safety-Critical, Rust-First Navigation Stack** serving as the Cognitive Infrastructure (Eidolon-V) for the visually impaired. It is built upon a Thermodynamic Causal Architecture designed to guarantee **Zero Hallucinations** and **Safe-by-Design** execution.
 
-The legacy Python/TypeScript runtime has been completely eradicated.
-
 ## Core Architecture
 
 Apollos is split into highly optimized Rust crates and Native Shells:
@@ -43,7 +41,6 @@ scripts/
 ```bash
 # Production server boot
 cargo run -p apollos-server --release
-```
 
 # Health check
 curl http://127.0.0.1:8000/healthz
