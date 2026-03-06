@@ -7,6 +7,10 @@ import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.os.SystemClock
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.util.Base64
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
@@ -38,6 +42,8 @@ import java.util.UUID
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
+import kotlin.math.cos
+import kotlin.math.sqrt
 
 data class LocationSnapshot(
     val lat: Double,
@@ -57,8 +63,21 @@ class RealtimeSessionManager(
     private val cameraExecutor = Executors.newSingleThreadExecutor()
 
     private val locationClient = LocationServices.getFusedLocationProviderClient(context)
+    private val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as? SensorManager
     private var locationCallback: LocationCallback? = null
+    private var sensorListener: SensorEventListener? = null
     private var latestLocation: LocationSnapshot? = null
+    private var geoOrigin: LocationSnapshot? = null
+    @Volatile private var eskfHandle: Long = 0L
+    @Volatile private var lastImuTimestampNs: Long = 0L
+    @Volatile private var lastCameraFrameTimestampNs: Long = 0L
+    @Volatile private var latestGyroMagnitudeDeg: Float = 0.0f
+    @Volatile private var latestVoApplied: Boolean = false
+    @Volatile private var latestVoFlowScore: Float = 0.0f
+    @Volatile private var latestVoVarianceM2: Float = 999.0f
+    @Volatile private var latestVoPoseXM: Float = 0.0f
+    @Volatile private var latestVoPoseYM: Float = 0.0f
+    private var gravityEstimate = FloatArray(3)
 
     private var sessionId: String = UUID.randomUUID().toString()
     private var webSocket: WebSocket? = null
@@ -84,9 +103,26 @@ class RealtimeSessionManager(
         }
         running = true
         onStatus("Auth OK")
+        eskfHandle = RustCoreBridge.eskfCreate()
+        if (eskfHandle == 0L) {
+            running = false
+            onStatus("ESKF create failed")
+            return false
+        }
+        geoOrigin = null
+        lastImuTimestampNs = 0L
+        lastCameraFrameTimestampNs = 0L
+        latestGyroMagnitudeDeg = 0.0f
+        latestVoApplied = false
+        latestVoFlowScore = 0.0f
+        latestVoVarianceM2 = 999.0f
+        latestVoPoseXM = 0.0f
+        latestVoPoseYM = 0.0f
+        gravityEstimate = FloatArray(3)
 
         connectLiveSocket(serverBaseUrl, wsToken, onStatus)
         startLocation(onStatus)
+        startSensors(onStatus)
         startAudio(onStatus)
         startCamera(onStatus)
 
@@ -95,7 +131,13 @@ class RealtimeSessionManager(
     }
 
     suspend fun stop(onStatus: (String) -> Unit) {
-        if (!running) return
+        if (!running) {
+            if (eskfHandle != 0L) {
+                RustCoreBridge.eskfDestroy(eskfHandle)
+                eskfHandle = 0L
+            }
+            return
+        }
         running = false
 
         webSocket?.close(1000, "client_stop")
@@ -107,6 +149,24 @@ class RealtimeSessionManager(
         }
         locationCallback = null
         latestLocation = null
+        geoOrigin = null
+
+        sensorListener?.let { listener ->
+            sensorManager?.unregisterListener(listener)
+        }
+        sensorListener = null
+        lastImuTimestampNs = 0L
+        lastCameraFrameTimestampNs = 0L
+        latestGyroMagnitudeDeg = 0.0f
+        latestVoApplied = false
+        latestVoFlowScore = 0.0f
+        latestVoVarianceM2 = 999.0f
+        latestVoPoseXM = 0.0f
+        latestVoPoseYM = 0.0f
+        if (eskfHandle != 0L) {
+            RustCoreBridge.eskfDestroy(eskfHandle)
+            eskfHandle = 0L
+        }
 
         audioJob?.cancelAndJoin()
         audioJob = null
@@ -198,11 +258,13 @@ class RealtimeSessionManager(
         val callback = object : LocationCallback() {
             override fun onLocationResult(result: LocationResult) {
                 val latest = result.lastLocation ?: return
-                latestLocation = LocationSnapshot(
+                val snapshot = LocationSnapshot(
                     lat = latest.latitude,
                     lng = latest.longitude,
                     accuracyM = latest.accuracy,
                 )
+                latestLocation = snapshot
+                ingestLocationToEskf(snapshot)
             }
         }
         locationCallback = callback
@@ -210,6 +272,109 @@ class RealtimeSessionManager(
             request,
             callback,
             context.mainLooper,
+        )
+    }
+
+    private fun startSensors(onStatus: (String) -> Unit) {
+        val manager = sensorManager
+        if (manager == null) {
+            onStatus("IMU manager unavailable")
+            return
+        }
+
+        val accelSensor = manager.getDefaultSensor(Sensor.TYPE_LINEAR_ACCELERATION)
+            ?: manager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+        val gyroSensor = manager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
+
+        if (accelSensor == null && gyroSensor == null) {
+            onStatus("IMU sensors unavailable")
+            return
+        }
+
+        val listener = object : SensorEventListener {
+            override fun onSensorChanged(event: SensorEvent) {
+                if (!running) {
+                    return
+                }
+
+                when (event.sensor.type) {
+                    Sensor.TYPE_LINEAR_ACCELERATION, Sensor.TYPE_ACCELEROMETER -> {
+                        val timestampNs = event.timestamp
+                        if (lastImuTimestampNs == 0L) {
+                            lastImuTimestampNs = timestampNs
+                            return
+                        }
+
+                        val dtS = ((timestampNs - lastImuTimestampNs).coerceAtLeast(0L) / 1_000_000_000f)
+                        lastImuTimestampNs = timestampNs
+                        if (dtS <= 0.0f || dtS > 0.2f) {
+                            return
+                        }
+
+                        val accel = if (event.sensor.type == Sensor.TYPE_LINEAR_ACCELERATION) {
+                            floatArrayOf(event.values[0], event.values[1], event.values[2])
+                        } else {
+                            val alpha = 0.8f
+                            for (i in 0..2) {
+                                gravityEstimate[i] =
+                                    alpha * gravityEstimate[i] + (1.0f - alpha) * event.values[i]
+                            }
+                            floatArrayOf(
+                                event.values[0] - gravityEstimate[0],
+                                event.values[1] - gravityEstimate[1],
+                                event.values[2] - gravityEstimate[2],
+                            )
+                        }
+
+                        RustCoreBridge.eskfPredictImu(
+                            handle = eskfHandle,
+                            accelX = accel[0],
+                            accelY = accel[1],
+                            accelZ = accel[2],
+                            dtS = dtS,
+                        )
+                    }
+                    Sensor.TYPE_GYROSCOPE -> {
+                        val x = event.values.getOrElse(0) { 0.0f }
+                        val y = event.values.getOrElse(1) { 0.0f }
+                        val z = event.values.getOrElse(2) { 0.0f }
+                        latestGyroMagnitudeDeg = sqrt(x * x + y * y + z * z) * 57.29578f
+                    }
+                }
+            }
+
+            override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
+        }
+
+        sensorListener = listener
+        accelSensor?.let {
+            manager.registerListener(listener, it, SensorManager.SENSOR_DELAY_GAME)
+        }
+        gyroSensor?.let {
+            manager.registerListener(listener, it, SensorManager.SENSOR_DELAY_GAME)
+        }
+        onStatus("IMU stream started")
+    }
+
+    private fun ingestLocationToEskf(location: LocationSnapshot) {
+        val origin = geoOrigin ?: run {
+            geoOrigin = location
+            location
+        }
+
+        val latScaleM = 111_132.0f
+        val lngScaleM =
+            (111_320.0 * cos(Math.toRadians(origin.lat))).toFloat().coerceAtLeast(1.0f)
+        val posX = ((location.lng - origin.lng) * lngScaleM.toDouble()).toFloat()
+        val posY = ((location.lat - origin.lat) * latScaleM.toDouble()).toFloat()
+        val varianceM2 = location.accuracyM.coerceIn(4.0f, 50.0f).let { it * it }
+
+        RustCoreBridge.eskfUpdateVision(
+            handle = eskfHandle,
+            positionX = posX,
+            positionY = posY,
+            positionZ = 0.0f,
+            varianceM2 = varianceM2,
         )
     }
 
@@ -279,6 +444,27 @@ class RealtimeSessionManager(
                     val buffer = plane.buffer
                     val bytes = ByteArray(buffer.remaining())
                     buffer.get(bytes)
+                    val frameTimestampNs = image.imageInfo.timestamp
+                    val dtS = if (lastCameraFrameTimestampNs == 0L) {
+                        0.033f
+                    } else {
+                        ((frameTimestampNs - lastCameraFrameTimestampNs).coerceAtLeast(0L) / 1_000_000_000f)
+                            .coerceIn(0.01f, 0.2f)
+                    }
+                    lastCameraFrameTimestampNs = frameTimestampNs
+
+                    val vo = RustCoreBridge.eskfUpdateVisualOdometryRgba(
+                        handle = eskfHandle,
+                        rgbaBytes = bytes,
+                        width = image.width,
+                        height = image.height,
+                        dtS = dtS,
+                    )
+                    latestVoApplied = vo.applied
+                    latestVoFlowScore = vo.opticalFlowScore
+                    latestVoVarianceM2 = vo.varianceM2
+                    latestVoPoseXM = vo.poseXM
+                    latestVoPoseYM = vo.poseYM
 
                     val kinematic = RustCoreBridge.analyzeDefaultWalkingFrame()
                     val depth = RustCoreBridge.detectDropAheadRgba(
@@ -287,9 +473,12 @@ class RealtimeSessionManager(
                         height = image.height,
                         riskScore = kinematic.riskScore,
                         carryModeCode = 1,
-                        gyroMagnitude = 0.0f,
+                        gyroMagnitude = latestGyroMagnitudeDeg,
                         nowMs = SystemClock.elapsedRealtime(),
                     )
+                    if (depth.detected) {
+                        sendHazardObservation(depth, kinematic.riskScore)
+                    }
                     sendMultimodalFrame(kinematic.riskScore, depth.sourceCode)
                     image.close()
                 }
@@ -317,11 +506,44 @@ class RealtimeSessionManager(
         lastFrameSentAtMs.set(nowMs)
 
         val location = latestLocation
+        val eskf = RustCoreBridge.eskfSnapshot(eskfHandle)
+        val flags = mutableListOf<String>()
+        if (eskf.degraded) {
+            flags.add("eskf_degraded")
+        }
+        if (eskf.localizationUncertaintyM > 6.0f) {
+            flags.add("localization_uncertain")
+        }
+        if (depthSourceCode != 1) {
+            flags.add("depth_heuristic_fallback")
+        }
+        if (!latestVoApplied) {
+            flags.add("vision_odometry_fallback")
+        }
+        val velocityMps = riskScore.coerceIn(0.2f, 3.0f)
         val sensorHealth = JSONObject()
-            .put("score", if (depthSourceCode == 1) 0.95 else 0.75)
-            .put("flags", emptyList<String>())
-            .put("degraded", false)
-            .put("source", "android-native-rust-v1")
+            .put("score", eskf.sensorHealthScore.coerceIn(0.0f, 1.0f))
+            .put("flags", flags)
+            .put("degraded", eskf.degraded)
+            .put("source", "android-eskf-runtime-v3")
+        val sensorUncertainty = JSONObject()
+            .put(
+                "covariance_3x3",
+                listOf(
+                    eskf.covarianceXx, 0.0f, 0.0f,
+                    0.0f, eskf.covarianceYy, 0.0f,
+                    0.0f, 0.0f, eskf.covarianceZz,
+                ),
+            )
+            .put("innovation_norm", eskf.innovationNorm.coerceIn(0.0f, 10.0f))
+            .put("source", "android-eskf-runtime-v3")
+        val visionOdometry = JSONObject()
+            .put("source", if (latestVoApplied) "android-visual-odometry-v1" else "gps-anchor-fallback")
+            .put("applied", latestVoApplied)
+            .put("optical_flow_score", latestVoFlowScore.coerceIn(0.0f, 1.0f))
+            .put("variance_m2", latestVoVarianceM2.coerceIn(0.0f, 999.0f))
+            .put("pose_x_m", latestVoPoseXM)
+            .put("pose_y_m", latestVoPoseYM)
 
         val payload = JSONObject()
             .put("type", "multimodal_frame")
@@ -330,7 +552,7 @@ class RealtimeSessionManager(
             .put("frame_jpeg_base64", JSONObject.NULL)
             .put("motion_state", "walking_fast")
             .put("pitch", 0.0)
-            .put("velocity", 1.4)
+            .put("velocity", velocityMps)
             .put("user_text", JSONObject.NULL)
             .put("yaw_delta_deg", 0.0)
             .put("carry_mode", "necklace")
@@ -341,6 +563,8 @@ class RealtimeSessionManager(
             .put("location_accuracy_m", location?.accuracyM ?: JSONObject.NULL)
             .put("location_age_ms", 0)
             .put("sensor_health", sensorHealth)
+            .put("sensor_uncertainty", sensorUncertainty)
+            .put("vision_odometry", visionOdometry)
 
         webSocket?.send(payload.toString())
     }
@@ -355,6 +579,35 @@ class RealtimeSessionManager(
             .put("session_id", sessionId)
             .put("timestamp", Instant.now().toString())
             .put("audio_chunk_pcm16", base64)
+        webSocket?.send(payload.toString())
+    }
+
+    private fun sendHazardObservation(depth: DepthHazardResult, riskScore: Float) {
+        if (!running || !wsOpen) {
+            return
+        }
+
+        val distanceM = when (depth.distanceCode) {
+            0 -> 1.0f
+            1 -> 2.5f
+            2 -> 4.5f
+            else -> 3.0f
+        }
+        val relativeVelocityMps = -riskScore.coerceIn(0.4f, 3.0f)
+        val source = if (depth.sourceCode == 1) "depth_onnx" else "depth_heuristic"
+
+        val payload = JSONObject()
+            .put("type", "hazard_observation")
+            .put("session_id", sessionId)
+            .put("timestamp", Instant.now().toString())
+            .put("hazard_type", "DROP_AHEAD")
+            .put("bearing_x", depth.positionX)
+            .put("distance_m", distanceM)
+            .put("relative_velocity_mps", relativeVelocityMps)
+            .put("confidence", depth.confidence)
+            .put("source", source)
+            .put("suppress_ms", 3000)
+
         webSocket?.send(payload.toString())
     }
 

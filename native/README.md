@@ -32,3 +32,15 @@ The script builds:
 3. Add `ApollosCoreFFI.h` to Objective-C bridging header.
 4. Ensure `Info.plist` includes camera/mic/location usage descriptions.
 5. Run `ApollosShell` app and provide backend URL + OIDC `id_token`.
+
+## WS Payload Smoke (Android/iOS)
+
+Run end-to-end WebSocket smoke verification for native payload contracts:
+
+```bash
+./scripts/native_ws_smoke.sh
+```
+
+This test opens a local server, obtains a dev WS ticket, sends Android/iOS-style
+`multimodal_frame` payloads (including `sensor_health` + `sensor_uncertainty`),
+and verifies observability updates end-to-end.

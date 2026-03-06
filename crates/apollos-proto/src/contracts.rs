@@ -38,16 +38,6 @@ pub enum CarryMode {
     Pocket,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SafetyTier {
-    Silent,
-    Ping,
-    Voice,
-    HardStop,
-    HumanEscalation,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MotionSnapshot {
     pub state: MotionState,
@@ -60,6 +50,13 @@ pub struct SensorHealthSnapshot {
     pub score: f32,
     pub flags: Vec<String>,
     pub degraded: bool,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SensorUncertaintySnapshot {
+    pub covariance_3x3: Vec<f32>,
+    pub innovation_norm: f32,
     pub source: String,
 }
 
@@ -81,6 +78,7 @@ pub struct MultimodalFrameMessage {
     pub location_accuracy_m: Option<f32>,
     pub location_age_ms: Option<u64>,
     pub sensor_health: Option<SensorHealthSnapshot>,
+    pub sensor_uncertainty: Option<SensorUncertaintySnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -98,14 +96,16 @@ pub struct UserCommandMessage {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct EdgeHazardMessage {
+pub struct HazardObservationMessage {
     pub session_id: String,
     pub timestamp: String,
     pub hazard_type: String,
-    pub position_x: Option<f32>,
-    pub distance: Option<DistanceCategory>,
+    pub bearing_x: Option<f32>,
+    pub distance_m: Option<f32>,
+    pub relative_velocity_mps: Option<f32>,
     pub confidence: Option<f32>,
-    pub suppress_seconds: Option<u32>,
+    pub source: Option<String>,
+    pub suppress_ms: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -141,12 +141,17 @@ pub struct SemanticCueMessage {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct HardStopMessage {
-    pub position_x: f32,
-    pub distance: DistanceCategory,
-    pub hazard_type: String,
-    pub confidence: f32,
-    pub ts: Option<String>,
+pub struct SafetyDirectiveMessage {
+    pub session_id: String,
+    pub timestamp: String,
+    pub hazard_type: Option<String>,
+    pub hazard_score: f32,
+    pub hard_stop: bool,
+    pub haptic_intensity: f32,
+    pub spatial_audio_pitch_hz: f32,
+    pub spatial_audio_pan: f32,
+    pub needs_human_assistance: bool,
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -162,18 +167,6 @@ pub enum ConnectionState {
 pub struct ConnectionStateMessage {
     pub state: ConnectionState,
     pub detail: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SafetyStateMessage {
-    pub session_id: String,
-    pub timestamp: String,
-    pub degraded: bool,
-    pub reason: Option<String>,
-    pub sensor_health_score: f32,
-    pub sensor_health_flags: Option<Vec<String>>,
-    pub localization_uncertainty_m: f32,
-    pub tier: SafetyTier,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -209,8 +202,8 @@ pub enum ClientToBackendMessage {
     AudioChunk(AudioChunkMessage),
     #[serde(rename = "user_command")]
     UserCommand(UserCommandMessage),
-    #[serde(rename = "EDGE_HAZARD")]
-    EdgeHazard(EdgeHazardMessage),
+    #[serde(rename = "hazard_observation")]
+    HazardObservation(HazardObservationMessage),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -220,14 +213,12 @@ pub enum BackendToClientMessage {
     AssistantText(AssistantTextMessage),
     #[serde(rename = "audio_chunk")]
     AssistantAudio(AssistantAudioMessage),
-    #[serde(rename = "HARD_STOP")]
-    HardStop(HardStopMessage),
+    #[serde(rename = "safety_directive")]
+    SafetyDirective(SafetyDirectiveMessage),
     #[serde(rename = "connection_state")]
     ConnectionState(ConnectionStateMessage),
     #[serde(rename = "semantic_cue")]
     SemanticCue(SemanticCueMessage),
-    #[serde(rename = "safety_state")]
-    SafetyState(SafetyStateMessage),
     #[serde(rename = "human_help_session")]
     HumanHelpSession(HumanHelpSessionMessage),
 }
@@ -255,6 +246,7 @@ mod tests {
             location_accuracy_m: None,
             location_age_ms: None,
             sensor_health: None,
+            sensor_uncertainty: None,
         });
 
         let json = serde_json::to_string(&payload).expect("should serialize");

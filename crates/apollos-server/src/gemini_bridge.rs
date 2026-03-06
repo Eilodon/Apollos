@@ -6,8 +6,8 @@ use std::{
 use anyhow::Context;
 use apollos_proto::contracts::{
     AssistantAudioMessage, AssistantTextMessage, BackendToClientMessage, ConnectionState,
-    ConnectionStateMessage, DistanceCategory, HardStopMessage, HumanHelpSessionMessage,
-    NavigationMode, SemanticCue, SemanticCueMessage,
+    ConnectionStateMessage, HumanHelpSessionMessage, NavigationMode, SafetyDirectiveMessage,
+    SemanticCue, SemanticCueMessage,
 };
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
@@ -15,7 +15,7 @@ use serde_json::{json, Map, Value};
 use tokio::sync::{mpsc, RwLock};
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::{prompts::SYSTEM_PROMPT, AppState};
+use crate::{prompts::SYSTEM_PROMPT, safety_policy, AppState};
 
 type LiveSocket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -32,12 +32,18 @@ enum LiveOutgoing {
     ToolResponse {
         payload: Value,
     },
+}
+
+#[derive(Debug)]
+enum LiveControl {
+    Interrupt { reason: String },
     Close,
 }
 
 #[derive(Debug, Clone)]
 struct LiveSessionHandle {
     tx: mpsc::Sender<LiveOutgoing>,
+    control_tx: mpsc::Sender<LiveControl>,
 }
 
 #[derive(Debug, Clone)]
@@ -241,8 +247,30 @@ impl GeminiBridge {
         };
 
         if let Some(handle) = handle {
-            let _ = handle.tx.try_send(LiveOutgoing::Close);
+            let _ = handle.control_tx.try_send(LiveControl::Close);
         }
+    }
+
+    pub async fn interrupt_live_session(&self, session_id: &str, reason: &str) -> bool {
+        let handle = {
+            let guard = self.live_sessions.read().await;
+            guard.get(session_id).cloned()
+        };
+
+        let Some(handle) = handle else {
+            return false;
+        };
+
+        if handle.control_tx.is_closed() {
+            return false;
+        }
+
+        handle
+            .control_tx
+            .try_send(LiveControl::Interrupt {
+                reason: reason.trim().to_string(),
+            })
+            .is_ok()
     }
 
     async fn forward_user_command_by_session(
@@ -307,7 +335,11 @@ impl GeminiBridge {
         }
 
         let (tx, rx) = mpsc::channel(1024);
-        let handle = LiveSessionHandle { tx: tx.clone() };
+        let (control_tx, control_rx) = mpsc::channel(64);
+        let handle = LiveSessionHandle {
+            tx: tx.clone(),
+            control_tx: control_tx.clone(),
+        };
 
         guard.insert(session_id.to_string(), handle.clone());
         drop(guard);
@@ -326,7 +358,10 @@ impl GeminiBridge {
         let live_sessions = Arc::clone(&self.live_sessions);
         let session_key = session_id.to_string();
         tokio::spawn(async move {
-            if let Err(error) = runner.run(tx.clone(), rx).await {
+            if let Err(error) = runner
+                .run(tx.clone(), rx, control_tx.clone(), control_rx)
+                .await
+            {
                 tracing::warn!(
                     session_id = %session_key,
                     error = %error,
@@ -406,8 +441,12 @@ impl LiveSessionRunner {
         &self,
         tx: mpsc::Sender<LiveOutgoing>,
         mut outbound_rx: mpsc::Receiver<LiveOutgoing>,
+        control_tx: mpsc::Sender<LiveControl>,
+        mut control_rx: mpsc::Receiver<LiveControl>,
     ) -> anyhow::Result<()> {
-        let result = self.run_inner(tx, &mut outbound_rx).await;
+        let result = self
+            .run_inner(tx, &mut outbound_rx, control_tx, &mut control_rx)
+            .await;
 
         if let Err(error) = &result {
             self.emit_connection_state(
@@ -427,6 +466,8 @@ impl LiveSessionRunner {
         &self,
         tx: mpsc::Sender<LiveOutgoing>,
         outbound_rx: &mut mpsc::Receiver<LiveOutgoing>,
+        control_tx: mpsc::Sender<LiveControl>,
+        control_rx: &mut mpsc::Receiver<LiveControl>,
     ) -> anyhow::Result<()> {
         let ws_url = format!("{}?key={}", self.live_endpoint_base, self.api_key);
         let (mut socket, _) = tokio_tungstenite::connect_async(ws_url)
@@ -445,6 +486,28 @@ impl LiveSessionRunner {
 
         loop {
             tokio::select! {
+                biased;
+                control = control_rx.recv() => {
+                    let Some(control) = control else {
+                        break;
+                    };
+
+                    match control {
+                        LiveControl::Interrupt { reason } => {
+                            tracing::warn!(
+                                session_id = %self.session_id,
+                                reason = %reason,
+                                "dual_interrupt_triggered"
+                            );
+                            let payload = build_interrupt_payload(&reason);
+                            send_ws_json(&mut socket, &payload).await?;
+                        }
+                        LiveControl::Close => {
+                            let _ = socket.close(None).await;
+                            return Ok(());
+                        }
+                    }
+                }
                 outgoing = outbound_rx.recv() => {
                     let Some(outgoing) = outgoing else {
                         break;
@@ -477,10 +540,6 @@ impl LiveSessionRunner {
                         LiveOutgoing::ToolResponse { payload } => {
                             send_ws_json(&mut socket, &payload).await?;
                         }
-                        LiveOutgoing::Close => {
-                            let _ = socket.close(None).await;
-                            return Ok(());
-                        }
                     }
                 }
                 incoming = socket.next() => {
@@ -498,7 +557,7 @@ impl LiveSessionRunner {
                                 continue;
                             };
 
-                            self.handle_server_payload(tx.clone(), &payload).await?;
+                            self.handle_server_payload(tx.clone(), control_tx.clone(), &payload).await?;
                         }
                         Err(error) => {
                             return Err(anyhow::anyhow!("gemini live websocket stream error: {error}"));
@@ -527,6 +586,7 @@ impl LiveSessionRunner {
     async fn handle_server_payload(
         &self,
         tx: mpsc::Sender<LiveOutgoing>,
+        control_tx: mpsc::Sender<LiveControl>,
         payload: &Value,
     ) -> anyhow::Result<()> {
         for text in extract_texts(payload) {
@@ -561,7 +621,7 @@ impl LiveSessionRunner {
 
         let tool_calls = extract_tool_calls(payload);
         if !tool_calls.is_empty() {
-            self.handle_tool_calls(tx, tool_calls).await?;
+            self.handle_tool_calls(tx, control_tx, tool_calls).await?;
         }
 
         Ok(())
@@ -570,6 +630,7 @@ impl LiveSessionRunner {
     async fn handle_tool_calls(
         &self,
         tx: mpsc::Sender<LiveOutgoing>,
+        control_tx: mpsc::Sender<LiveControl>,
         tool_calls: Vec<GeminiToolCall>,
     ) -> anyhow::Result<()> {
         let runner = self.clone();
@@ -579,7 +640,9 @@ impl LiveSessionRunner {
 
             for call in tool_calls {
                 let args = normalize_tool_args(call.args);
-                let result = runner.dispatch_tool_call(&call.name, &args).await;
+                let result = runner
+                    .dispatch_tool_call(&control_tx, &call.name, &args)
+                    .await;
 
                 function_responses.push(json!({
                     "id": call.id,
@@ -601,9 +664,14 @@ impl LiveSessionRunner {
         Ok(())
     }
 
-    async fn dispatch_tool_call(&self, name: &str, args: &Map<String, Value>) -> Value {
+    async fn dispatch_tool_call(
+        &self,
+        control_tx: &mpsc::Sender<LiveControl>,
+        name: &str,
+        args: &Map<String, Value>,
+    ) -> Value {
         match name {
-            "log_hazard_event" => self.tool_log_hazard_event(args).await,
+            "log_hazard_event" => self.tool_log_hazard_event(control_tx, args).await,
             "set_navigation_mode" => self.tool_set_navigation_mode(args).await,
             "log_emotion_event" => self.tool_log_emotion_event(args).await,
             "escalate_mode_if_stressed" => self.tool_escalate_mode_if_stressed(args).await,
@@ -617,44 +685,117 @@ impl LiveSessionRunner {
         }
     }
 
-    async fn tool_log_hazard_event(&self, args: &Map<String, Value>) -> Value {
+    async fn tool_log_hazard_event(
+        &self,
+        control_tx: &mpsc::Sender<LiveControl>,
+        args: &Map<String, Value>,
+    ) -> Value {
         let hazard_type =
             arg_str(args, "hazard_type").unwrap_or_else(|| "UNKNOWN_HAZARD".to_string());
         let position_x = arg_f32(args, "position_x").unwrap_or(0.0).clamp(-1.0, 1.0);
         let confidence = arg_f32(args, "confidence").unwrap_or(0.7).clamp(0.0, 1.0);
+        let distance_m = arg_f32(args, "distance_m").unwrap_or(2.0).max(0.0);
+        let relative_velocity_mps = arg_f32(args, "relative_velocity_mps").unwrap_or(-1.0);
+        let suppress_ms = arg_u32(args, "suppress_ms").unwrap_or(3000).max(500);
+        let suppress_seconds = (suppress_ms.saturating_add(999)) / 1000;
         let description = arg_str(args, "description").unwrap_or_default();
-        let distance = parse_distance_category(
-            arg_str(args, "distance_category")
-                .or_else(|| arg_str(args, "distance"))
-                .as_deref(),
-        );
 
-        self.sessions
-            .mark_edge_hazard(&self.session_id, hazard_type.clone(), Some(3))
-            .await;
+        let observability = self.sessions.get_observability(&self.session_id).await;
+        let reflex_gate = confidence >= 0.85 && distance_m <= 1.5 && relative_velocity_mps <= -1.0;
+        let decision = safety_policy::evaluate_safety_policy(safety_policy::SafetyPolicyInput {
+            hazard_confidence: confidence,
+            distance_m,
+            relative_velocity_mps,
+            bearing_x: position_x,
+            sensor_health_score: observability.sensor_health_score,
+            localization_uncertainty_m: observability.localization_uncertainty_m,
+            edge_reflex_active: observability.edge_reflex_active || reflex_gate,
+        });
+
+        if decision.should_emit_hard_stop() {
+            self.sessions
+                .mark_edge_hazard(
+                    &self.session_id,
+                    hazard_type.clone(),
+                    Some(suppress_seconds),
+                )
+                .await;
+
+            let _ = control_tx
+                .send(LiveControl::Interrupt {
+                    reason: format!(
+                        "hazard={hazard_type};distance_m={distance_m:.2};closing={:.2};score={:.2}",
+                        (-relative_velocity_mps).max(0.0),
+                        decision.hazard_score
+                    ),
+                })
+                .await;
+        }
+
         self.sessions
             .log_hazard(
                 &self.session_id,
                 &hazard_type,
                 position_x,
-                distance,
+                Some(distance_m),
+                Some(relative_velocity_mps),
                 confidence,
+                Some(decision.hazard_score),
+                Some(decision.hard_stop),
+                Some("gemini_live"),
                 description.as_str(),
             )
             .await;
 
-        self.ws_registry
-            .emit_hard_stop(
+        self.sessions
+            .update_observability(
                 &self.session_id,
-                BackendToClientMessage::HardStop(HardStopMessage {
-                    position_x,
-                    distance,
-                    hazard_type: hazard_type.clone(),
-                    confidence,
-                    ts: Some(Utc::now().to_rfc3339()),
-                }),
+                None,
+                None,
+                None,
+                Some(decision.hazard_score),
+                Some(decision.hard_stop),
+                Some(decision.reason.clone()),
             )
             .await;
+
+        let directive = BackendToClientMessage::SafetyDirective(SafetyDirectiveMessage {
+            session_id: self.session_id.clone(),
+            timestamp: Utc::now().to_rfc3339(),
+            hazard_type: Some(hazard_type.clone()),
+            hazard_score: decision.hazard_score,
+            hard_stop: decision.hard_stop,
+            haptic_intensity: decision.haptic_intensity,
+            spatial_audio_pitch_hz: decision.spatial_audio_pitch_hz,
+            spatial_audio_pan: decision.spatial_audio_pan,
+            needs_human_assistance: decision.human_assistance,
+            reason: Some(decision.reason.clone()),
+        });
+
+        if decision.should_emit_hard_stop() {
+            self.ws_registry
+                .emit_hard_stop(&self.session_id, directive.clone())
+                .await;
+        } else {
+            let _ = self
+                .ws_registry
+                .send_live(&self.session_id, directive)
+                .await;
+        }
+
+        if decision.should_escalate_human() {
+            let help = self
+                .fallback
+                .create_help_session(&self.session_id, "gemini_safety_policy")
+                .await;
+            let _ = self
+                .ws_registry
+                .send_live(
+                    &self.session_id,
+                    BackendToClientMessage::HumanHelpSession(help),
+                )
+                .await;
+        }
 
         let _ = self
             .ws_registry
@@ -672,7 +813,11 @@ impl LiveSessionRunner {
             "hazard_type": hazard_type,
             "position_x": position_x,
             "confidence": confidence,
-            "distance": distance_category_str(distance),
+            "distance_m": distance_m,
+            "relative_velocity_mps": relative_velocity_mps,
+            "hazard_score": decision.hazard_score,
+            "hard_stop": decision.hard_stop,
+            "interrupted": decision.should_emit_hard_stop(),
         })
     }
 
@@ -830,6 +975,28 @@ fn build_live_setup_payload(model: &str, temperature: f32) -> Value {
     })
 }
 
+fn build_interrupt_payload(reason: &str) -> Value {
+    let reason = reason.trim();
+    let text = if reason.is_empty() {
+        "<CRITICAL OVERRIDE> HAZARD DETECTED. CEASE ALL GENERATION AND AUDIO IMMEDIATELY."
+            .to_string()
+    } else {
+        format!(
+            "<CRITICAL OVERRIDE> HAZARD DETECTED ({reason}). CEASE ALL GENERATION AND AUDIO IMMEDIATELY."
+        )
+    };
+
+    json!({
+        "clientContent": {
+            "turns": [{
+                "role": "user",
+                "parts": [{"text": text}],
+            }],
+            "turnComplete": true,
+        }
+    })
+}
+
 fn normalize_live_model_name(model: &str) -> String {
     let trimmed = model.trim();
     if trimmed.starts_with("models/") {
@@ -843,18 +1010,20 @@ fn live_function_declarations() -> Vec<Value> {
     vec![
         json!({
             "name": "log_hazard_event",
-            "description": "Trigger immediate HARD_STOP and log detected hazard.",
+            "description": "Log hazard observation and trigger deterministic safety directive evaluation.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "hazard_type": {"type": "string"},
                     "position_x": {"type": "number", "minimum": -1.0, "maximum": 1.0},
-                    "distance_category": {"type": "string", "enum": ["very_close", "mid", "far"]},
+                    "distance_m": {"type": "number", "minimum": 0.0},
+                    "relative_velocity_mps": {"type": "number"},
                     "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                    "suppress_ms": {"type": "number", "minimum": 500, "maximum": 20000},
                     "description": {"type": "string"},
                     "session_id": {"type": "string"}
                 },
-                "required": ["hazard_type", "position_x", "distance_category", "confidence"]
+                "required": ["hazard_type", "position_x", "distance_m", "confidence"]
             }
         }),
         json!({
@@ -1100,6 +1269,12 @@ fn arg_f32(args: &Map<String, Value>, key: &str) -> Option<f32> {
         .map(|value| value as f32)
 }
 
+fn arg_u32(args: &Map<String, Value>, key: &str) -> Option<u32> {
+    args.get(key)
+        .and_then(Value::as_u64)
+        .map(|value| value as u32)
+}
+
 fn arg_f64(args: &Map<String, Value>, key: &str) -> Option<f64> {
     args.get(key).and_then(Value::as_f64)
 }
@@ -1120,22 +1295,6 @@ fn navigation_mode_str(mode: NavigationMode) -> &'static str {
         NavigationMode::Explore => "EXPLORE",
         NavigationMode::Read => "READ",
         NavigationMode::Quiet => "QUIET",
-    }
-}
-
-fn parse_distance_category(raw: Option<&str>) -> DistanceCategory {
-    match raw.unwrap_or_default().trim().to_ascii_lowercase().as_str() {
-        "very_close" | "veryclose" => DistanceCategory::VeryClose,
-        "far" => DistanceCategory::Far,
-        _ => DistanceCategory::Mid,
-    }
-}
-
-fn distance_category_str(category: DistanceCategory) -> &'static str {
-    match category {
-        DistanceCategory::VeryClose => "very_close",
-        DistanceCategory::Mid => "mid",
-        DistanceCategory::Far => "far",
     }
 }
 
@@ -1176,5 +1335,16 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].id, "c1");
         assert_eq!(calls[0].name, "set_navigation_mode");
+    }
+
+    #[test]
+    fn builds_interrupt_payload_with_turn_complete() {
+        let payload = build_interrupt_payload("DROP_AHEAD");
+        let turn_complete = payload
+            .get("clientContent")
+            .and_then(|value| value.get("turnComplete"))
+            .and_then(Value::as_bool);
+
+        assert_eq!(turn_complete, Some(true));
     }
 }

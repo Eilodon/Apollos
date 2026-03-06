@@ -406,7 +406,7 @@ fn client_message_session_id(message: &ClientToBackendMessage) -> &str {
         ClientToBackendMessage::MultimodalFrame(payload) => &payload.session_id,
         ClientToBackendMessage::AudioChunk(payload) => &payload.session_id,
         ClientToBackendMessage::UserCommand(payload) => &payload.session_id,
-        ClientToBackendMessage::EdgeHazard(payload) => &payload.session_id,
+        ClientToBackendMessage::HazardObservation(payload) => &payload.session_id,
     }
 }
 
@@ -419,7 +419,9 @@ pub fn server_message_to_text(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use apollos_proto::contracts::{ClientToBackendMessage, UserCommandMessage};
+    use apollos_proto::contracts::{
+        ClientToBackendMessage, HazardObservationMessage, UserCommandMessage,
+    };
 
     #[test]
     fn parses_json_when_encoding_json() {
@@ -450,5 +452,31 @@ mod tests {
             .expect("parse should pass");
 
         assert_eq!(parsed, message);
+    }
+
+    #[test]
+    fn parses_hazard_observation_json_payload() {
+        let payload = serde_json::to_string(&ClientToBackendMessage::HazardObservation(
+            HazardObservationMessage {
+                session_id: "s3".to_string(),
+                timestamp: "2026-03-05T10:00:00Z".to_string(),
+                hazard_type: "DROP_AHEAD".to_string(),
+                bearing_x: Some(0.1),
+                distance_m: Some(1.3),
+                relative_velocity_mps: Some(-1.8),
+                confidence: Some(0.92),
+                source: Some("native_depth".to_string()),
+                suppress_ms: Some(3000),
+            },
+        ))
+        .expect("serialize");
+
+        let parsed = parse_incoming(Message::Text(payload.into()), SocketEncoding::Json)
+            .expect("parse should pass");
+
+        assert!(matches!(
+            parsed,
+            ClientToBackendMessage::HazardObservation(_)
+        ));
     }
 }

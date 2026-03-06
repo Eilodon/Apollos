@@ -1,7 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use anyhow::Context;
-use apollos_proto::contracts::{DistanceCategory, MotionState, NavigationMode, SafetyTier};
+use apollos_proto::contracts::{MotionState, NavigationMode};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -30,7 +30,8 @@ pub struct SessionState {
     pub localization_uncertainty_m: f32,
     pub degraded_mode: bool,
     pub degraded_reason: String,
-    pub last_safety_tier: SafetyTier,
+    pub last_hazard_score: f32,
+    pub last_hard_stop: bool,
     pub utterance_timestamps: Vec<f64>,
     pub last_persist_epoch: f64,
 }
@@ -56,7 +57,8 @@ impl SessionState {
             localization_uncertainty_m: 120.0,
             degraded_mode: false,
             degraded_reason: String::new(),
-            last_safety_tier: SafetyTier::Silent,
+            last_hazard_score: 0.0,
+            last_hard_stop: false,
             utterance_timestamps: Vec::new(),
             last_persist_epoch: 0.0,
         }
@@ -73,7 +75,8 @@ pub struct SessionObservability {
     pub degraded_reason: String,
     pub edge_reflex_active: bool,
     pub edge_hazard_type: String,
-    pub last_safety_tier: SafetyTier,
+    pub last_hazard_score: f32,
+    pub last_hard_stop: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -129,7 +132,7 @@ impl Default for SessionStore {
 
 impl SessionStore {
     const SENSOR_HEALTH_DEGRADED_THRESHOLD: f32 = 0.55;
-    const LOCALIZATION_UNCERTAINTY_DEGRADED_M: f32 = 45.0;
+    const LOCALIZATION_UNCERTAINTY_DEGRADED_M: f32 = 6.0;
 
     pub async fn ensure_session(&self, session_id: &str) -> SessionState {
         let mut guard = self.inner.write().await;
@@ -324,7 +327,8 @@ impl SessionStore {
         sensor_health_score: Option<f32>,
         sensor_health_flags: Option<Vec<String>>,
         localization_uncertainty_m: Option<f32>,
-        safety_tier: Option<SafetyTier>,
+        latest_hazard_score: Option<f32>,
+        latest_hard_stop: Option<bool>,
         degraded_reason: Option<String>,
     ) -> SessionState {
         let (result, should_persist) = {
@@ -345,8 +349,12 @@ impl SessionStore {
                 state.localization_uncertainty_m = uncertainty.max(0.0);
             }
 
-            if let Some(tier) = safety_tier {
-                state.last_safety_tier = tier;
+            if let Some(hazard_score) = latest_hazard_score {
+                state.last_hazard_score = hazard_score.max(0.0);
+            }
+
+            if let Some(hard_stop) = latest_hard_stop {
+                state.last_hard_stop = hard_stop;
             }
 
             if let Some(reason) = degraded_reason {
@@ -385,7 +393,8 @@ impl SessionStore {
                 degraded_reason: String::new(),
                 edge_reflex_active: false,
                 edge_hazard_type: String::new(),
-                last_safety_tier: SafetyTier::Silent,
+                last_hazard_score: 0.0,
+                last_hard_stop: false,
             };
         };
 
@@ -398,7 +407,8 @@ impl SessionStore {
             degraded_reason: state.degraded_reason.clone(),
             edge_reflex_active: state.edge_hazard_until_epoch > now_epoch(),
             edge_hazard_type: state.edge_hazard_type.clone(),
-            last_safety_tier: state.last_safety_tier,
+            last_hazard_score: state.last_hazard_score,
+            last_hard_stop: state.last_hard_stop,
         }
     }
 
@@ -494,17 +504,28 @@ impl SessionStore {
         &self,
         session_id: &str,
         hazard_type: &str,
-        position_x: f32,
-        distance: DistanceCategory,
+        bearing_x: f32,
+        distance_m: Option<f32>,
+        relative_velocity_mps: Option<f32>,
         confidence: f32,
+        hazard_score: Option<f32>,
+        hard_stop: Option<bool>,
+        source: Option<&str>,
         description: &str,
     ) {
         let timestamp = Utc::now().to_rfc3339();
+        let distance_m = distance_m.map(|value| value.max(0.0));
+        let distance_band = distance_m.map(distance_band_for_m);
         let event = json!({
             "hazard_type": hazard_type,
-            "position_x": position_x,
-            "distance": distance_category_str(distance),
+            "bearing_x": bearing_x,
+            "distance_m": distance_m,
+            "distance_band": distance_band,
+            "relative_velocity_mps": relative_velocity_mps,
             "confidence": confidence,
+            "hazard_score": hazard_score,
+            "hard_stop": hard_stop,
+            "source": source.unwrap_or("unknown"),
             "description": description,
             "ts": timestamp,
         });
@@ -769,7 +790,8 @@ impl FirestorePersistence {
             "localization_uncertainty_m": state.localization_uncertainty_m,
             "degraded_mode": state.degraded_mode,
             "degraded_reason": state.degraded_reason,
-            "last_safety_tier": safety_tier_str(state.last_safety_tier),
+            "last_hazard_score": state.last_hazard_score,
+            "last_hard_stop": state.last_hard_stop,
         });
 
         let doc_path = format!("sessions/{}", sanitize_document_id(&state.session_id));
@@ -1024,21 +1046,13 @@ fn motion_state_str(state: MotionState) -> &'static str {
     }
 }
 
-fn safety_tier_str(tier: SafetyTier) -> &'static str {
-    match tier {
-        SafetyTier::Silent => "silent",
-        SafetyTier::Ping => "ping",
-        SafetyTier::Voice => "voice",
-        SafetyTier::HardStop => "hard_stop",
-        SafetyTier::HumanEscalation => "human_escalation",
-    }
-}
-
-fn distance_category_str(distance: DistanceCategory) -> &'static str {
-    match distance {
-        DistanceCategory::VeryClose => "very_close",
-        DistanceCategory::Mid => "mid",
-        DistanceCategory::Far => "far",
+fn distance_band_for_m(distance_m: f32) -> &'static str {
+    if distance_m <= 1.5 {
+        "very_close"
+    } else if distance_m <= 3.5 {
+        "mid"
+    } else {
+        "far"
     }
 }
 
@@ -1116,13 +1130,46 @@ mod tests {
                 "s4",
                 "STAIRS_DOWN",
                 0.1,
-                DistanceCategory::VeryClose,
+                Some(1.1),
+                Some(-1.2),
                 0.9,
+                Some(4.2),
+                Some(true),
+                Some("test"),
                 "Cau thang di xuong",
             )
             .await;
 
         let hints = store.get_crowd_hazard_hints(10.7761, 106.7002, 3).await;
         assert!(!hints.is_empty());
+    }
+
+    #[tokio::test]
+    async fn hazard_events_persist_continuous_fields_not_legacy_distance_category() {
+        let store = SessionStore::default();
+        store
+            .log_hazard(
+                "s5",
+                "DROP_AHEAD",
+                -0.2,
+                Some(1.3),
+                Some(-1.9),
+                0.91,
+                Some(4.7),
+                Some(true),
+                Some("native_depth"),
+                "continuous_hazard",
+            )
+            .await;
+
+        let hazards = store.hazards.read().await;
+        let bucket = hazards.get("s5").expect("hazard bucket");
+        let event = bucket.last().expect("hazard event");
+
+        assert!(event.get("distance_m").is_some());
+        assert!(event.get("relative_velocity_mps").is_some());
+        assert!(event.get("hazard_score").is_some());
+        assert!(event.get("hard_stop").is_some());
+        assert!(event.get("distance").is_none());
     }
 }

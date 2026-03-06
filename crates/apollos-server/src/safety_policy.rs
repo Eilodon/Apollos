@@ -1,10 +1,13 @@
-use apollos_proto::contracts::{DistanceCategory, MotionState, SafetyTier};
+const HARD_STOP_THRESHOLD: f32 = 3.2;
+const HUMAN_ASSIST_THRESHOLD: f32 = 6.2;
+const HUMAN_ASSIST_SENSOR_HEALTH_THRESHOLD: f32 = 0.35;
 
 #[derive(Debug, Clone, Copy)]
 pub struct SafetyPolicyInput {
     pub hazard_confidence: f32,
-    pub distance_category: DistanceCategory,
-    pub motion_state: MotionState,
+    pub distance_m: f32,
+    pub relative_velocity_mps: f32,
+    pub bearing_x: f32,
     pub sensor_health_score: f32,
     pub localization_uncertainty_m: f32,
     pub edge_reflex_active: bool,
@@ -12,134 +15,75 @@ pub struct SafetyPolicyInput {
 
 #[derive(Debug, Clone)]
 pub struct SafetyPolicyDecision {
-    pub tier: SafetyTier,
-    pub risk_score: f32,
+    pub hazard_score: f32,
+    pub haptic_intensity: f32,
+    pub spatial_audio_pitch_hz: f32,
+    pub spatial_audio_pan: f32,
+    pub hard_stop: bool,
+    pub human_assistance: bool,
     pub reason: String,
 }
 
 impl SafetyPolicyDecision {
     pub fn should_emit_hard_stop(&self) -> bool {
-        tier_rank(self.tier) >= tier_rank(SafetyTier::HardStop)
+        self.hard_stop
     }
 
     pub fn should_escalate_human(&self) -> bool {
-        self.tier == SafetyTier::HumanEscalation
-    }
-}
-
-fn clamp(value: f32, low: f32, high: f32) -> f32 {
-    value.max(low).min(high)
-}
-
-fn distance_weight(distance: DistanceCategory) -> f32 {
-    match distance {
-        DistanceCategory::VeryClose => 2.4,
-        DistanceCategory::Mid => 1.4,
-        DistanceCategory::Far => 0.5,
-    }
-}
-
-fn motion_weight(motion_state: MotionState) -> f32 {
-    match motion_state {
-        MotionState::Running => 1.2,
-        MotionState::WalkingFast => 0.8,
-        MotionState::WalkingSlow => 0.35,
-        MotionState::Stationary => 0.0,
-    }
-}
-
-fn tier_rank(tier: SafetyTier) -> u8 {
-    match tier {
-        SafetyTier::Silent => 0,
-        SafetyTier::Ping => 1,
-        SafetyTier::Voice => 2,
-        SafetyTier::HardStop => 3,
-        SafetyTier::HumanEscalation => 4,
-    }
-}
-
-pub fn max_tier(a: SafetyTier, b: SafetyTier) -> SafetyTier {
-    if tier_rank(a) >= tier_rank(b) {
-        a
-    } else {
-        b
+        self.human_assistance
     }
 }
 
 pub fn evaluate_safety_policy(payload: SafetyPolicyInput) -> SafetyPolicyDecision {
-    let confidence = clamp(payload.hazard_confidence, 0.0, 1.0);
-    let sensor_health = clamp(payload.sensor_health_score, 0.0, 1.0);
-    let loc_uncertainty = clamp(payload.localization_uncertainty_m, 0.0, 300.0);
+    let confidence = payload.hazard_confidence.clamp(0.0, 1.0);
+    let distance_m = payload.distance_m.max(0.0);
+    let closing_speed = (-payload.relative_velocity_mps).max(0.0);
+    let sensor_health = payload.sensor_health_score.clamp(0.0, 1.0);
+    let loc_uncertainty = payload.localization_uncertainty_m.clamp(0.0, 300.0);
+    let pan = payload.bearing_x.clamp(-1.0, 1.0);
 
-    let mut risk_score = confidence * 3.2;
-    risk_score += distance_weight(payload.distance_category);
-    risk_score += motion_weight(payload.motion_state);
-    risk_score += (1.0 - sensor_health) * 1.8;
-    risk_score += (loc_uncertainty / 100.0).min(1.0) * 0.8;
+    // H(d, v) = alpha*exp(-lambda*d) + beta*max(0, -v) + gamma*kappa
+    let alpha = 1.5_f32;
+    let lambda = 0.8_f32;
+    let beta = 2.5_f32;
+    let gamma = 1.2_f32;
+
+    let distance_risk = alpha * (-lambda * distance_m).exp();
+    let velocity_risk = beta * closing_speed;
+    let confidence_risk = gamma * confidence;
+
+    let mut hazard_score = distance_risk + velocity_risk + confidence_risk;
+
+    if sensor_health < 0.5 {
+        hazard_score *= 1.3;
+    }
+
+    let uncertainty_scale = 1.0 + (loc_uncertainty / 8.0).min(1.5) * 0.35;
+    hazard_score *= uncertainty_scale;
 
     if payload.edge_reflex_active {
-        risk_score += 1.5;
+        hazard_score += 5.0;
     }
 
-    let mut tier = if risk_score >= 6.0 {
-        if sensor_health < 0.30 {
-            SafetyTier::HumanEscalation
-        } else {
-            SafetyTier::HardStop
-        }
-    } else if risk_score >= 4.2 {
-        SafetyTier::HardStop
-    } else if risk_score >= 3.0 {
-        SafetyTier::Voice
-    } else if risk_score >= 2.0 {
-        SafetyTier::Ping
-    } else {
-        SafetyTier::Silent
-    };
-
-    if payload.distance_category == DistanceCategory::VeryClose {
-        tier = max_tier(tier, SafetyTier::Voice);
-        if confidence >= 0.55 || payload.edge_reflex_active {
-            tier = max_tier(tier, SafetyTier::HardStop);
-        }
-    }
-
-    if payload.distance_category == DistanceCategory::Far
-        && confidence < 0.40
-        && !payload.edge_reflex_active
-        && (tier == SafetyTier::HardStop || tier == SafetyTier::HumanEscalation)
-    {
-        tier = SafetyTier::Voice;
-    }
+    let haptic_intensity = (hazard_score / 4.0).clamp(0.0, 1.0);
+    let spatial_audio_pitch_hz = 440.0 + (hazard_score * 220.0).clamp(0.0, 1000.0);
+    let hard_stop = hazard_score > HARD_STOP_THRESHOLD || payload.edge_reflex_active;
+    let human_assistance = hazard_score > HUMAN_ASSIST_THRESHOLD
+        && sensor_health < HUMAN_ASSIST_SENSOR_HEALTH_THRESHOLD;
 
     let reason = format!(
-        "conf={confidence:.2}; distance={}; motion={}; sensor_health={sensor_health:.2}; loc_uncertainty_m={loc_uncertainty:.1}; edge_reflex={}; risk={risk_score:.2}",
-        distance_str(payload.distance_category),
-        motion_str(payload.motion_state),
+        "score={hazard_score:.2};conf={confidence:.2};distance_m={distance_m:.2};closing_speed={closing_speed:.2};sensor={sensor_health:.2};loc_uncertainty_m={loc_uncertainty:.1};edge_reflex={};pan={pan:.2}",
         if payload.edge_reflex_active { "1" } else { "0" },
     );
 
     SafetyPolicyDecision {
-        tier,
-        risk_score,
+        hazard_score,
+        haptic_intensity,
+        spatial_audio_pitch_hz,
+        spatial_audio_pan: pan,
+        hard_stop,
+        human_assistance,
         reason,
-    }
-}
-
-fn distance_str(distance: DistanceCategory) -> &'static str {
-    match distance {
-        DistanceCategory::VeryClose => "very_close",
-        DistanceCategory::Mid => "mid",
-        DistanceCategory::Far => "far",
-    }
-}
-
-fn motion_str(state: MotionState) -> &'static str {
-    match state {
-        MotionState::Stationary => "stationary",
-        MotionState::WalkingSlow => "walking_slow",
-        MotionState::WalkingFast => "walking_fast",
-        MotionState::Running => "running",
     }
 }
 
@@ -148,41 +92,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn very_close_medium_confidence_emits_hard_stop() {
+    fn close_fast_hazard_emits_hard_stop() {
         let decision = evaluate_safety_policy(SafetyPolicyInput {
-            hazard_confidence: 0.60,
-            distance_category: DistanceCategory::VeryClose,
-            motion_state: MotionState::WalkingFast,
-            sensor_health_score: 0.85,
-            localization_uncertainty_m: 18.0,
+            hazard_confidence: 0.88,
+            distance_m: 1.1,
+            relative_velocity_mps: -1.9,
+            bearing_x: 0.2,
+            sensor_health_score: 0.9,
+            localization_uncertainty_m: 14.0,
             edge_reflex_active: false,
         });
 
         assert!(decision.should_emit_hard_stop());
-    }
-
-    #[test]
-    fn low_confidence_far_hazard_is_downgraded() {
-        let decision = evaluate_safety_policy(SafetyPolicyInput {
-            hazard_confidence: 0.20,
-            distance_category: DistanceCategory::Far,
-            motion_state: MotionState::Running,
-            sensor_health_score: 0.10,
-            localization_uncertainty_m: 200.0,
-            edge_reflex_active: false,
-        });
-
-        assert_eq!(decision.tier, SafetyTier::Voice);
+        assert!(decision.haptic_intensity > 0.5);
     }
 
     #[test]
     fn critical_risk_with_bad_sensors_escalates_human() {
         let decision = evaluate_safety_policy(SafetyPolicyInput {
             hazard_confidence: 0.95,
-            distance_category: DistanceCategory::VeryClose,
-            motion_state: MotionState::Running,
-            sensor_health_score: 0.15,
-            localization_uncertainty_m: 250.0,
+            distance_m: 0.8,
+            relative_velocity_mps: -2.4,
+            bearing_x: -0.3,
+            sensor_health_score: 0.18,
+            localization_uncertainty_m: 220.0,
             edge_reflex_active: true,
         });
 

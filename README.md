@@ -18,7 +18,7 @@ Apollos operates strictly on Causal reasoning (Pearl's do-calculus), rejecting s
 1. **Bounded Realtime Backpressure:** Gemini live duplex uses bounded channels (`mpsc::channel`) with drop-on-congestion behavior for non-critical payloads, keeping the WS loop stable under burst load.
 2. **Kinematic + Sensor Gating:** `apollos-core` evaluates motion/tilt/risk before expensive operations and tags degraded sensor conditions for downstream policy decisions.
 3. **Depth Engine with Source Tagging:** ONNX inference is used when runtime/model is available; deterministic heuristic fallback is used otherwise, with `source` explicitly attached to outputs.
-4. **Policy-Driven Safety Tiers:** `apollos-server/safety_policy.rs` maps confidence, distance, motion, sensor health, and edge reflex into `Silent/Ping/Voice/HardStop/HumanEscalation`.
+4. **Continuous Safety Directives:** `apollos-server/safety_policy.rs` evaluates continuous hazard kinematics (`distance_m`, `relative_velocity_mps`, confidence, uncertainty, edge reflex) into deterministic `SafetyDirective` outputs (`hard_stop`, haptic/audio intensity, human escalation).
 5. **Session Persistence + Human Escalation:** Firestore persistence and Twilio help escalation are first-class runtime paths with production strictness controls.
 
 ## Workspace Layout

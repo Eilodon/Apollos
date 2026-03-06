@@ -1,6 +1,6 @@
 use apollos_proto::contracts::{
     AssistantTextMessage, BackendToClientMessage, ClientToBackendMessage, ConnectionState,
-    ConnectionStateMessage, DistanceCategory, HardStopMessage, NavigationMode, SafetyStateMessage,
+    ConnectionStateMessage, NavigationMode, SafetyDirectiveMessage,
 };
 use chrono::Utc;
 use tracing::warn;
@@ -48,6 +48,13 @@ impl AgentOrchestrator {
 
                 let sensor_health_score = frame.sensor_health.as_ref().map(|s| s.score);
                 let sensor_health_flags = frame.sensor_health.as_ref().map(|s| s.flags.clone());
+                let localization_uncertainty_m = frame
+                    .sensor_uncertainty
+                    .as_ref()
+                    .and_then(|snapshot| {
+                        localization_uncertainty_from_covariance(&snapshot.covariance_3x3)
+                    })
+                    .or(frame.location_accuracy_m.map(|value| value.max(0.0)));
 
                 state
                     .sessions
@@ -55,7 +62,8 @@ impl AgentOrchestrator {
                         &frame.session_id,
                         sensor_health_score,
                         sensor_health_flags,
-                        frame.location_accuracy_m,
+                        localization_uncertainty_m,
+                        None,
                         None,
                         None,
                     )
@@ -177,27 +185,65 @@ impl AgentOrchestrator {
                     },
                 ))
             }
-            ClientToBackendMessage::EdgeHazard(hazard) => {
-                state
-                    .sessions
-                    .mark_edge_hazard(
-                        &hazard.session_id,
-                        hazard.hazard_type.clone(),
-                        hazard.suppress_seconds,
-                    )
-                    .await;
-
+            ClientToBackendMessage::HazardObservation(hazard) => {
+                let suppress_seconds = hazard
+                    .suppress_ms
+                    .map(|ms| (ms.max(500).saturating_add(999)) / 1000);
                 let observability = state.sessions.get_observability(&hazard.session_id).await;
+                let hazard_confidence = hazard.confidence.unwrap_or(0.7).clamp(0.0, 1.0);
+                let distance_m = hazard.distance_m.unwrap_or(2.0).max(0.0);
+                let relative_velocity_mps = hazard.relative_velocity_mps.unwrap_or(-0.8);
+                let bearing_x = hazard.bearing_x.unwrap_or(0.0).clamp(-1.0, 1.0);
+                let reflex_gate =
+                    hazard_confidence >= 0.85 && distance_m <= 1.5 && relative_velocity_mps <= -1.0;
 
                 let decision =
                     safety_policy::evaluate_safety_policy(safety_policy::SafetyPolicyInput {
-                        hazard_confidence: hazard.confidence.unwrap_or(0.7),
-                        distance_category: hazard.distance.unwrap_or(DistanceCategory::VeryClose),
-                        motion_state: observability.motion_state,
+                        hazard_confidence,
+                        distance_m,
+                        relative_velocity_mps,
+                        bearing_x,
                         sensor_health_score: observability.sensor_health_score,
                         localization_uncertainty_m: observability.localization_uncertainty_m,
-                        edge_reflex_active: observability.edge_reflex_active,
+                        edge_reflex_active: observability.edge_reflex_active || reflex_gate,
                     });
+
+                if decision.should_emit_hard_stop() {
+                    state
+                        .sessions
+                        .mark_edge_hazard(
+                            &hazard.session_id,
+                            hazard.hazard_type.clone(),
+                            suppress_seconds,
+                        )
+                        .await;
+                    let _ = state
+                        .gemini
+                        .interrupt_live_session(
+                            &hazard.session_id,
+                            &format!(
+                                "hazard={};distance_m={distance_m:.2};score={:.2}",
+                                hazard.hazard_type, decision.hazard_score
+                            ),
+                        )
+                        .await;
+                }
+
+                state
+                    .sessions
+                    .log_hazard(
+                        &hazard.session_id,
+                        &hazard.hazard_type,
+                        bearing_x,
+                        Some(distance_m),
+                        Some(relative_velocity_mps),
+                        hazard_confidence,
+                        Some(decision.hazard_score),
+                        Some(decision.hard_stop),
+                        hazard.source.as_deref(),
+                        "hazard_observation_ingested",
+                    )
+                    .await;
 
                 state
                     .sessions
@@ -206,23 +252,29 @@ impl AgentOrchestrator {
                         None,
                         None,
                         None,
-                        Some(decision.tier),
+                        Some(decision.hazard_score),
+                        Some(decision.hard_stop),
                         Some(decision.reason.clone()),
                     )
                     .await;
 
-                if decision.should_emit_hard_stop() {
-                    let hard_stop = BackendToClientMessage::HardStop(HardStopMessage {
-                        position_x: hazard.position_x.unwrap_or(0.0),
-                        distance: hazard.distance.unwrap_or(DistanceCategory::VeryClose),
-                        hazard_type: hazard.hazard_type.clone(),
-                        confidence: hazard.confidence.unwrap_or(0.7),
-                        ts: Some(Utc::now().to_rfc3339()),
-                    });
+                let directive = BackendToClientMessage::SafetyDirective(SafetyDirectiveMessage {
+                    session_id: hazard.session_id.clone(),
+                    timestamp: Utc::now().to_rfc3339(),
+                    hazard_type: Some(hazard.hazard_type.clone()),
+                    hazard_score: decision.hazard_score,
+                    hard_stop: decision.hard_stop,
+                    haptic_intensity: decision.haptic_intensity,
+                    spatial_audio_pitch_hz: decision.spatial_audio_pitch_hz,
+                    spatial_audio_pan: decision.spatial_audio_pan,
+                    needs_human_assistance: decision.human_assistance,
+                    reason: Some(decision.reason.clone()),
+                });
 
+                if decision.should_emit_hard_stop() {
                     state
                         .ws_registry
-                        .emit_hard_stop(&hazard.session_id, hard_stop)
+                        .emit_hard_stop(&hazard.session_id, directive.clone())
                         .await;
                 }
 
@@ -240,16 +292,7 @@ impl AgentOrchestrator {
                         .await;
                 }
 
-                Some(BackendToClientMessage::SafetyState(SafetyStateMessage {
-                    session_id: hazard.session_id,
-                    timestamp: Utc::now().to_rfc3339(),
-                    degraded: observability.degraded_mode,
-                    reason: Some(decision.reason),
-                    sensor_health_score: observability.sensor_health_score,
-                    sensor_health_flags: Some(observability.sensor_health_flags),
-                    localization_uncertainty_m: observability.localization_uncertainty_m,
-                    tier: decision.tier,
-                }))
+                Some(directive)
             }
         }
     }
@@ -271,16 +314,29 @@ fn extract_mode_from_command(command: &str) -> Option<NavigationMode> {
     }
 }
 
+fn localization_uncertainty_from_covariance(covariance_3x3: &[f32]) -> Option<f32> {
+    if covariance_3x3.len() < 9 {
+        return None;
+    }
+
+    let trace = covariance_3x3[0] + covariance_3x3[4] + covariance_3x3[8];
+    if !trace.is_finite() || trace < 0.0 {
+        return None;
+    }
+
+    Some(trace.sqrt())
+}
+
 #[cfg(test)]
 mod tests {
     use apollos_proto::contracts::{
-        BackendToClientMessage, ClientToBackendMessage, DistanceCategory, EdgeHazardMessage,
+        BackendToClientMessage, ClientToBackendMessage, HazardObservationMessage,
     };
 
     use super::*;
 
     #[tokio::test]
-    async fn edge_hazard_triggers_hard_stop_delivery() {
+    async fn hazard_observation_triggers_hard_stop_delivery() {
         let state = AppState::default();
         let (emergency_tx, mut emergency_rx) = tokio::sync::mpsc::channel(8);
 
@@ -296,14 +352,16 @@ mod tests {
         let _ = orchestrator
             .route_message(
                 &state,
-                ClientToBackendMessage::EdgeHazard(EdgeHazardMessage {
+                ClientToBackendMessage::HazardObservation(HazardObservationMessage {
                     session_id: "s1".to_string(),
                     timestamp: Utc::now().to_rfc3339(),
                     hazard_type: "EDGE_DROP_HAZARD".to_string(),
-                    position_x: Some(0.2),
-                    distance: Some(DistanceCategory::VeryClose),
+                    bearing_x: Some(0.2),
+                    distance_m: Some(1.0),
+                    relative_velocity_mps: Some(-2.0),
                     confidence: Some(0.92),
-                    suppress_seconds: Some(3),
+                    source: Some("test".to_string()),
+                    suppress_ms: Some(3000),
                 }),
             )
             .await;
@@ -311,7 +369,15 @@ mod tests {
         let delivered = emergency_rx.recv().await;
         assert!(matches!(
             delivered,
-            Some(BackendToClientMessage::HardStop(_))
+            Some(BackendToClientMessage::SafetyDirective(_))
         ));
+    }
+
+    #[test]
+    fn derives_localization_uncertainty_from_covariance_trace() {
+        let covariance_3x3 = vec![4.0, 0.0, 0.0, 0.0, 9.0, 0.0, 0.0, 0.0, 16.0];
+        let uncertainty = localization_uncertainty_from_covariance(&covariance_3x3);
+
+        assert_eq!(uncertainty, Some((29.0_f32).sqrt()));
     }
 }

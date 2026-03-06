@@ -38,6 +38,7 @@ message MultimodalFrameMessage {
   optional float location_accuracy_m = 14;
   optional uint64 location_age_ms = 15;
   optional apollos.types.v1.SensorHealthSnapshot sensor_health = 16;
+  optional apollos.types.v1.SensorUncertaintySnapshot sensor_uncertainty = 17;
 }
 
 message AudioChunkMessage {
@@ -52,14 +53,29 @@ message UserCommandMessage {
   string command = 3;
 }
 
-message EdgeHazardMessage {
+message HazardObservationMessage {
   string session_id = 1;
   string timestamp = 2;
   string hazard_type = 3;
-  optional float position_x = 4;
-  optional apollos.types.v1.DistanceCategory distance = 5;
-  optional float confidence = 6;
-  optional uint32 suppress_seconds = 7;
+  optional float bearing_x = 4;
+  optional float distance_m = 5;
+  optional float relative_velocity_mps = 6;
+  optional float confidence = 7;
+  optional string source = 8;
+  optional uint32 suppress_ms = 9;
+}
+
+message SafetyDirectiveMessage {
+  string session_id = 1;
+  string timestamp = 2;
+  optional string hazard_type = 3;
+  float hazard_score = 4;
+  bool hard_stop = 5;
+  float haptic_intensity = 6;
+  float spatial_audio_pitch_hz = 7;
+  float spatial_audio_pan = 8;
+  bool needs_human_assistance = 9;
+  optional string reason = 10;
 }
 
 message AssistantTextMessage {
@@ -81,28 +97,9 @@ message SemanticCueMessage {
   optional float position_x = 2;
 }
 
-message HardStopMessage {
-  float position_x = 1;
-  apollos.types.v1.DistanceCategory distance = 2;
-  string hazard_type = 3;
-  float confidence = 4;
-  optional string ts = 5;
-}
-
 message ConnectionStateMessage {
   ConnectionStateKind state = 1;
   optional string detail = 2;
-}
-
-message SafetyStateMessage {
-  string session_id = 1;
-  string timestamp = 2;
-  bool degraded = 3;
-  optional string reason = 4;
-  float sensor_health_score = 5;
-  repeated string sensor_health_flags = 6;
-  float localization_uncertainty_m = 7;
-  apollos.types.v1.SafetyTier tier = 8;
 }
 
 message HumanHelpSessionMessage {
@@ -117,7 +114,7 @@ message ClientEnvelope {
     MultimodalFrameMessage multimodal_frame = 1;
     AudioChunkMessage audio_chunk = 2;
     UserCommandMessage user_command = 3;
-    EdgeHazardMessage edge_hazard = 4;
+    HazardObservationMessage hazard_observation = 4;
   }
 }
 
@@ -125,10 +122,9 @@ message ServerEnvelope {
   oneof payload {
     AssistantTextMessage assistant_text = 1;
     AssistantAudioMessage assistant_audio = 2;
-    HardStopMessage hard_stop = 3;
+    SafetyDirectiveMessage safety_directive = 3;
     ConnectionStateMessage connection_state = 4;
     SemanticCueMessage semantic_cue = 5;
-    SafetyStateMessage safety_state = 6;
-    HumanHelpSessionMessage human_help_session = 7;
+    HumanHelpSessionMessage human_help_session = 6;
   }
 }

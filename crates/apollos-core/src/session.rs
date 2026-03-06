@@ -38,6 +38,7 @@ impl SessionState {
             location_accuracy_m: None,
             location_age_ms: None,
             sensor_health: self.sensor_health.clone(),
+            sensor_uncertainty: None,
         })
     }
 }

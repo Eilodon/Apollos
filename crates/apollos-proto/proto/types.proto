@@ -33,15 +33,6 @@ enum CarryMode {
   CARRY_MODE_POCKET = 4;
 }
 
-enum SafetyTier {
-  SAFETY_TIER_UNSPECIFIED = 0;
-  SAFETY_TIER_SILENT = 1;
-  SAFETY_TIER_PING = 2;
-  SAFETY_TIER_VOICE = 3;
-  SAFETY_TIER_HARD_STOP = 4;
-  SAFETY_TIER_HUMAN_ESCALATION = 5;
-}
-
 enum HumanRtcProvider {
   HUMAN_RTC_PROVIDER_UNSPECIFIED = 0;
   HUMAN_RTC_PROVIDER_TWILIO = 1;
@@ -59,6 +50,12 @@ message SensorHealthSnapshot {
   repeated string flags = 2;
   bool degraded = 3;
   string source = 4;
+}
+
+message SensorUncertaintySnapshot {
+  repeated float covariance_3x3 = 1;
+  float innovation_norm = 2;
+  string source = 3;
 }
 
 message HumanHelpRtcSession {

@@ -1,6 +1,7 @@
 import AVFoundation
 import Combine
 import CoreLocation
+import CoreMotion
 import Foundation
 
 struct NativePermissionStatus {
@@ -37,11 +38,28 @@ final class RealtimeSessionManager: NSObject, ObservableObject {
     private var wsTask: URLSessionWebSocketTask?
     private let urlSession = URLSession(configuration: .default)
     private let locationManager = CLLocationManager()
+    private let motionManager = CMMotionManager()
+    private let motionQueue: OperationQueue = {
+        let queue = OperationQueue()
+        queue.name = "com.apollos.ios.motion"
+        return queue
+    }()
+    private let imuLock = NSLock()
     private var latestLocation: IOSLocationSnapshot?
+    private var geoOrigin: IOSLocationSnapshot?
+    private var eskfHandle: UInt64 = 0
+    private var lastMotionTimestamp: TimeInterval = 0
+    private var latestGyroMagnitudeDeg: Float = 0
 
     private var captureSession: AVCaptureSession?
     private let cameraQueue = DispatchQueue(label: "com.apollos.ios.camera")
     private var lastFrameSentAt: TimeInterval = 0
+    private var lastCameraFrameTimestampS: TimeInterval = 0
+    private var latestVoApplied: Bool = false
+    private var latestVoFlowScore: Float = 0.0
+    private var latestVoVarianceM2: Float = 999.0
+    private var latestVoPoseXM: Float = 0.0
+    private var latestVoPoseYM: Float = 0.0
 
     private var audioEngine: AVAudioEngine?
 
@@ -103,13 +121,29 @@ final class RealtimeSessionManager: NSObject, ObservableObject {
                     serverBaseURL: trimmedURL,
                     idToken: trimmedToken
                 )
+                let handle = RustCoreBridge.eskfCreate()
+                guard handle != 0 else {
+                    appendLog("ESKF create failed")
+                    return
+                }
 
                 DispatchQueue.main.async {
                     self.isRunning = true
                 }
+                eskfHandle = handle
+                geoOrigin = nil
+                lastMotionTimestamp = 0
+                setGyroMagnitudeDeg(0)
+                lastCameraFrameTimestampS = 0
+                latestVoApplied = false
+                latestVoFlowScore = 0.0
+                latestVoVarianceM2 = 999.0
+                latestVoPoseXM = 0.0
+                latestVoPoseYM = 0.0
 
                 connectWebSocket(serverBaseURL: trimmedURL, wsToken: wsToken)
                 startLocation()
+                startMotion()
                 startCamera()
                 startAudio()
 
@@ -122,6 +156,10 @@ final class RealtimeSessionManager: NSObject, ObservableObject {
 
     func stop() {
         if !isRunning {
+            if eskfHandle != 0 {
+                _ = RustCoreBridge.eskfDestroy(handle: eskfHandle)
+                eskfHandle = 0
+            }
             return
         }
 
@@ -132,6 +170,21 @@ final class RealtimeSessionManager: NSObject, ObservableObject {
 
         locationManager.stopUpdatingLocation()
         latestLocation = nil
+        geoOrigin = nil
+
+        motionManager.stopDeviceMotionUpdates()
+        lastMotionTimestamp = 0
+        setGyroMagnitudeDeg(0)
+        lastCameraFrameTimestampS = 0
+        latestVoApplied = false
+        latestVoFlowScore = 0.0
+        latestVoVarianceM2 = 999.0
+        latestVoPoseXM = 0.0
+        latestVoPoseYM = 0.0
+        if eskfHandle != 0 {
+            _ = RustCoreBridge.eskfDestroy(handle: eskfHandle)
+            eskfHandle = 0
+        }
 
         if let session = captureSession {
             session.stopRunning()
@@ -215,6 +268,85 @@ final class RealtimeSessionManager: NSObject, ObservableObject {
         locationManager.desiredAccuracy = kCLLocationAccuracyBest
         locationManager.distanceFilter = 1
         locationManager.startUpdatingLocation()
+    }
+
+    private func startMotion() {
+        guard motionManager.isDeviceMotionAvailable else {
+            appendLog("CoreMotion unavailable")
+            return
+        }
+
+        motionManager.deviceMotionUpdateInterval = 1.0 / 100.0
+        motionManager.startDeviceMotionUpdates(to: motionQueue) { [weak self] motion, _ in
+            guard let self, self.isRunning, let motion else {
+                return
+            }
+
+            let ts = motion.timestamp
+            if self.lastMotionTimestamp <= 0 {
+                self.lastMotionTimestamp = ts
+                return
+            }
+
+            let dtS = Float(max(0.0, min(0.2, ts - self.lastMotionTimestamp)))
+            self.lastMotionTimestamp = ts
+            if dtS <= 0 {
+                return
+            }
+
+            let g = Float(9.80665)
+            let accelX = Float(motion.userAcceleration.x) * g
+            let accelY = Float(motion.userAcceleration.y) * g
+            let accelZ = Float(motion.userAcceleration.z) * g
+            _ = RustCoreBridge.eskfPredictImu(
+                handle: self.eskfHandle,
+                accelX: accelX,
+                accelY: accelY,
+                accelZ: accelZ,
+                dtS: dtS
+            )
+
+            let rate = motion.rotationRate
+            let gyroRad = sqrt(rate.x * rate.x + rate.y * rate.y + rate.z * rate.z)
+            let gyroDeg = Float(gyroRad * 57.29578)
+            self.setGyroMagnitudeDeg(gyroDeg)
+        }
+    }
+
+    private func setGyroMagnitudeDeg(_ value: Float) {
+        imuLock.lock()
+        latestGyroMagnitudeDeg = value
+        imuLock.unlock()
+    }
+
+    private func currentGyroMagnitudeDeg() -> Float {
+        imuLock.lock()
+        let value = latestGyroMagnitudeDeg
+        imuLock.unlock()
+        return value
+    }
+
+    private func ingestLocationToEskf(_ location: IOSLocationSnapshot) {
+        let origin: IOSLocationSnapshot
+        if let existing = geoOrigin {
+            origin = existing
+        } else {
+            geoOrigin = location
+            origin = location
+        }
+
+        let latScaleM = 111_132.0
+        let lngScaleM = max(1.0, 111_320.0 * cos(origin.lat * .pi / 180.0))
+        let posX = Float((location.lng - origin.lng) * lngScaleM)
+        let posY = Float((location.lat - origin.lat) * latScaleM)
+        let varianceM2 = Float(max(4.0, min(50.0, location.accuracyM)))
+        _ = RustCoreBridge.eskfUpdateVision(
+            handle: eskfHandle,
+            positionX: posX,
+            positionY: posY,
+            positionZ: 0.0,
+            varianceM2: varianceM2 * varianceM2
+        )
     }
 
     private func startCamera() {
@@ -314,6 +446,29 @@ final class RealtimeSessionManager: NSObject, ObservableObject {
         let locationAgeMs = location.map {
             Int(nowDate.timeIntervalSince($0.capturedAt) * 1000)
         } ?? 0
+        let eskf = RustCoreBridge.eskfSnapshot(handle: eskfHandle)
+        var healthFlags: [String] = []
+        if eskf.degraded {
+            healthFlags.append("eskf_degraded")
+        }
+        if eskf.localizationUncertaintyM > 6.0 {
+            healthFlags.append("localization_uncertain")
+        }
+        if depthSourceCode != 1 {
+            healthFlags.append("depth_heuristic_fallback")
+        }
+        if !latestVoApplied {
+            healthFlags.append("vision_odometry_fallback")
+        }
+        let velocityMps = max(0.2, min(3.0, riskScore))
+        let visionOdometry: [String: Any] = [
+            "source": latestVoApplied ? "ios-visual-odometry-v1" : "gps-anchor-fallback",
+            "applied": latestVoApplied,
+            "optical_flow_score": max(0.0, min(1.0, latestVoFlowScore)),
+            "variance_m2": max(0.0, min(999.0, latestVoVarianceM2)),
+            "pose_x_m": latestVoPoseXM,
+            "pose_y_m": latestVoPoseYM,
+        ]
 
         let payload: [String: Any?] = [
             "type": "multimodal_frame",
@@ -322,7 +477,7 @@ final class RealtimeSessionManager: NSObject, ObservableObject {
             "frame_jpeg_base64": nil,
             "motion_state": "walking_fast",
             "pitch": 0.0,
-            "velocity": 1.4,
+            "velocity": velocityMps,
             "user_text": nil,
             "yaw_delta_deg": 0.0,
             "carry_mode": "necklace",
@@ -333,11 +488,21 @@ final class RealtimeSessionManager: NSObject, ObservableObject {
             "location_accuracy_m": location?.accuracyM,
             "location_age_ms": locationAgeMs,
             "sensor_health": [
-                "score": depthSourceCode == 1 ? 0.95 : 0.75,
-                "flags": [],
-                "degraded": false,
-                "source": "ios-native-rust-v1",
+                "score": max(0.0, min(1.0, eskf.sensorHealthScore)),
+                "flags": healthFlags,
+                "degraded": eskf.degraded,
+                "source": "ios-eskf-runtime-v3",
             ],
+            "sensor_uncertainty": [
+                "covariance_3x3": [
+                    eskf.covarianceXx, 0.0, 0.0,
+                    0.0, eskf.covarianceYy, 0.0,
+                    0.0, 0.0, eskf.covarianceZz,
+                ],
+                "innovation_norm": max(0.0, min(10.0, eskf.innovationNorm)),
+                "source": "ios-eskf-runtime-v3",
+            ],
+            "vision_odometry": visionOdometry,
         ]
 
         sendJSON(payload)
@@ -349,6 +514,36 @@ final class RealtimeSessionManager: NSObject, ObservableObject {
             "session_id": sessionId,
             "timestamp": iso8601Now(),
             "audio_chunk_pcm16": pcm16.base64EncodedString(),
+        ]
+        sendJSON(payload)
+    }
+
+    private func sendHazardObservation(depth: IOSDepthHazardResult, riskScore: Float) {
+        let distanceM: Float
+        switch depth.distanceCode {
+        case 0:
+            distanceM = 1.0
+        case 1:
+            distanceM = 2.5
+        case 2:
+            distanceM = 4.5
+        default:
+            distanceM = 3.0
+        }
+        let relativeVelocityMps = -max(0.4, min(3.0, riskScore))
+        let source = depth.sourceCode == 1 ? "depth_onnx" : "depth_heuristic"
+
+        let payload: [String: Any] = [
+            "type": "hazard_observation",
+            "session_id": sessionId,
+            "timestamp": iso8601Now(),
+            "hazard_type": "DROP_AHEAD",
+            "bearing_x": depth.positionX,
+            "distance_m": distanceM,
+            "relative_velocity_mps": relativeVelocityMps,
+            "confidence": depth.confidence,
+            "source": source,
+            "suppress_ms": 3000,
         ]
         sendJSON(payload)
     }
@@ -486,12 +681,14 @@ extension RealtimeSessionManager: CLLocationManagerDelegate {
         guard let latest = locations.last else {
             return
         }
-        latestLocation = IOSLocationSnapshot(
+        let snapshot = IOSLocationSnapshot(
             lat: latest.coordinate.latitude,
             lng: latest.coordinate.longitude,
             accuracyM: latest.horizontalAccuracy,
             capturedAt: Date()
         )
+        latestLocation = snapshot
+        ingestLocationToEskf(snapshot)
     }
 }
 
@@ -537,6 +734,29 @@ extension RealtimeSessionManager: AVCaptureVideoDataOutputSampleBufferDelegate {
             }
         }
 
+        let frameTimestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer).seconds
+        let currentTimestamp = frameTimestamp.isFinite ? frameTimestamp : Date().timeIntervalSince1970
+        let dtS: Float
+        if lastCameraFrameTimestampS <= 0 {
+            dtS = 0.033
+        } else {
+            dtS = Float(max(0.01, min(0.2, currentTimestamp - lastCameraFrameTimestampS)))
+        }
+        lastCameraFrameTimestampS = currentTimestamp
+
+        let vo = RustCoreBridge.eskfUpdateVisualOdometryRgba(
+            handle: eskfHandle,
+            rgba: rgba,
+            width: UInt32(width),
+            height: UInt32(height),
+            dtS: dtS
+        )
+        latestVoApplied = vo.applied
+        latestVoFlowScore = vo.opticalFlowScore
+        latestVoVarianceM2 = vo.varianceM2
+        latestVoPoseXM = vo.poseXM
+        latestVoPoseYM = vo.poseYM
+
         let kinematic = RustCoreBridge.analyzeDefaultWalkingFrame()
         let depth = RustCoreBridge.detectDropAheadRgba(
             rgba: rgba,
@@ -544,9 +764,12 @@ extension RealtimeSessionManager: AVCaptureVideoDataOutputSampleBufferDelegate {
             height: UInt32(height),
             riskScore: kinematic.riskScore,
             carryModeCode: 1,
-            gyroMagnitude: 0,
+            gyroMagnitude: currentGyroMagnitudeDeg(),
             nowMs: UInt64(Date().timeIntervalSince1970 * 1000)
         )
+        if depth.detected {
+            sendHazardObservation(depth: depth, riskScore: kinematic.riskScore)
+        }
         sendMultimodalFrame(riskScore: kinematic.riskScore, depthSourceCode: depth.sourceCode)
     }
 }
