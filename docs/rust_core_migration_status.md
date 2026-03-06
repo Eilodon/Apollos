@@ -15,15 +15,20 @@
    - persistence throttling and metadata-token auth support.
 4. Twilio token minting:
    - real Video Access Token JWT minting via API key secret
-   - automatic fallback to stub tokens when Twilio env is missing.
+   - strict production behavior via `TWILIO_REQUIRED` (fail-fast when config is missing).
 5. Native shell scaffolding + FFI integration:
    - `apollos-core` exported C ABI (`cdylib`/`staticlib`)
-   - Android JNI bridge and Compose shell
-   - iOS Swift bridge and shell sources.
+   - Android JNI bridge and Compose shell with realtime camera/mic/location/ws flow
+   - iOS Swift bridge and shell sources with realtime camera/mic/location/ws flow.
 6. Phase-4 legacy removal:
    - removed `backend/` (Python runtime)
    - removed `frontend/` (TypeScript/PWA runtime)
-   - removed Python regression scripts and local `.venv`.
+   - removed Python regression scripts and local `.venv`
+   - removed leftover Firebase hosting artifacts (`.firebase/`, `.firebaserc`, `firebase.json`).
+7. Release guardrails:
+   - production fail-fast for missing OIDC/JWKS and disabled Gemini live
+   - runtime/deploy single-instance guardrail (`SINGLE_INSTANCE_ONLY=1`, Cloud Run max instances = 1)
+   - release audit script (`scripts/release_audit.sh`) to enforce migration + quality gates.
 
 ## Validation
 

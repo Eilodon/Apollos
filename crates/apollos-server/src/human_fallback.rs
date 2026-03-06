@@ -161,7 +161,7 @@ impl Default for HumanFallbackService {
         let twilio = TwilioConfig::from_env(viewer_ttl_seconds);
 
         if twilio_required && twilio.is_none() {
-            tracing::warn!("TWILIO_REQUIRED is enabled but Twilio config is missing. Human fallback video will not work.");
+            panic!("TWILIO_REQUIRED is enabled but Twilio config is missing");
         }
 
         Self {
@@ -193,7 +193,7 @@ impl HumanFallbackService {
         let publisher_identity = format!("patient-{session_id}");
         let publisher_token = self
             .mint_twilio_video_token(&room_name, &publisher_identity)
-            .unwrap_or_else(|| "publisher-token-stub".to_string());
+            .expect("failed to mint Twilio publisher token");
         let rtc_expires_in = self.twilio_token_ttl_seconds() as u32;
 
         let mut guard = self.state.write().await;
@@ -248,7 +248,7 @@ impl HumanFallbackService {
         let helper_identity = format!("helper-{}", Uuid::new_v4().simple());
         let viewer_rtc_token = self
             .mint_twilio_video_token(&room_name, &helper_identity)
-            .unwrap_or_else(|| "viewer-token-stub".to_string());
+            .expect("failed to mint Twilio viewer token");
         let rtc_expires_in = self.twilio_token_ttl_seconds() as u32;
 
         let mut guard = self.state.write().await;
@@ -395,9 +395,25 @@ pub async fn help_ticket_exchange_handler(
 mod tests {
     use super::*;
 
+    fn test_service() -> HumanFallbackService {
+        HumanFallbackService {
+            public_help_base: "https://help.apollos.local/live".to_string(),
+            ticket_ttl_seconds: 300,
+            viewer_ttl_seconds: 300,
+            twilio: Some(TwilioConfig {
+                account_sid: "AC123".to_string(),
+                api_key_sid: "SK123".to_string(),
+                api_key_secret: "secret".to_string(),
+                room_prefix: "apollos-help".to_string(),
+                token_ttl_seconds: 300,
+            }),
+            state: Arc::new(RwLock::new(FallbackState::default())),
+        }
+    }
+
     #[tokio::test]
     async fn help_ticket_is_one_time_exchange() {
-        let service = HumanFallbackService::default();
+        let service = test_service();
         let session = service.create_help_session("s1", "manual").await;
         let link = session.help_link.expect("must have link");
         let ticket = link
@@ -415,7 +431,7 @@ mod tests {
 
     #[tokio::test]
     async fn viewer_token_must_match_session() {
-        let service = HumanFallbackService::default();
+        let service = test_service();
         let session = service.create_help_session("s2", "manual").await;
         let link = session.help_link.expect("must have link");
         let ticket = link

@@ -25,31 +25,49 @@ impl ServerConfig {
         format!("{}:{}", self.host, self.port)
     }
 
-    pub fn validate_runtime_requirements(&self) {
+    pub fn validate_runtime_requirements(&self) -> anyhow::Result<()> {
         let production = self.app_env.eq_ignore_ascii_case("production");
         if !production {
-            return;
+            return Ok(());
         }
 
-        for required in ["OIDC_ISSUER", "OIDC_AUDIENCE", "OIDC_JWKS_URL"] {
-            if !std::env::var(required)
-                .ok()
-                .map(|value| !value.trim().is_empty())
-                .unwrap_or(false)
-            {
-                tracing::error!("CRITICAL: missing required production env: {required}. Auth will fail.");
-            }
+        let missing_oidc = ["OIDC_ISSUER", "OIDC_AUDIENCE", "OIDC_JWKS_URL"]
+            .iter()
+            .copied()
+            .filter(|required| {
+                !std::env::var(required)
+                    .ok()
+                    .map(|value| !value.trim().is_empty())
+                    .unwrap_or(false)
+            })
+            .collect::<Vec<_>>();
+
+        if !missing_oidc.is_empty() {
+            anyhow::bail!(
+                "missing required production OIDC env vars: {}",
+                missing_oidc.join(", ")
+            );
         }
 
         if !std::env::var("ENABLE_GEMINI_LIVE")
             .ok()
-            .map(|value| !matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "0" | "false" | "off" | "no"
-            ))
+            .map(|value| {
+                !matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "0" | "false" | "off" | "no"
+                )
+            })
             .unwrap_or(true)
         {
-            tracing::error!("CRITICAL: ENABLE_GEMINI_LIVE must be enabled in production. Core logic will fail.");
+            anyhow::bail!("ENABLE_GEMINI_LIVE must be enabled in production");
         }
+
+        let ws_auth_mode =
+            std::env::var("WS_AUTH_MODE").unwrap_or_else(|_| "oidc_broker".to_string());
+        if !ws_auth_mode.eq_ignore_ascii_case("oidc_broker") {
+            anyhow::bail!("WS_AUTH_MODE must be set to oidc_broker in production");
+        }
+
+        Ok(())
     }
 }

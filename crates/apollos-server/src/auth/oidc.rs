@@ -54,6 +54,7 @@ pub async fn verify_id_token(token: &str) -> Option<OidcIdentity> {
     }
 
     if cfg.allow_insecure_dev_tokens {
+        warn!("using insecure dev OIDC token fallback (OIDC_ALLOW_INSECURE_DEV_TOKENS=1)");
         return verify_insecure_dev_token(token);
     }
 
@@ -66,7 +67,8 @@ impl OidcRuntimeConfig {
         let strict_mode =
             app_env.eq_ignore_ascii_case("production") || env_flag("OIDC_REQUIRE_STRICT", false);
 
-        let allow_insecure_dev_tokens = env_flag("OIDC_ALLOW_INSECURE_DEV_TOKENS", !strict_mode);
+        let allow_insecure_dev_tokens =
+            !strict_mode && env_flag("OIDC_ALLOW_INSECURE_DEV_TOKENS", false);
 
         let issuer = read_non_empty_env("OIDC_ISSUER");
         let audience = read_non_empty_env("OIDC_AUDIENCE");

@@ -923,7 +923,7 @@ fn live_function_declarations() -> Vec<Value> {
 
 async fn send_ws_json(socket: &mut LiveSocket, payload: &Value) -> anyhow::Result<()> {
     socket
-        .send(Message::Text(payload.to_string()))
+        .send(Message::Text(payload.to_string().into()))
         .await
         .context("failed to send gemini websocket message")
 }

@@ -20,6 +20,16 @@ resource "google_cloud_run_v2_service" "aria_backend" {
         value = var.enable_firestore ? "1" : "0"
       }
 
+      env {
+        name  = "SINGLE_INSTANCE_ONLY"
+        value = "1"
+      }
+
+      env {
+        name  = "WS_AUTH_MODE"
+        value = "oidc_broker"
+      }
+
       resources {
         limits = {
           cpu    = "2"

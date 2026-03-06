@@ -6,6 +6,15 @@ use axum::{
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
+fn configure_test_env() {
+    std::env::set_var("APP_ENV", "development");
+    std::env::set_var("OIDC_ALLOW_INSECURE_DEV_TOKENS", "1");
+    std::env::set_var("TWILIO_ACCOUNT_SID", "AC123");
+    std::env::set_var("TWILIO_VIDEO_API_KEY_SID", "SK123");
+    std::env::set_var("TWILIO_VIDEO_API_KEY_SECRET", "secret");
+    std::env::set_var("TWILIO_REQUIRED", "0");
+}
+
 async fn post_json(app: axum::Router, path: &str, payload: Value) -> (StatusCode, Value) {
     let request = Request::builder()
         .method("POST")
@@ -31,6 +40,7 @@ async fn post_json(app: axum::Router, path: &str, payload: Value) -> (StatusCode
 
 #[tokio::test]
 async fn oidc_broker_flow_revokes_session_tokens() {
+    configure_test_env();
     let app = build_router(AppState::default());
 
     let (exchange_status, exchange_body) = post_json(
@@ -76,6 +86,7 @@ async fn oidc_broker_flow_revokes_session_tokens() {
 
 #[tokio::test]
 async fn help_ticket_exchange_is_one_time() {
+    configure_test_env();
     let state = AppState::default();
     let help_session = state
         .fallback

@@ -1,0 +1,17 @@
+.git
+target
+native
+docs
+assets
+infra
+scripts
+.github
+.firebase
+.firebaserc
+firebase.json
+.env
+.env.*
+*.log
+*.tfstate
+*.tfstate.*
+*-firebase-adminsdk-*.json

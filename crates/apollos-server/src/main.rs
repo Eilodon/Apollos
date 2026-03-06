@@ -11,7 +11,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = ServerConfig::from_env();
-    config.validate_runtime_requirements();
+    config.validate_runtime_requirements()?;
     let bind_addr = config.bind_addr();
 
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;

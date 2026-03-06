@@ -3,8 +3,8 @@ use once_cell::sync::Lazy;
 use std::sync::Mutex;
 
 use crate::{
-    depth_engine::{DepthEngine, DepthSource},
     carry_mode::get_carry_mode_profile,
+    depth_engine::{DepthEngine, DepthSource},
     kinematic_gate::{
         compute_risk_score, compute_yaw_delta, should_capture_frame, Acceleration, GyroRotation,
         KinematicReading,
@@ -168,7 +168,13 @@ pub extern "C" fn apollos_depth_onnx_runtime_enabled() -> u8 {
 }
 
 #[no_mangle]
-pub extern "C" fn apollos_detect_drop_ahead_rgba(
+/// Runs depth hazard detection on an RGBA frame and returns a compact ABI-safe output.
+///
+/// # Safety
+/// - `rgba_ptr` must point to at least `width * height * 4` readable bytes.
+/// - `rgba_ptr` must remain valid for the duration of this call.
+/// - Caller is responsible for ensuring the buffer memory is properly aligned and initialized.
+pub unsafe extern "C" fn apollos_detect_drop_ahead_rgba(
     rgba_ptr: *const u8,
     rgba_len: usize,
     width: u32,
@@ -190,7 +196,10 @@ pub extern "C" fn apollos_detect_drop_ahead_rgba(
 
     let width = width as usize;
     let height = height as usize;
-    let Some(expected_len) = width.checked_mul(height).and_then(|value| value.checked_mul(4)) else {
+    let Some(expected_len) = width
+        .checked_mul(height)
+        .and_then(|value| value.checked_mul(4))
+    else {
         return ApollosDepthHazardOutput {
             detected: 0,
             position_x: 0.0,
@@ -209,7 +218,11 @@ pub extern "C" fn apollos_detect_drop_ahead_rgba(
         };
     }
 
-    let rgba = unsafe { std::slice::from_raw_parts(rgba_ptr, expected_len) };
+    // SAFETY:
+    // - caller guarantees rgba_ptr points to readable memory.
+    // - expected_len is validated against width/height with checked arithmetic.
+    // - function returns early when pointer is null or buffer length is insufficient.
+    let rgba = std::slice::from_raw_parts(rgba_ptr, expected_len);
     let Some(frame) = LumaFrame::from_rgba(width, height, rgba) else {
         return ApollosDepthHazardOutput {
             detected: 0,

@@ -35,6 +35,18 @@ impl WebSocketRegistry {
     ) -> Result<String, String> {
         let mut guard = self.inner.lock().await;
 
+        if single_instance_only() {
+            if let Some((active_session_id, _)) = guard
+                .live
+                .iter()
+                .find(|(active_session_id, _)| *active_session_id != session_id)
+            {
+                return Err(format!(
+                    "single_instance_only: active live session exists ({active_session_id})"
+                ));
+            }
+        }
+
         if let Some(active) = guard.live.get(session_id) {
             if active.client_id.is_some() && active.client_id != client_id {
                 return Err("live session already owned by another client".to_string());
@@ -62,6 +74,18 @@ impl WebSocketRegistry {
         client_id: Option<String>,
     ) -> Result<String, String> {
         let mut guard = self.inner.lock().await;
+
+        if single_instance_only() {
+            if let Some((active_session_id, _)) = guard
+                .emergency
+                .iter()
+                .find(|(active_session_id, _)| *active_session_id != session_id)
+            {
+                return Err(format!(
+                    "single_instance_only: active emergency session exists ({active_session_id})"
+                ));
+            }
+        }
 
         if let Some(live) = guard.live.get(session_id) {
             if live.client_id.is_some() && live.client_id != client_id {
@@ -242,6 +266,14 @@ impl WebSocketRegistry {
     }
 }
 
+fn single_instance_only() -> bool {
+    let value = std::env::var("SINGLE_INSTANCE_ONLY")
+        .unwrap_or_else(|_| "1".to_string())
+        .to_ascii_lowercase();
+
+    !matches!(value.trim(), "0" | "false" | "off" | "no")
+}
+
 #[cfg(test)]
 mod tests {
     use apollos_proto::contracts::{
@@ -307,5 +339,23 @@ mod tests {
         assert_eq!(delivered, 2);
         assert!(rx1.recv().await.is_some());
         assert!(rx2.recv().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn single_instance_only_rejects_second_live_session() {
+        let registry = WebSocketRegistry::default();
+        let (tx1, _rx1) = mpsc::channel(8);
+        let (tx2, _rx2) = mpsc::channel(8);
+
+        registry
+            .register_live("s-a", tx1, Some("client-a".to_string()))
+            .await
+            .expect("first session should register");
+
+        let second = registry
+            .register_live("s-b", tx2, Some("client-b".to_string()))
+            .await;
+
+        assert!(second.is_err());
     }
 }

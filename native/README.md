@@ -20,10 +20,15 @@ The script builds:
 2. Copy `target/aarch64-linux-android/release/libapollos_core.so` to:
    `native/android/app/src/main/jniLibs/arm64-v8a/libapollos_core.so`
 3. Open `native/android` with Android Studio and run.
+4. In app UI, provide:
+   - backend base URL (`http://10.0.2.2:8000` for emulator)
+   - OIDC `id_token`
+5. Grant runtime permissions (camera/mic/location), then start live session.
 
 ## iOS wiring
 
 1. Build Rust iOS artifact.
 2. Link `libapollos_core.a` in Xcode.
 3. Add `ApollosCoreFFI.h` to Objective-C bridging header.
-4. Run `ApollosShell` app.
+4. Ensure `Info.plist` includes camera/mic/location usage descriptions.
+5. Run `ApollosShell` app and provide backend URL + OIDC `id_token`.
