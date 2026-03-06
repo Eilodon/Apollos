@@ -37,6 +37,7 @@ import java.time.Instant
 import java.util.UUID
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 
 data class LocationSnapshot(
     val lat: Double,
@@ -63,23 +64,25 @@ class RealtimeSessionManager(
     private var webSocket: WebSocket? = null
     private var audioJob: Job? = null
     private var running = false
+    private var wsOpen = false
+    private val lastFrameSentAtMs = AtomicLong(0L)
 
     suspend fun start(
         serverBaseUrl: String,
         idToken: String,
         onStatus: (String) -> Unit,
-    ) {
-        if (running) return
-        running = true
+    ): Boolean {
+        if (running) return true
         sessionId = UUID.randomUUID().toString()
+        wsOpen = false
 
-        val (sessionToken, wsToken) = try {
+        val (_, wsToken) = try {
             fetchAuthTokens(serverBaseUrl, idToken)
         } catch (error: Throwable) {
-            running = false
             onStatus("Auth failed: ${error.message}")
-            return
+            return false
         }
+        running = true
         onStatus("Auth OK")
 
         connectLiveSocket(serverBaseUrl, wsToken, onStatus)
@@ -88,6 +91,7 @@ class RealtimeSessionManager(
         startCamera(onStatus)
 
         onStatus("Live session started: $sessionId")
+        return true
     }
 
     suspend fun stop(onStatus: (String) -> Unit) {
@@ -96,6 +100,7 @@ class RealtimeSessionManager(
 
         webSocket?.close(1000, "client_stop")
         webSocket = null
+        wsOpen = false
 
         locationCallback?.let { callback ->
             locationClient.removeLocationUpdates(callback)
@@ -106,7 +111,11 @@ class RealtimeSessionManager(
         audioJob?.cancelAndJoin()
         audioJob = null
 
-        ProcessCameraProvider.getInstance(context).get().unbindAll()
+        runCatching {
+            ProcessCameraProvider.getInstance(context).get().unbindAll()
+        }.onFailure { error ->
+            onStatus("Camera cleanup failed: ${error.message}")
+        }
         onStatus("Stopped")
     }
 
@@ -144,6 +153,7 @@ class RealtimeSessionManager(
 
         webSocket = network.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
+                wsOpen = true
                 onStatus("WS connected")
             }
 
@@ -156,10 +166,12 @@ class RealtimeSessionManager(
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                wsOpen = false
                 onStatus("WS closed: $code")
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                wsOpen = false
                 onStatus("WS failure: ${t.message}")
             }
         })
@@ -294,6 +306,16 @@ class RealtimeSessionManager(
     }
 
     private fun sendMultimodalFrame(riskScore: Float, depthSourceCode: Int) {
+        if (!running || !wsOpen) {
+            return
+        }
+        val nowMs = SystemClock.elapsedRealtime()
+        val last = lastFrameSentAtMs.get()
+        if (nowMs - last < 200) {
+            return
+        }
+        lastFrameSentAtMs.set(nowMs)
+
         val location = latestLocation
         val sensorHealth = JSONObject()
             .put("score", if (depthSourceCode == 1) 0.95 else 0.75)
@@ -324,6 +346,9 @@ class RealtimeSessionManager(
     }
 
     private fun sendAudioChunk(audioPcm16: ByteArray) {
+        if (!running || !wsOpen) {
+            return
+        }
         val base64 = Base64.encodeToString(audioPcm16, Base64.NO_WRAP)
         val payload = JSONObject()
             .put("type", "audio_chunk")
