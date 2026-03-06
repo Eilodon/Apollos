@@ -1,6 +1,7 @@
 const HARD_STOP_THRESHOLD: f32 = 3.2;
 const HUMAN_ASSIST_THRESHOLD: f32 = 6.2;
 const HUMAN_ASSIST_SENSOR_HEALTH_THRESHOLD: f32 = 0.35;
+const SAFE_SILENCE_DEADZONE: f32 = 0.1;
 
 #[derive(Debug, Clone, Copy)]
 pub struct SafetyPolicyInput {
@@ -65,15 +66,22 @@ pub fn evaluate_safety_policy(payload: SafetyPolicyInput) -> SafetyPolicyDecisio
         hazard_score += 5.0;
     }
 
-    let haptic_intensity = (hazard_score / 4.0).clamp(0.0, 1.0);
-    let spatial_audio_pitch_hz = 440.0 + (hazard_score * 220.0).clamp(0.0, 1000.0);
+    let activation =
+        ((hazard_score - SAFE_SILENCE_DEADZONE) / (HARD_STOP_THRESHOLD + 1.0)).clamp(0.0, 1.0);
+    let haptic_intensity = activation.powf(0.75);
+    let spatial_audio_pitch_hz = if activation <= 0.0 {
+        0.0
+    } else {
+        330.0 + activation * 770.0
+    };
     let hard_stop = hazard_score > HARD_STOP_THRESHOLD || payload.edge_reflex_active;
     let human_assistance = hazard_score > HUMAN_ASSIST_THRESHOLD
         && sensor_health < HUMAN_ASSIST_SENSOR_HEALTH_THRESHOLD;
 
     let reason = format!(
-        "score={hazard_score:.2};conf={confidence:.2};distance_m={distance_m:.2};closing_speed={closing_speed:.2};sensor={sensor_health:.2};loc_uncertainty_m={loc_uncertainty:.1};edge_reflex={};pan={pan:.2}",
+        "score={hazard_score:.2};conf={confidence:.2};distance_m={distance_m:.2};closing_speed={closing_speed:.2};sensor={sensor_health:.2};loc_uncertainty_m={loc_uncertainty:.1};edge_reflex={};pan={pan:.2};silence={}",
         if payload.edge_reflex_active { "1" } else { "0" },
+        if hazard_score < SAFE_SILENCE_DEADZONE { "1" } else { "0" },
     );
 
     SafetyPolicyDecision {
@@ -120,5 +128,22 @@ mod tests {
         });
 
         assert!(decision.should_escalate_human());
+    }
+
+    #[test]
+    fn deadzone_silences_audio_and_haptic_output() {
+        let decision = evaluate_safety_policy(SafetyPolicyInput {
+            hazard_confidence: 0.01,
+            distance_m: 24.0,
+            relative_velocity_mps: 0.6,
+            bearing_x: 0.0,
+            sensor_health_score: 0.98,
+            localization_uncertainty_m: 0.2,
+            edge_reflex_active: false,
+        });
+
+        assert!(decision.hazard_score < SAFE_SILENCE_DEADZONE);
+        assert_eq!(decision.haptic_intensity, 0.0);
+        assert_eq!(decision.spatial_audio_pitch_hz, 0.0);
     }
 }

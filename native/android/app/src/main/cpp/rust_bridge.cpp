@@ -64,6 +64,18 @@ ApollosDepthHazardOutput apollos_detect_drop_ahead_rgba(
     float gyro_magnitude,
     uint64_t now_ms
 );
+ApollosDepthHazardOutput apollos_detect_drop_ahead_rgba_strided(
+    const uint8_t* rgba_ptr,
+    uintptr_t rgba_len,
+    uint32_t width,
+    uint32_t height,
+    uint32_t row_stride,
+    uint32_t pixel_stride,
+    float risk_score,
+    uint8_t carry_mode_code,
+    float gyro_magnitude,
+    uint64_t now_ms
+);
 uint64_t apollos_eskf_create(void);
 uint8_t apollos_eskf_destroy(uint64_t handle);
 uint8_t apollos_eskf_reset(uint64_t handle);
@@ -87,6 +99,16 @@ ApollosVisionOdometryOutput apollos_eskf_update_visual_odometry_rgba(
     uintptr_t rgba_len,
     uint32_t width,
     uint32_t height,
+    float dt_s
+);
+ApollosVisionOdometryOutput apollos_eskf_update_visual_odometry_rgba_strided(
+    uint64_t handle,
+    const uint8_t* rgba_ptr,
+    uintptr_t rgba_len,
+    uint32_t width,
+    uint32_t height,
+    uint32_t row_stride,
+    uint32_t pixel_stride,
     float dt_s
 );
 ApollosEskfSnapshot apollos_eskf_snapshot(uint64_t handle);
@@ -204,6 +226,59 @@ Java_com_apollos_nativeapp_RustCoreBridge_nativeDetectDropAheadRgba(
     return array;
 }
 
+JNIEXPORT jfloatArray JNICALL
+Java_com_apollos_nativeapp_RustCoreBridge_nativeDetectDropAheadRgbaBuffer(
+    JNIEnv* env,
+    jobject /* thiz */,
+    jobject rgba_buffer,
+    jint width,
+    jint height,
+    jint row_stride,
+    jint pixel_stride,
+    jfloat risk_score,
+    jbyte carry_mode_code,
+    jfloat gyro_magnitude,
+    jlong now_ms
+) {
+    if (rgba_buffer == nullptr || width <= 0 || height <= 0 || row_stride <= 0 || pixel_stride <= 0) {
+        return nullptr;
+    }
+
+    auto* bytes = static_cast<uint8_t*>(env->GetDirectBufferAddress(rgba_buffer));
+    const jlong len = env->GetDirectBufferCapacity(rgba_buffer);
+    if (bytes == nullptr || len <= 0) {
+        return nullptr;
+    }
+
+    ApollosDepthHazardOutput output = apollos_detect_drop_ahead_rgba_strided(
+        reinterpret_cast<const uint8_t*>(bytes),
+        static_cast<uintptr_t>(len),
+        static_cast<uint32_t>(width),
+        static_cast<uint32_t>(height),
+        static_cast<uint32_t>(row_stride),
+        static_cast<uint32_t>(pixel_stride),
+        static_cast<float>(risk_score),
+        static_cast<uint8_t>(carry_mode_code),
+        static_cast<float>(gyro_magnitude),
+        static_cast<uint64_t>(now_ms)
+    );
+
+    jfloat values[5] = {
+        output.detected == 0 ? 0.0f : 1.0f,
+        output.position_x,
+        output.confidence,
+        static_cast<float>(output.source_code),
+        static_cast<float>(output.distance_code),
+    };
+
+    jfloatArray array = env->NewFloatArray(5);
+    if (array == nullptr) {
+        return nullptr;
+    }
+    env->SetFloatArrayRegion(array, 0, 5, values);
+    return array;
+}
+
 JNIEXPORT jlong JNICALL
 Java_com_apollos_nativeapp_RustCoreBridge_nativeEskfCreate(
     JNIEnv* /* env */,
@@ -297,6 +372,58 @@ Java_com_apollos_nativeapp_RustCoreBridge_nativeEskfUpdateVisualOdometryRgba(
         static_cast<float>(dt_s)
     );
     env->ReleaseByteArrayElements(rgba_bytes, bytes, JNI_ABORT);
+
+    jfloat values[8] = {
+        output.applied == 0 ? 0.0f : 1.0f,
+        output.delta_x_m,
+        output.delta_y_m,
+        output.pose_x_m,
+        output.pose_y_m,
+        output.variance_m2,
+        output.optical_flow_score,
+        output.lateral_bias,
+    };
+
+    jfloatArray array = env->NewFloatArray(8);
+    if (array == nullptr) {
+        return nullptr;
+    }
+    env->SetFloatArrayRegion(array, 0, 8, values);
+    return array;
+}
+
+JNIEXPORT jfloatArray JNICALL
+Java_com_apollos_nativeapp_RustCoreBridge_nativeEskfUpdateVisualOdometryRgbaBuffer(
+    JNIEnv* env,
+    jobject /* thiz */,
+    jlong handle,
+    jobject rgba_buffer,
+    jint width,
+    jint height,
+    jint row_stride,
+    jint pixel_stride,
+    jfloat dt_s
+) {
+    if (rgba_buffer == nullptr || width <= 0 || height <= 0 || row_stride <= 0 || pixel_stride <= 0) {
+        return nullptr;
+    }
+
+    auto* bytes = static_cast<uint8_t*>(env->GetDirectBufferAddress(rgba_buffer));
+    const jlong len = env->GetDirectBufferCapacity(rgba_buffer);
+    if (bytes == nullptr || len <= 0) {
+        return nullptr;
+    }
+
+    ApollosVisionOdometryOutput output = apollos_eskf_update_visual_odometry_rgba_strided(
+        static_cast<uint64_t>(handle),
+        reinterpret_cast<const uint8_t*>(bytes),
+        static_cast<uintptr_t>(len),
+        static_cast<uint32_t>(width),
+        static_cast<uint32_t>(height),
+        static_cast<uint32_t>(row_stride),
+        static_cast<uint32_t>(pixel_stride),
+        static_cast<float>(dt_s)
+    );
 
     jfloat values[8] = {
         output.applied == 0 ? 0.0f : 1.0f,

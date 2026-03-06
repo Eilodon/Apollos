@@ -1,7 +1,10 @@
 use std::{collections::HashMap, sync::Arc};
 
 use anyhow::Context;
-use apollos_proto::contracts::{MotionState, NavigationMode};
+use apollos_proto::contracts::{
+    CloudLinkSnapshot, CognitionLayer, CognitionStateMessage, EdgeSemanticCueMessage, MotionState,
+    NavigationMode,
+};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -32,6 +35,12 @@ pub struct SessionState {
     pub degraded_reason: String,
     pub last_hazard_score: f32,
     pub last_hard_stop: bool,
+    pub cloud_link_healthy: bool,
+    pub cloud_rtt_ms: Option<f32>,
+    pub edge_cognition_available: bool,
+    pub last_edge_cue_epoch: f64,
+    pub active_cognition_layer: CognitionLayer,
+    pub cognition_reason: String,
     pub utterance_timestamps: Vec<f64>,
     pub last_persist_epoch: f64,
 }
@@ -59,6 +68,12 @@ impl SessionState {
             degraded_reason: String::new(),
             last_hazard_score: 0.0,
             last_hard_stop: false,
+            cloud_link_healthy: true,
+            cloud_rtt_ms: None,
+            edge_cognition_available: false,
+            last_edge_cue_epoch: 0.0,
+            active_cognition_layer: CognitionLayer::L3Cloud,
+            cognition_reason: "cloud_available".to_string(),
             utterance_timestamps: Vec::new(),
             last_persist_epoch: 0.0,
         }
@@ -77,6 +92,11 @@ pub struct SessionObservability {
     pub edge_hazard_type: String,
     pub last_hazard_score: f32,
     pub last_hard_stop: bool,
+    pub cloud_link_healthy: bool,
+    pub cloud_rtt_ms: Option<f32>,
+    pub edge_cognition_available: bool,
+    pub active_cognition_layer: CognitionLayer,
+    pub cognition_reason: String,
 }
 
 #[derive(Debug, Clone)]
@@ -133,6 +153,9 @@ impl Default for SessionStore {
 impl SessionStore {
     const SENSOR_HEALTH_DEGRADED_THRESHOLD: f32 = 0.55;
     const LOCALIZATION_UNCERTAINTY_DEGRADED_M: f32 = 6.0;
+    const CLOUD_RTT_DEGRADED_MS: f32 = 900.0;
+    const EDGE_COGNITION_STALE_S: f64 = 20.0;
+    const EDGE_COGNITION_RECENCY_S: f64 = 8.0;
 
     pub async fn ensure_session(&self, session_id: &str) -> SessionState {
         let mut guard = self.inner.write().await;
@@ -368,6 +391,7 @@ impl SessionStore {
             }
 
             state.degraded_mode = !state.degraded_reason.is_empty();
+            self.refresh_cognition_layer(state, now_epoch());
             state.last_seen = Utc::now();
 
             let should_persist = self.mark_persist_if_due(state, true);
@@ -379,6 +403,62 @@ impl SessionStore {
         }
 
         result
+    }
+
+    pub async fn update_cognition_signals(
+        &self,
+        session_id: &str,
+        cloud_link: Option<&CloudLinkSnapshot>,
+        edge_semantic_cues: &[EdgeSemanticCueMessage],
+    ) -> Option<CognitionStateMessage> {
+        let mut transition = None;
+        let mut guard = self.inner.write().await;
+        let state = guard
+            .entry(session_id.to_string())
+            .or_insert_with(|| SessionState::new(session_id.to_string()));
+
+        let now = now_epoch();
+
+        if let Some(link) = cloud_link {
+            let rtt_ms = link.rtt_ms.filter(|value| value.is_finite() && *value >= 0.0);
+            state.cloud_rtt_ms = rtt_ms;
+            let rtt_healthy = rtt_ms
+                .map(|value| value <= Self::CLOUD_RTT_DEGRADED_MS)
+                .unwrap_or(true);
+            state.cloud_link_healthy = link.connected && rtt_healthy;
+        }
+
+        let has_strong_edge_cue = edge_semantic_cues.iter().any(|cue| {
+            cue.confidence.is_finite()
+                && cue.confidence >= 0.55
+                && (!cue.cue_type.trim().is_empty() || cue.text.as_deref().unwrap_or("").len() > 2)
+        });
+        if has_strong_edge_cue {
+            state.edge_cognition_available = true;
+            state.last_edge_cue_epoch = now;
+        } else if state.last_edge_cue_epoch > 0.0
+            && (now - state.last_edge_cue_epoch) > Self::EDGE_COGNITION_STALE_S
+        {
+            state.edge_cognition_available = false;
+        }
+
+        let previous_layer = state.active_cognition_layer;
+        let previous_reason = state.cognition_reason.clone();
+        self.refresh_cognition_layer(state, now);
+        if previous_layer != state.active_cognition_layer || previous_reason != state.cognition_reason
+        {
+            transition = Some(CognitionStateMessage {
+                session_id: state.session_id.clone(),
+                timestamp: Utc::now().to_rfc3339(),
+                active_layer: state.active_cognition_layer,
+                cloud_link_healthy: state.cloud_link_healthy,
+                edge_cognition_available: state.edge_cognition_available,
+                cloud_rtt_ms: state.cloud_rtt_ms,
+                reason: Some(state.cognition_reason.clone()),
+            });
+        }
+
+        transition
     }
 
     pub async fn get_observability(&self, session_id: &str) -> SessionObservability {
@@ -395,6 +475,11 @@ impl SessionStore {
                 edge_hazard_type: String::new(),
                 last_hazard_score: 0.0,
                 last_hard_stop: false,
+                cloud_link_healthy: true,
+                cloud_rtt_ms: None,
+                edge_cognition_available: false,
+                active_cognition_layer: CognitionLayer::L3Cloud,
+                cognition_reason: "cloud_available".to_string(),
             };
         };
 
@@ -409,6 +494,11 @@ impl SessionStore {
             edge_hazard_type: state.edge_hazard_type.clone(),
             last_hazard_score: state.last_hazard_score,
             last_hard_stop: state.last_hard_stop,
+            cloud_link_healthy: state.cloud_link_healthy,
+            cloud_rtt_ms: state.cloud_rtt_ms,
+            edge_cognition_available: state.edge_cognition_available,
+            active_cognition_layer: state.active_cognition_layer,
+            cognition_reason: state.cognition_reason.clone(),
         }
     }
 
@@ -427,6 +517,7 @@ impl SessionStore {
             let suppress = suppress_seconds.unwrap_or(3).max(1) as f64;
             state.edge_hazard_until_epoch = now_epoch() + suppress;
             state.edge_hazard_type = hazard_type;
+            self.refresh_cognition_layer(state, now_epoch());
             state.last_seen = Utc::now();
 
             let should_persist = self.mark_persist_if_due(state, true);
@@ -637,6 +728,31 @@ impl SessionStore {
         )
     }
 
+    fn refresh_cognition_layer(&self, state: &mut SessionState, now: f64) {
+        if state.edge_hazard_until_epoch > now {
+            state.active_cognition_layer = CognitionLayer::L1Survival;
+            state.cognition_reason = "edge_hazard_active".to_string();
+            return;
+        }
+
+        let edge_recent = state.last_edge_cue_epoch > 0.0
+            && (now - state.last_edge_cue_epoch) <= Self::EDGE_COGNITION_RECENCY_S;
+        if !state.cloud_link_healthy && state.edge_cognition_available && edge_recent {
+            state.active_cognition_layer = CognitionLayer::L2Edge;
+            state.cognition_reason = "cloud_unavailable_edge_fallback".to_string();
+            return;
+        }
+
+        state.active_cognition_layer = CognitionLayer::L3Cloud;
+        state.cognition_reason = if state.cloud_link_healthy {
+            "cloud_available".to_string()
+        } else if state.edge_cognition_available {
+            "cloud_unavailable_edge_cue_stale".to_string()
+        } else {
+            "cloud_unavailable_no_edge_cues".to_string()
+        };
+    }
+
     fn mark_persist_if_due(&self, state: &mut SessionState, force: bool) -> bool {
         if self.persistence.is_none() {
             return false;
@@ -792,6 +908,12 @@ impl FirestorePersistence {
             "degraded_reason": state.degraded_reason,
             "last_hazard_score": state.last_hazard_score,
             "last_hard_stop": state.last_hard_stop,
+            "cloud_link_healthy": state.cloud_link_healthy,
+            "cloud_rtt_ms": state.cloud_rtt_ms,
+            "edge_cognition_available": state.edge_cognition_available,
+            "last_edge_cue_epoch": state.last_edge_cue_epoch,
+            "active_cognition_layer": cognition_layer_str(state.active_cognition_layer),
+            "cognition_reason": state.cognition_reason,
         });
 
         let doc_path = format!("sessions/{}", sanitize_document_id(&state.session_id));
@@ -1046,6 +1168,14 @@ fn motion_state_str(state: MotionState) -> &'static str {
     }
 }
 
+fn cognition_layer_str(layer: CognitionLayer) -> &'static str {
+    match layer {
+        CognitionLayer::L1Survival => "l1_survival",
+        CognitionLayer::L2Edge => "l2_edge",
+        CognitionLayer::L3Cloud => "l3_cloud",
+    }
+}
+
 fn distance_band_for_m(distance_m: f32) -> &'static str {
     if distance_m <= 1.5 {
         "very_close"
@@ -1171,5 +1301,64 @@ mod tests {
         assert!(event.get("hazard_score").is_some());
         assert!(event.get("hard_stop").is_some());
         assert!(event.get("distance").is_none());
+    }
+
+    #[tokio::test]
+    async fn tri_layer_switches_to_l2_when_cloud_down_and_edge_cues_recent() {
+        let store = SessionStore::default();
+        let transition = store
+            .update_cognition_signals(
+                "s6",
+                Some(&CloudLinkSnapshot {
+                    connected: false,
+                    rtt_ms: Some(1800.0),
+                    source: "test".to_string(),
+                }),
+                &[EdgeSemanticCueMessage {
+                    cue_type: "text_sign".to_string(),
+                    text: Some("Exit".to_string()),
+                    confidence: 0.82,
+                    position_x: Some(0.2),
+                    distance_m: Some(2.0),
+                    position_clock: Some("2h".to_string()),
+                    ttl_ms: Some(1200),
+                    source: "edge_vlm".to_string(),
+                }],
+            )
+            .await;
+
+        let transition = transition.expect("expected layer transition");
+        assert_eq!(transition.active_layer, CognitionLayer::L2Edge);
+    }
+
+    #[tokio::test]
+    async fn tri_layer_forces_l1_when_edge_hazard_active() {
+        let store = SessionStore::default();
+        let _ = store
+            .update_cognition_signals(
+                "s7",
+                Some(&CloudLinkSnapshot {
+                    connected: false,
+                    rtt_ms: Some(2000.0),
+                    source: "test".to_string(),
+                }),
+                &[EdgeSemanticCueMessage {
+                    cue_type: "object".to_string(),
+                    text: Some("pole".to_string()),
+                    confidence: 0.73,
+                    position_x: Some(-0.1),
+                    distance_m: Some(1.9),
+                    position_clock: Some("11h".to_string()),
+                    ttl_ms: Some(1000),
+                    source: "edge_vlm".to_string(),
+                }],
+            )
+            .await;
+        let _ = store
+            .mark_edge_hazard("s7", "DROP_AHEAD".to_string(), Some(4))
+            .await;
+
+        let observability = store.get_observability("s7").await;
+        assert_eq!(observability.active_cognition_layer, CognitionLayer::L1Survival);
     }
 }

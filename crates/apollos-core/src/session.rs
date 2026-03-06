@@ -39,6 +39,8 @@ impl SessionState {
             location_age_ms: None,
             sensor_health: self.sensor_health.clone(),
             sensor_uncertainty: None,
+            cloud_link: None,
+            edge_semantic_cues: Vec::new(),
         })
     }
 }

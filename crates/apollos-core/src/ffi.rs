@@ -29,7 +29,7 @@ pub struct FfiAbiVersion {
 
 pub const ABI_VERSION: FfiAbiVersion = FfiAbiVersion {
     major: 0,
-    minor: 5,
+    minor: 6,
     patch: 0,
 };
 
@@ -370,6 +370,140 @@ fn invalid_vision_odometry_output() -> ApollosVisionOdometryOutput {
     }
 }
 
+fn invalid_depth_hazard_output() -> ApollosDepthHazardOutput {
+    ApollosDepthHazardOutput {
+        detected: 0,
+        position_x: 0.0,
+        confidence: 0.0,
+        source_code: 0,
+        distance_code: 0,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PixelLayout {
+    Rgba,
+    Bgra,
+}
+
+fn update_visual_odometry_from_frame(
+    handle: u64,
+    frame: LumaFrame,
+    dt_s: f32,
+) -> ApollosVisionOdometryOutput {
+    if handle == 0 || !dt_s.is_finite() {
+        return invalid_vision_odometry_output();
+    }
+
+    let Ok(mut guard) = ESKF_ENGINES.lock() else {
+        return invalid_vision_odometry_output();
+    };
+    let Some(shared) = guard.get_mut(&handle) else {
+        return invalid_vision_odometry_output();
+    };
+
+    let Some(measurement) = shared.vision_odometry.ingest_frame(frame, dt_s) else {
+        return invalid_vision_odometry_output();
+    };
+
+    let applied = shared.engine.update_vision_with_variance(
+        Vector3::new(measurement.pose_x_m, measurement.pose_y_m, 0.0),
+        measurement.variance_m2,
+    );
+
+    ApollosVisionOdometryOutput {
+        applied: u8::from(applied),
+        delta_x_m: measurement.delta_x_m,
+        delta_y_m: measurement.delta_y_m,
+        pose_x_m: measurement.pose_x_m,
+        pose_y_m: measurement.pose_y_m,
+        variance_m2: measurement.variance_m2,
+        optical_flow_score: measurement.optical_flow_score,
+        lateral_bias: measurement.lateral_bias,
+    }
+}
+
+fn detect_drop_ahead_from_frame(
+    frame: LumaFrame,
+    risk_score: f32,
+    carry_mode_code: u8,
+    gyro_magnitude: f32,
+    now_ms: u64,
+) -> ApollosDepthHazardOutput {
+    let Ok(mut guard) = DEPTH_ENGINE.lock() else {
+        return invalid_depth_hazard_output();
+    };
+
+    if !guard.onnx_probe_done {
+        let _ = guard.engine.try_enable_onnx_from_env();
+        guard.onnx_probe_done = true;
+    }
+
+    let hazard = guard.engine.process(
+        &frame,
+        risk_score,
+        carry_mode_from_code(carry_mode_code),
+        gyro_magnitude,
+        now_ms,
+    );
+
+    let Some(hazard) = hazard else {
+        return invalid_depth_hazard_output();
+    };
+
+    ApollosDepthHazardOutput {
+        detected: 1,
+        position_x: hazard.position_x,
+        confidence: hazard.confidence,
+        source_code: match hazard.source {
+            DepthSource::Onnx => 1,
+            DepthSource::Heuristic => 0,
+        },
+        distance_code: match hazard.distance {
+            DistanceCategory::VeryClose => 0,
+            DistanceCategory::Mid => 1,
+            DistanceCategory::Far => 2,
+        },
+    }
+}
+
+unsafe fn frame_from_strided_ptr(
+    rgba_ptr: *const u8,
+    rgba_len: usize,
+    width: usize,
+    height: usize,
+    row_stride: usize,
+    pixel_stride: usize,
+    layout: PixelLayout,
+) -> Option<LumaFrame> {
+    if rgba_ptr.is_null() || width == 0 || height == 0 {
+        return None;
+    }
+
+    let min_row_stride = width.checked_mul(pixel_stride)?;
+    if row_stride < min_row_stride || pixel_stride < 3 {
+        return None;
+    }
+
+    let required_len = row_stride.checked_mul(height)?;
+    if rgba_len < required_len {
+        return None;
+    }
+
+    // SAFETY:
+    // - caller guarantees `rgba_ptr` points to at least `required_len` readable bytes.
+    // - pointer non-null and bounds checked above.
+    let buffer = unsafe { std::slice::from_raw_parts(rgba_ptr, required_len) };
+    match layout {
+        PixelLayout::Rgba => {
+            LumaFrame::from_rgba_strided(width, height, buffer, row_stride, pixel_stride)
+        }
+        PixelLayout::Bgra => {
+            LumaFrame::from_bgra_strided(width, height, buffer, row_stride, pixel_stride)
+        }
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn apollos_eskf_predict_imu(
     handle: u64,
@@ -441,57 +575,90 @@ pub unsafe extern "C" fn apollos_eskf_update_visual_odometry_rgba(
     height: u32,
     dt_s: f32,
 ) -> ApollosVisionOdometryOutput {
-    if handle == 0 || rgba_ptr.is_null() || !dt_s.is_finite() {
-        return invalid_vision_odometry_output();
+    // SAFETY:
+    // - contiguous RGBA is a special case of strided RGBA with row_stride=width*4 and pixel_stride=4.
+    unsafe {
+        apollos_eskf_update_visual_odometry_rgba_strided(
+            handle,
+            rgba_ptr,
+            rgba_len,
+            width,
+            height,
+            width.saturating_mul(4),
+            4,
+            dt_s,
+        )
     }
+}
 
-    let width = width as usize;
-    let height = height as usize;
-    let Some(expected_len) = width
-        .checked_mul(height)
-        .and_then(|value| value.checked_mul(4))
-    else {
-        return invalid_vision_odometry_output();
-    };
-
-    if width == 0 || height == 0 || rgba_len < expected_len {
+#[no_mangle]
+pub unsafe extern "C" fn apollos_eskf_update_visual_odometry_rgba_strided(
+    handle: u64,
+    rgba_ptr: *const u8,
+    rgba_len: usize,
+    width: u32,
+    height: u32,
+    row_stride: u32,
+    pixel_stride: u32,
+    dt_s: f32,
+) -> ApollosVisionOdometryOutput {
+    if handle == 0 || !dt_s.is_finite() {
         return invalid_vision_odometry_output();
     }
 
     // SAFETY:
-    // - caller guarantees rgba_ptr points to at least `expected_len` readable bytes.
-    // - pointer is checked for null and bounds are verified above.
-    let rgba = unsafe { std::slice::from_raw_parts(rgba_ptr, expected_len) };
-    let Some(frame) = LumaFrame::from_rgba(width, height, rgba) else {
+    // - caller guarantees pointer/length validity for this call.
+    let frame = unsafe {
+        frame_from_strided_ptr(
+            rgba_ptr,
+            rgba_len,
+            width as usize,
+            height as usize,
+            row_stride as usize,
+            pixel_stride as usize,
+            PixelLayout::Rgba,
+        )
+    };
+    let Some(frame) = frame else {
         return invalid_vision_odometry_output();
     };
 
-    let Ok(mut guard) = ESKF_ENGINES.lock() else {
-        return invalid_vision_odometry_output();
-    };
-    let Some(shared) = guard.get_mut(&handle) else {
-        return invalid_vision_odometry_output();
-    };
+    update_visual_odometry_from_frame(handle, frame, dt_s)
+}
 
-    let Some(measurement) = shared.vision_odometry.ingest_frame(frame, dt_s) else {
+#[no_mangle]
+pub unsafe extern "C" fn apollos_eskf_update_visual_odometry_bgra_strided(
+    handle: u64,
+    bgra_ptr: *const u8,
+    bgra_len: usize,
+    width: u32,
+    height: u32,
+    row_stride: u32,
+    pixel_stride: u32,
+    dt_s: f32,
+) -> ApollosVisionOdometryOutput {
+    if handle == 0 || !dt_s.is_finite() {
         return invalid_vision_odometry_output();
-    };
-
-    let applied = shared.engine.update_vision_with_variance(
-        Vector3::new(measurement.pose_x_m, measurement.pose_y_m, 0.0),
-        measurement.variance_m2,
-    );
-
-    ApollosVisionOdometryOutput {
-        applied: u8::from(applied),
-        delta_x_m: measurement.delta_x_m,
-        delta_y_m: measurement.delta_y_m,
-        pose_x_m: measurement.pose_x_m,
-        pose_y_m: measurement.pose_y_m,
-        variance_m2: measurement.variance_m2,
-        optical_flow_score: measurement.optical_flow_score,
-        lateral_bias: measurement.lateral_bias,
     }
+
+    // SAFETY:
+    // - caller guarantees pointer/length validity for this call.
+    let frame = unsafe {
+        frame_from_strided_ptr(
+            bgra_ptr,
+            bgra_len,
+            width as usize,
+            height as usize,
+            row_stride as usize,
+            pixel_stride as usize,
+            PixelLayout::Bgra,
+        )
+    };
+    let Some(frame) = frame else {
+        return invalid_vision_odometry_output();
+    };
+
+    update_visual_odometry_from_frame(handle, frame, dt_s)
 }
 
 #[no_mangle]
@@ -539,102 +706,98 @@ pub unsafe extern "C" fn apollos_detect_drop_ahead_rgba(
     gyro_magnitude: f32,
     now_ms: u64,
 ) -> ApollosDepthHazardOutput {
-    if rgba_ptr.is_null() {
-        return ApollosDepthHazardOutput {
-            detected: 0,
-            position_x: 0.0,
-            confidence: 0.0,
-            source_code: 0,
-            distance_code: 0,
-        };
-    }
-
-    let width = width as usize;
-    let height = height as usize;
-    let Some(expected_len) = width
-        .checked_mul(height)
-        .and_then(|value| value.checked_mul(4))
-    else {
-        return ApollosDepthHazardOutput {
-            detected: 0,
-            position_x: 0.0,
-            confidence: 0.0,
-            source_code: 0,
-            distance_code: 0,
-        };
-    };
-    if rgba_len < expected_len || width == 0 || height == 0 {
-        return ApollosDepthHazardOutput {
-            detected: 0,
-            position_x: 0.0,
-            confidence: 0.0,
-            source_code: 0,
-            distance_code: 0,
-        };
-    }
-
     // SAFETY:
-    // - caller guarantees rgba_ptr points to readable memory.
-    // - expected_len is validated against width/height with checked arithmetic.
-    // - function returns early when pointer is null or buffer length is insufficient.
-    let rgba = std::slice::from_raw_parts(rgba_ptr, expected_len);
-    let Some(frame) = LumaFrame::from_rgba(width, height, rgba) else {
-        return ApollosDepthHazardOutput {
-            detected: 0,
-            position_x: 0.0,
-            confidence: 0.0,
-            source_code: 0,
-            distance_code: 0,
-        };
-    };
-
-    let Ok(mut guard) = DEPTH_ENGINE.lock() else {
-        return ApollosDepthHazardOutput {
-            detected: 0,
-            position_x: 0.0,
-            confidence: 0.0,
-            source_code: 0,
-            distance_code: 0,
-        };
-    };
-
-    if !guard.onnx_probe_done {
-        let _ = guard.engine.try_enable_onnx_from_env();
-        guard.onnx_probe_done = true;
+    // - contiguous RGBA is a special case of strided RGBA with row_stride=width*4 and pixel_stride=4.
+    unsafe {
+        apollos_detect_drop_ahead_rgba_strided(
+            rgba_ptr,
+            rgba_len,
+            width,
+            height,
+            width.saturating_mul(4),
+            4,
+            risk_score,
+            carry_mode_code,
+            gyro_magnitude,
+            now_ms,
+        )
     }
+}
 
-    let hazard = guard.engine.process(
-        &frame,
-        risk_score,
-        carry_mode_from_code(carry_mode_code),
-        gyro_magnitude,
-        now_ms,
-    );
-
-    let Some(hazard) = hazard else {
-        return ApollosDepthHazardOutput {
-            detected: 0,
-            position_x: 0.0,
-            confidence: 0.0,
-            source_code: 0,
-            distance_code: 0,
-        };
+#[no_mangle]
+/// Runs depth hazard detection on a strided RGBA frame.
+///
+/// # Safety
+/// - `rgba_ptr` must point to at least `row_stride * height` readable bytes.
+/// - pointer must remain valid for this call.
+pub unsafe extern "C" fn apollos_detect_drop_ahead_rgba_strided(
+    rgba_ptr: *const u8,
+    rgba_len: usize,
+    width: u32,
+    height: u32,
+    row_stride: u32,
+    pixel_stride: u32,
+    risk_score: f32,
+    carry_mode_code: u8,
+    gyro_magnitude: f32,
+    now_ms: u64,
+) -> ApollosDepthHazardOutput {
+    // SAFETY:
+    // - caller guarantees pointer/length validity for this call.
+    let frame = unsafe {
+        frame_from_strided_ptr(
+            rgba_ptr,
+            rgba_len,
+            width as usize,
+            height as usize,
+            row_stride as usize,
+            pixel_stride as usize,
+            PixelLayout::Rgba,
+        )
+    };
+    let Some(frame) = frame else {
+        return invalid_depth_hazard_output();
     };
 
-    ApollosDepthHazardOutput {
-        detected: 1,
-        position_x: hazard.position_x,
-        confidence: hazard.confidence,
-        source_code: match hazard.source {
-            DepthSource::Onnx => 1,
-            DepthSource::Heuristic => 0,
-        },
-        distance_code: match hazard.distance {
-            DistanceCategory::VeryClose => 0,
-            DistanceCategory::Mid => 1,
-            DistanceCategory::Far => 2,
-        },
-    }
+    detect_drop_ahead_from_frame(frame, risk_score, carry_mode_code, gyro_magnitude, now_ms)
+}
+
+#[no_mangle]
+/// Runs depth hazard detection on a strided BGRA frame.
+///
+/// # Safety
+/// - `bgra_ptr` must point to at least `row_stride * height` readable bytes.
+/// - pointer must remain valid for this call.
+pub unsafe extern "C" fn apollos_detect_drop_ahead_bgra_strided(
+    bgra_ptr: *const u8,
+    bgra_len: usize,
+    width: u32,
+    height: u32,
+    row_stride: u32,
+    pixel_stride: u32,
+    risk_score: f32,
+    carry_mode_code: u8,
+    gyro_magnitude: f32,
+    now_ms: u64,
+) -> ApollosDepthHazardOutput {
+    // SAFETY:
+    // - caller guarantees pointer/length validity for this call.
+    let frame = unsafe {
+        frame_from_strided_ptr(
+            bgra_ptr,
+            bgra_len,
+            width as usize,
+            height as usize,
+            row_stride as usize,
+            pixel_stride as usize,
+            PixelLayout::Bgra,
+        )
+    };
+    let Some(frame) = frame else {
+        return invalid_depth_hazard_output();
+    };
+
+    detect_drop_ahead_from_frame(frame, risk_score, carry_mode_code, gyro_magnitude, now_ms)
 }
 
 fn motion_state_from_code(value: u8) -> MotionState {
@@ -662,7 +825,7 @@ mod tests {
     #[test]
     fn abi_version_packs_into_u32() {
         let packed = apollos_abi_version_u32();
-        assert_eq!(packed, 0x0000_0500);
+        assert_eq!(packed, 0x0000_0600);
     }
 
     #[test]
@@ -760,6 +923,69 @@ mod tests {
         };
         assert!(second.optical_flow_score > 0.0);
         assert!(second.pose_y_m >= 0.0);
+        assert!(second.variance_m2.is_finite());
+
+        assert_eq!(apollos_eskf_destroy(handle), 1);
+    }
+
+    #[test]
+    fn eskf_visual_odometry_accepts_bgra_strided_buffer() {
+        let handle = apollos_eskf_create();
+        assert_ne!(handle, 0);
+
+        let width = 8_u32;
+        let height = 4_u32;
+        let row_stride = (width as usize) * 4 + 8;
+        let mut frame_a = vec![0_u8; row_stride * (height as usize)];
+        let mut frame_b = vec![0_u8; row_stride * (height as usize)];
+
+        for y in 0..height as usize {
+            let row_a = &mut frame_a[y * row_stride..(y + 1) * row_stride];
+            let row_b = &mut frame_b[y * row_stride..(y + 1) * row_stride];
+            for x in 0..width as usize {
+                let off = x * 4;
+                // BGRA
+                row_a[off] = 24;
+                row_a[off + 1] = 24;
+                row_a[off + 2] = 24;
+                row_a[off + 3] = 255;
+
+                row_b[off] = 120;
+                row_b[off + 1] = 120;
+                row_b[off + 2] = 120;
+                row_b[off + 3] = 255;
+            }
+        }
+
+        // SAFETY: buffers are valid and live for call duration.
+        let first = unsafe {
+            apollos_eskf_update_visual_odometry_bgra_strided(
+                handle,
+                frame_a.as_ptr(),
+                frame_a.len(),
+                width,
+                height,
+                row_stride as u32,
+                4,
+                0.033,
+            )
+        };
+        assert_eq!(first.applied, 0);
+
+        // SAFETY: buffers are valid and live for call duration.
+        let second = unsafe {
+            apollos_eskf_update_visual_odometry_bgra_strided(
+                handle,
+                frame_b.as_ptr(),
+                frame_b.len(),
+                width,
+                height,
+                row_stride as u32,
+                4,
+                0.033,
+            )
+        };
+        assert!(second.optical_flow_score >= 0.0);
         assert!(second.variance_m2.is_finite());
 
         assert_eq!(apollos_eskf_destroy(handle), 1);

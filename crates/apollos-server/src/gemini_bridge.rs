@@ -6,8 +6,8 @@ use std::{
 use anyhow::Context;
 use apollos_proto::contracts::{
     AssistantAudioMessage, AssistantTextMessage, BackendToClientMessage, ConnectionState,
-    ConnectionStateMessage, HumanHelpSessionMessage, NavigationMode, SafetyDirectiveMessage,
-    SemanticCue, SemanticCueMessage,
+    ConnectionStateMessage, CognitionLayer, HumanHelpSessionMessage, NavigationMode,
+    SafetyDirectiveMessage, SemanticCue, SemanticCueMessage,
 };
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
@@ -178,6 +178,13 @@ impl GeminiBridge {
 
         let mode = state.sessions.get_effective_mode(&frame.session_id).await;
         let observability = state.sessions.get_observability(&frame.session_id).await;
+        if observability.active_cognition_layer == CognitionLayer::L2Edge {
+            tracing::info!(
+                session_id = %frame.session_id,
+                "skip forwarding frame to cloud because edge cognition layer is active"
+            );
+            return Ok(());
+        }
         let motion_hint = format!(
             "[KINEMATIC: motion={:?}; pitch={:.1}; velocity={:.2}; mode={:?}; sensor_health={:.2}; degraded={}]",
             frame.motion_state,
@@ -267,9 +274,10 @@ impl GeminiBridge {
 
         handle
             .control_tx
-            .try_send(LiveControl::Interrupt {
+            .send(LiveControl::Interrupt {
                 reason: reason.trim().to_string(),
             })
+            .await
             .is_ok()
     }
 
@@ -500,7 +508,15 @@ impl LiveSessionRunner {
                                 "dual_interrupt_triggered"
                             );
                             let payload = build_interrupt_payload(&reason);
-                            send_ws_json(&mut socket, &payload).await?;
+                            if let Err(error) = send_ws_json(&mut socket, &payload).await {
+                                tracing::warn!(
+                                    session_id = %self.session_id,
+                                    error = %error,
+                                    "failed to send interrupt payload before hard-close"
+                                );
+                            }
+                            let _ = socket.close(None).await;
+                            return Ok(());
                         }
                         LiveControl::Close => {
                             let _ = socket.close(None).await;
@@ -589,34 +605,43 @@ impl LiveSessionRunner {
         control_tx: mpsc::Sender<LiveControl>,
         payload: &Value,
     ) -> anyhow::Result<()> {
-        for text in extract_texts(payload) {
-            let _ = self
-                .ws_registry
-                .send_live(
-                    &self.session_id,
-                    BackendToClientMessage::AssistantText(AssistantTextMessage {
-                        session_id: self.session_id.clone(),
-                        timestamp: Utc::now().to_rfc3339(),
-                        text,
-                    }),
-                )
-                .await;
-        }
+        let edge_hazard_active = self.sessions.is_edge_hazard_active(&self.session_id).await;
+        if !edge_hazard_active {
+            for text in extract_texts(payload) {
+                let _ = self
+                    .ws_registry
+                    .send_live(
+                        &self.session_id,
+                        BackendToClientMessage::AssistantText(AssistantTextMessage {
+                            session_id: self.session_id.clone(),
+                            timestamp: Utc::now().to_rfc3339(),
+                            text,
+                        }),
+                    )
+                    .await;
+            }
 
-        for chunk in extract_audio_chunks(payload) {
-            let _ = self
-                .ws_registry
-                .send_live(
-                    &self.session_id,
-                    BackendToClientMessage::AssistantAudio(AssistantAudioMessage {
-                        session_id: self.session_id.clone(),
-                        timestamp: Utc::now().to_rfc3339(),
-                        pcm24: None,
-                        pcm16: Some(chunk),
-                        hazard_position_x: None,
-                    }),
-                )
-                .await;
+            for chunk in extract_audio_chunks(payload) {
+                let _ = self
+                    .ws_registry
+                    .send_live(
+                        &self.session_id,
+                        BackendToClientMessage::AssistantAudio(AssistantAudioMessage {
+                            session_id: self.session_id.clone(),
+                            timestamp: Utc::now().to_rfc3339(),
+                            pcm24: None,
+                            pcm16: Some(chunk),
+                            hazard_position_x: None,
+                        }),
+                    )
+                    .await;
+            }
+        } else if payload.get("serverContent").is_some() || payload.get("server_content").is_some()
+        {
+            tracing::debug!(
+                session_id = %self.session_id,
+                "suppressed assistant output while edge hazard window is active"
+            );
         }
 
         let tool_calls = extract_tool_calls(payload);

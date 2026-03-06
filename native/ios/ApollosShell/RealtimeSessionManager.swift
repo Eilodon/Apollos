@@ -1,4 +1,5 @@
 import AVFoundation
+import AudioToolbox
 import Combine
 import CoreLocation
 import CoreMotion
@@ -26,6 +27,8 @@ private struct WsTicketResponse: Decodable {
 }
 
 final class RealtimeSessionManager: NSObject, ObservableObject {
+    private let safetyDeadzoneScore: Float = 0.1
+
     @Published private(set) var isRunning: Bool = false
     @Published private(set) var logs: [String] = []
     @Published private(set) var permissions = NativePermissionStatus(
@@ -60,6 +63,10 @@ final class RealtimeSessionManager: NSObject, ObservableObject {
     private var latestVoVarianceM2: Float = 999.0
     private var latestVoPoseXM: Float = 0.0
     private var latestVoPoseYM: Float = 0.0
+    private let safetyActuatorLock = NSLock()
+    private var safetyToneEngine: AVAudioEngine?
+    private var safetyToneNode: AVAudioPlayerNode?
+    private var latestSafetyDirectiveAt: TimeInterval = 0
 
     private var audioEngine: AVAudioEngine?
 
@@ -140,6 +147,7 @@ final class RealtimeSessionManager: NSObject, ObservableObject {
                 latestVoVarianceM2 = 999.0
                 latestVoPoseXM = 0.0
                 latestVoPoseYM = 0.0
+                latestSafetyDirectiveAt = 0
 
                 connectWebSocket(serverBaseURL: trimmedURL, wsToken: wsToken)
                 startLocation()
@@ -181,6 +189,7 @@ final class RealtimeSessionManager: NSObject, ObservableObject {
         latestVoVarianceM2 = 999.0
         latestVoPoseXM = 0.0
         latestVoPoseYM = 0.0
+        latestSafetyDirectiveAt = 0
         if eskfHandle != 0 {
             _ = RustCoreBridge.eskfDestroy(handle: eskfHandle)
             eskfHandle = 0
@@ -196,6 +205,7 @@ final class RealtimeSessionManager: NSObject, ObservableObject {
             engine.stop()
         }
         audioEngine = nil
+        stopSafetyActuator()
 
         appendLog("Stopped")
     }
@@ -248,7 +258,7 @@ final class RealtimeSessionManager: NSObject, ObservableObject {
             case .success(let message):
                 switch message {
                 case .string(let text):
-                    self.appendLog("WS message: \(String(text.prefix(120)))")
+                    self.handleServerMessage(text)
                 case .data(let data):
                     self.appendLog("WS binary message: \(data.count) bytes")
                 @unknown default:
@@ -262,6 +272,147 @@ final class RealtimeSessionManager: NSObject, ObservableObject {
                 self.stop()
             }
         }
+    }
+
+    private func handleServerMessage(_ text: String) {
+        guard
+            let data = text.data(using: .utf8),
+            let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else {
+            appendLog("WS non-json message: \(String(text.prefix(80)))")
+            return
+        }
+
+        let type = (payload["type"] as? String) ?? ""
+        switch type {
+        case "safety_directive":
+            applySafetyDirective(payload)
+        case "connection_state":
+            let detail = (payload["detail"] as? String) ?? "state_update"
+            appendLog("WS state: \(detail)")
+        case "cognition_state":
+            let layer = (payload["active_layer"] as? String) ?? "unknown_layer"
+            let reason = (payload["reason"] as? String) ?? "no_reason"
+            appendLog("WS cognition: \(layer) (\(reason))")
+        default:
+            appendLog("WS message: \(String(text.prefix(120)))")
+        }
+    }
+
+    private func applySafetyDirective(_ payload: [String: Any]) {
+        let hazardScore = Float(payload["hazard_score"] as? Double ?? 0.0)
+        let hardStop = payload["hard_stop"] as? Bool ?? false
+        let hapticIntensity = max(
+            0.0,
+            min(1.0, Float(payload["haptic_intensity"] as? Double ?? 0.0))
+        )
+        let pitchHz = Float(payload["spatial_audio_pitch_hz"] as? Double ?? 0.0)
+
+        let now = Date().timeIntervalSince1970
+        if (now - latestSafetyDirectiveAt) < 0.06 {
+            return
+        }
+        latestSafetyDirectiveAt = now
+
+        if hazardScore < safetyDeadzoneScore || hapticIntensity <= 0 || pitchHz <= 0 {
+            stopSafetyActuator()
+            return
+        }
+
+        let durationMs = hardStop ? 220 : 90
+        let gain = max(0.08, min(1.0, hapticIntensity))
+        playSafetyTone(frequencyHz: pitchHz, gain: gain, durationMs: durationMs)
+        triggerSafetyHaptic()
+    }
+
+    private func ensureSafetyToneEngine() -> (AVAudioEngine, AVAudioPlayerNode)? {
+        safetyActuatorLock.lock()
+        defer { safetyActuatorLock.unlock() }
+
+        if let existingEngine = safetyToneEngine, let existingNode = safetyToneNode {
+            return (existingEngine, existingNode)
+        }
+
+        do {
+            let session = AVAudioSession.sharedInstance()
+            try session.setCategory(
+                .playAndRecord,
+                mode: .voiceChat,
+                options: [.defaultToSpeaker, .allowBluetooth]
+            )
+            try session.setActive(true)
+        } catch {
+            appendLog("Safety audio session failed: \(error.localizedDescription)")
+            return nil
+        }
+
+        let engine = AVAudioEngine()
+        let node = AVAudioPlayerNode()
+        guard let format = AVAudioFormat(standardFormatWithSampleRate: 16_000, channels: 1) else {
+            appendLog("Safety audio format unavailable")
+            return nil
+        }
+
+        engine.attach(node)
+        engine.connect(node, to: engine.mainMixerNode, format: format)
+        do {
+            try engine.start()
+        } catch {
+            appendLog("Safety audio engine failed: \(error.localizedDescription)")
+            return nil
+        }
+
+        safetyToneEngine = engine
+        safetyToneNode = node
+        return (engine, node)
+    }
+
+    private func playSafetyTone(frequencyHz: Float, gain: Float, durationMs: Int) {
+        guard let (_, node) = ensureSafetyToneEngine() else {
+            return
+        }
+        guard let format = AVAudioFormat(standardFormatWithSampleRate: 16_000, channels: 1) else {
+            return
+        }
+
+        let sampleCount = max(1, (16_000 * durationMs) / 1000)
+        guard
+            let buffer = AVAudioPCMBuffer(
+                pcmFormat: format,
+                frameCapacity: AVAudioFrameCount(sampleCount)
+            ),
+            let channelData = buffer.floatChannelData?[0]
+        else {
+            return
+        }
+
+        buffer.frameLength = AVAudioFrameCount(sampleCount)
+        let step = (2.0 * Float.pi * frequencyHz) / 16_000.0
+        var phase: Float = 0.0
+        for idx in 0..<sampleCount {
+            let envelope = 1.0 - (Float(idx) / Float(sampleCount))
+            channelData[idx] = sinf(phase) * gain * envelope
+            phase += step
+        }
+
+        safetyActuatorLock.lock()
+        node.stop()
+        node.scheduleBuffer(buffer, at: nil, options: [])
+        node.play()
+        safetyActuatorLock.unlock()
+    }
+
+    private func triggerSafetyHaptic() {
+        AudioServicesPlaySystemSound(kSystemSoundID_Vibrate)
+    }
+
+    private func stopSafetyActuator() {
+        safetyActuatorLock.lock()
+        safetyToneNode?.stop()
+        safetyToneEngine?.stop()
+        safetyToneNode = nil
+        safetyToneEngine = nil
+        safetyActuatorLock.unlock()
     }
 
     private func startLocation() {
@@ -430,7 +581,7 @@ final class RealtimeSessionManager: NSObject, ObservableObject {
         }
     }
 
-    private func sendMultimodalFrame(riskScore: Float, depthSourceCode: UInt8) {
+    private func sendMultimodalFrame(riskScore: Float, depth: IOSDepthHazardResult) {
         guard isRunning else {
             return
         }
@@ -454,7 +605,7 @@ final class RealtimeSessionManager: NSObject, ObservableObject {
         if eskf.localizationUncertaintyM > 6.0 {
             healthFlags.append("localization_uncertain")
         }
-        if depthSourceCode != 1 {
+        if depth.sourceCode != 1 {
             healthFlags.append("depth_heuristic_fallback")
         }
         if !latestVoApplied {
@@ -469,6 +620,12 @@ final class RealtimeSessionManager: NSObject, ObservableObject {
             "pose_x_m": latestVoPoseXM,
             "pose_y_m": latestVoPoseYM,
         ]
+        let cloudLink: [String: Any] = [
+            "connected": wsTask != nil,
+            "rtt_ms": NSNull(),
+            "source": "ios-live-ws-v1",
+        ]
+        let edgeSemanticCues = buildEdgeSemanticCues(depth: depth)
 
         let payload: [String: Any?] = [
             "type": "multimodal_frame",
@@ -503,9 +660,48 @@ final class RealtimeSessionManager: NSObject, ObservableObject {
                 "source": "ios-eskf-runtime-v3",
             ],
             "vision_odometry": visionOdometry,
+            "cloud_link": cloudLink,
+            "edge_semantic_cues": edgeSemanticCues,
         ]
 
         sendJSON(payload)
+    }
+
+    private func buildEdgeSemanticCues(depth: IOSDepthHazardResult) -> [[String: Any]] {
+        guard depth.detected else {
+            return []
+        }
+
+        let distanceM: Float
+        switch depth.distanceCode {
+        case 0:
+            distanceM = 1.0
+        case 1:
+            distanceM = 2.5
+        case 2:
+            distanceM = 4.5
+        default:
+            distanceM = 3.0
+        }
+
+        return [[
+            "cue_type": "drop_ahead",
+            "text": "Drop ahead",
+            "confidence": max(0.0, min(1.0, depth.confidence)),
+            "position_x": max(-1.0, min(1.0, depth.positionX)),
+            "distance_m": distanceM,
+            "position_clock": clockFaceFromPositionX(depth.positionX),
+            "ttl_ms": 1200,
+            "source": depth.sourceCode == 1 ? "edge_depth_onnx" : "edge_depth_heuristic",
+        ]]
+    }
+
+    private func clockFaceFromPositionX(_ positionX: Float) -> String {
+        if positionX <= -0.6 { return "10h" }
+        if positionX <= -0.25 { return "11h" }
+        if positionX < 0.25 { return "12h" }
+        if positionX < 0.6 { return "1h" }
+        return "2h"
     }
 
     private func sendAudioChunk(_ pcm16: Data) {
@@ -717,22 +913,7 @@ extension RealtimeSessionManager: AVCaptureVideoDataOutputSampleBufferDelegate {
         guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else {
             return
         }
-
-        let src = baseAddress.assumingMemoryBound(to: UInt8.self)
-        var rgba = [UInt8](repeating: 0, count: width * height * 4)
-
-        for y in 0..<height {
-            let srcRow = src.advanced(by: y * bytesPerRow)
-            for x in 0..<width {
-                let srcOffset = x * 4
-                let dstOffset = (y * width + x) * 4
-                // Convert BGRA -> RGBA expected by Rust FFI.
-                rgba[dstOffset] = srcRow[srcOffset + 2]
-                rgba[dstOffset + 1] = srcRow[srcOffset + 1]
-                rgba[dstOffset + 2] = srcRow[srcOffset]
-                rgba[dstOffset + 3] = srcRow[srcOffset + 3]
-            }
-        }
+        let bufferLen = bytesPerRow * height
 
         let frameTimestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer).seconds
         let currentTimestamp = frameTimestamp.isFinite ? frameTimestamp : Date().timeIntervalSince1970
@@ -744,11 +925,14 @@ extension RealtimeSessionManager: AVCaptureVideoDataOutputSampleBufferDelegate {
         }
         lastCameraFrameTimestampS = currentTimestamp
 
-        let vo = RustCoreBridge.eskfUpdateVisualOdometryRgba(
+        let vo = RustCoreBridge.eskfUpdateVisualOdometryBgraStrided(
             handle: eskfHandle,
-            rgba: rgba,
+            baseAddress: baseAddress,
+            bufferLen: bufferLen,
             width: UInt32(width),
             height: UInt32(height),
+            rowStride: UInt32(bytesPerRow),
+            pixelStride: 4,
             dtS: dtS
         )
         latestVoApplied = vo.applied
@@ -758,10 +942,13 @@ extension RealtimeSessionManager: AVCaptureVideoDataOutputSampleBufferDelegate {
         latestVoPoseYM = vo.poseYM
 
         let kinematic = RustCoreBridge.analyzeDefaultWalkingFrame()
-        let depth = RustCoreBridge.detectDropAheadRgba(
-            rgba: rgba,
+        let depth = RustCoreBridge.detectDropAheadBgraStrided(
+            baseAddress: baseAddress,
+            bufferLen: bufferLen,
             width: UInt32(width),
             height: UInt32(height),
+            rowStride: UInt32(bytesPerRow),
+            pixelStride: 4,
             riskScore: kinematic.riskScore,
             carryModeCode: 1,
             gyroMagnitude: currentGyroMagnitudeDeg(),
@@ -770,6 +957,6 @@ extension RealtimeSessionManager: AVCaptureVideoDataOutputSampleBufferDelegate {
         if depth.detected {
             sendHazardObservation(depth: depth, riskScore: kinematic.riskScore)
         }
-        sendMultimodalFrame(riskScore: kinematic.riskScore, depthSourceCode: depth.sourceCode)
+        sendMultimodalFrame(riskScore: kinematic.riskScore, depth: depth)
     }
 }

@@ -39,6 +39,25 @@ message MultimodalFrameMessage {
   optional uint64 location_age_ms = 15;
   optional apollos.types.v1.SensorHealthSnapshot sensor_health = 16;
   optional apollos.types.v1.SensorUncertaintySnapshot sensor_uncertainty = 17;
+  optional CloudLinkSnapshot cloud_link = 18;
+  repeated EdgeSemanticCueMessage edge_semantic_cues = 19;
+}
+
+message CloudLinkSnapshot {
+  bool connected = 1;
+  optional float rtt_ms = 2;
+  string source = 3;
+}
+
+message EdgeSemanticCueMessage {
+  string cue_type = 1;
+  optional string text = 2;
+  float confidence = 3;
+  optional float position_x = 4;
+  optional float distance_m = 5;
+  optional string position_clock = 6;
+  optional uint32 ttl_ms = 7;
+  string source = 8;
 }
 
 message AudioChunkMessage {
@@ -102,6 +121,16 @@ message ConnectionStateMessage {
   optional string detail = 2;
 }
 
+message CognitionStateMessage {
+  string session_id = 1;
+  string timestamp = 2;
+  apollos.types.v1.CognitionLayer active_layer = 3;
+  bool cloud_link_healthy = 4;
+  bool edge_cognition_available = 5;
+  optional float cloud_rtt_ms = 6;
+  optional string reason = 7;
+}
+
 message HumanHelpSessionMessage {
   string session_id = 1;
   string timestamp = 2;
@@ -126,5 +155,6 @@ message ServerEnvelope {
     ConnectionStateMessage connection_state = 4;
     SemanticCueMessage semantic_cue = 5;
     HumanHelpSessionMessage human_help_session = 6;
+    CognitionStateMessage cognition_state = 7;
   }
 }

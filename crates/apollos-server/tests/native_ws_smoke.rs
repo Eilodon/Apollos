@@ -127,7 +127,13 @@ fn native_frame_payload(
             "covariance_3x3": covariance_3x3,
             "innovation_norm": 0.8,
             "source": source
-        }
+        },
+        "cloud_link": {
+            "connected": true,
+            "rtt_ms": 65.0,
+            "source": "native-smoke"
+        },
+        "edge_semantic_cues": []
     })
 }
 

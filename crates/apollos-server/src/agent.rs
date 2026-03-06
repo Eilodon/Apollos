@@ -1,6 +1,7 @@
 use apollos_proto::contracts::{
     AssistantTextMessage, BackendToClientMessage, ClientToBackendMessage, ConnectionState,
-    ConnectionStateMessage, NavigationMode, SafetyDirectiveMessage,
+    ConnectionStateMessage, CognitionLayer, NavigationMode, SafetyDirectiveMessage, SemanticCue,
+    SemanticCueMessage,
 };
 use chrono::Utc;
 use tracing::warn;
@@ -68,6 +69,60 @@ impl AgentOrchestrator {
                         None,
                     )
                     .await;
+
+                let cognition_transition = state
+                    .sessions
+                    .update_cognition_signals(
+                        &frame.session_id,
+                        frame.cloud_link.as_ref(),
+                        &frame.edge_semantic_cues,
+                    )
+                    .await;
+                if let Some(transition) = cognition_transition {
+                    let _ = state
+                        .ws_registry
+                        .send_live(
+                            &frame.session_id,
+                            BackendToClientMessage::CognitionState(transition),
+                        )
+                        .await;
+                }
+
+                let observability = state.sessions.get_observability(&frame.session_id).await;
+                if observability.active_cognition_layer == CognitionLayer::L2Edge {
+                    if let Some(cue) = strongest_edge_cue(&frame.edge_semantic_cues) {
+                        let text = format_edge_cue(cue);
+                        let _ = state
+                            .ws_registry
+                            .send_live(
+                                &frame.session_id,
+                                BackendToClientMessage::AssistantText(AssistantTextMessage {
+                                    session_id: frame.session_id.clone(),
+                                    timestamp: Utc::now().to_rfc3339(),
+                                    text,
+                                }),
+                            )
+                            .await;
+
+                        if let Some(position_x) = cue.position_x {
+                            let _ = state
+                                .ws_registry
+                                .send_live(
+                                    &frame.session_id,
+                                    BackendToClientMessage::SemanticCue(SemanticCueMessage {
+                                        cue: SemanticCue::ApproachingObject,
+                                        position_x: Some(position_x.clamp(-1.0, 1.0)),
+                                    }),
+                                )
+                                .await;
+                        }
+                    }
+
+                    return Some(BackendToClientMessage::ConnectionState(ConnectionStateMessage {
+                        state: ConnectionState::Degraded,
+                        detail: Some("edge_cognition_active".to_string()),
+                    }));
+                }
 
                 if let Err(error) = state.gemini.forward_multimodal_frame(state, &frame).await {
                     warn!(
@@ -325,6 +380,43 @@ fn localization_uncertainty_from_covariance(covariance_3x3: &[f32]) -> Option<f3
     }
 
     Some(trace.sqrt())
+}
+
+fn strongest_edge_cue(
+    cues: &[apollos_proto::contracts::EdgeSemanticCueMessage],
+) -> Option<&apollos_proto::contracts::EdgeSemanticCueMessage> {
+    cues.iter().max_by(|left, right| {
+        left.confidence
+            .partial_cmp(&right.confidence)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    })
+}
+
+fn format_edge_cue(cue: &apollos_proto::contracts::EdgeSemanticCueMessage) -> String {
+    let mut parts = Vec::new();
+    if let Some(text) = cue.text.as_deref() {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            parts.push(trimmed.to_string());
+        }
+    }
+    if let Some(distance) = cue.distance_m {
+        if distance.is_finite() && distance >= 0.0 {
+            parts.push(format!("{distance:.1}m"));
+        }
+    }
+    if let Some(clock) = cue.position_clock.as_deref() {
+        let trimmed = clock.trim();
+        if !trimmed.is_empty() {
+            parts.push(trimmed.to_string());
+        }
+    }
+
+    if parts.is_empty() {
+        format!("Edge cue: {}", cue.cue_type)
+    } else {
+        format!("{} ({})", cue.cue_type, parts.join(", "))
+    }
 }
 
 #[cfg(test)]

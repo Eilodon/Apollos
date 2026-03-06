@@ -3,10 +3,16 @@ package com.apollos.nativeapp
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
+import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioRecord
+import android.media.AudioTrack
 import android.media.MediaRecorder
+import android.os.Build
 import android.os.SystemClock
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
@@ -43,6 +49,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.cos
+import kotlin.math.sin
 import kotlin.math.sqrt
 
 data class LocationSnapshot(
@@ -55,6 +62,11 @@ class RealtimeSessionManager(
     private val context: Context,
     private val lifecycleOwner: LifecycleOwner,
 ) {
+    companion object {
+        private const val SAFETY_DEADZONE_SCORE = 0.1f
+        private const val SAFETY_TONE_SAMPLE_RATE = 16_000
+    }
+
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val network = OkHttpClient.Builder()
         .connectTimeout(12, TimeUnit.SECONDS)
@@ -85,6 +97,9 @@ class RealtimeSessionManager(
     private var running = false
     private var wsOpen = false
     private val lastFrameSentAtMs = AtomicLong(0L)
+    private val safetyActuatorLock = Any()
+    private var safetyToneTrack: AudioTrack? = null
+    private var latestSafetyDirectiveAtMs: Long = 0L
 
     suspend fun start(
         serverBaseUrl: String,
@@ -119,6 +134,7 @@ class RealtimeSessionManager(
         latestVoPoseXM = 0.0f
         latestVoPoseYM = 0.0f
         gravityEstimate = FloatArray(3)
+        latestSafetyDirectiveAtMs = 0L
 
         connectLiveSocket(serverBaseUrl, wsToken, onStatus)
         startLocation(onStatus)
@@ -163,6 +179,7 @@ class RealtimeSessionManager(
         latestVoVarianceM2 = 999.0f
         latestVoPoseXM = 0.0f
         latestVoPoseYM = 0.0f
+        latestSafetyDirectiveAtMs = 0L
         if (eskfHandle != 0L) {
             RustCoreBridge.eskfDestroy(eskfHandle)
             eskfHandle = 0L
@@ -176,6 +193,7 @@ class RealtimeSessionManager(
         }.onFailure { error ->
             onStatus("Camera cleanup failed: ${error.message}")
         }
+        stopSafetyActuator()
         onStatus("Stopped")
     }
 
@@ -218,7 +236,7 @@ class RealtimeSessionManager(
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
-                onStatus("WS message: ${text.take(80)}")
+                handleServerMessage(text, onStatus)
             }
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
@@ -235,6 +253,145 @@ class RealtimeSessionManager(
                 onStatus("WS failure: ${t.message}")
             }
         })
+    }
+
+    private fun handleServerMessage(text: String, onStatus: (String) -> Unit) {
+        val payload = runCatching { JSONObject(text) }.getOrNull()
+        if (payload == null) {
+            onStatus("WS non-json message: ${text.take(80)}")
+            return
+        }
+
+        when (payload.optString("type")) {
+            "safety_directive" -> applySafetyDirective(payload, onStatus)
+            "connection_state" -> {
+                val detail = payload.optString("detail").ifBlank { "state_update" }
+                onStatus("WS state: $detail")
+            }
+            "cognition_state" -> {
+                val layer = payload.optString("active_layer").ifBlank { "unknown_layer" }
+                val reason = payload.optString("reason").ifBlank { "no_reason" }
+                onStatus("WS cognition: $layer ($reason)")
+            }
+            else -> onStatus("WS message: ${text.take(80)}")
+        }
+    }
+
+    private fun applySafetyDirective(payload: JSONObject, onStatus: (String) -> Unit) {
+        val hazardScore = payload.optDouble("hazard_score", 0.0).toFloat().coerceAtLeast(0.0f)
+        val hardStop = payload.optBoolean("hard_stop", false)
+        val hapticIntensity = payload.optDouble("haptic_intensity", 0.0).toFloat().coerceIn(0.0f, 1.0f)
+        val pitchHz = payload.optDouble("spatial_audio_pitch_hz", 0.0).toFloat().coerceAtLeast(0.0f)
+        val nowMs = SystemClock.elapsedRealtime()
+        if ((nowMs - latestSafetyDirectiveAtMs) < 60) {
+            return
+        }
+        latestSafetyDirectiveAtMs = nowMs
+
+        if (hazardScore < SAFETY_DEADZONE_SCORE || pitchHz <= 0.0f || hapticIntensity <= 0.0f) {
+            stopSafetyActuator()
+            return
+        }
+
+        val durationMs = if (hardStop) 220 else 90
+        val gain = hapticIntensity.coerceIn(0.08f, 1.0f)
+        playSafetyTone(pitchHz, gain, durationMs, onStatus)
+        triggerSafetyVibration(hapticIntensity, durationMs)
+    }
+
+    private fun playSafetyTone(
+        frequencyHz: Float,
+        gain: Float,
+        durationMs: Int,
+        onStatus: (String) -> Unit,
+    ) {
+        scope.launch(Dispatchers.Default) {
+            val sampleCount = (SAFETY_TONE_SAMPLE_RATE * durationMs / 1000).coerceAtLeast(1)
+            val samples = ShortArray(sampleCount)
+            val gainClamped = gain.coerceIn(0.0f, 1.0f)
+            val w = (2.0 * Math.PI * frequencyHz.toDouble() / SAFETY_TONE_SAMPLE_RATE.toDouble()).toFloat()
+            var phase = 0.0f
+
+            for (idx in 0 until sampleCount) {
+                // Fade-out envelope to avoid audible clicks.
+                val envelope = 1.0f - (idx.toFloat() / sampleCount.toFloat())
+                val value = sin(phase.toDouble()).toFloat() * gainClamped * envelope
+                samples[idx] = (value * Short.MAX_VALUE).toInt().coerceIn(
+                    Short.MIN_VALUE.toInt(),
+                    Short.MAX_VALUE.toInt(),
+                ).toShort()
+                phase += w
+            }
+
+            val track = try {
+                AudioTrack.Builder()
+                    .setAudioAttributes(
+                        AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_ASSISTANCE_SONIFICATION)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                            .build(),
+                    )
+                    .setAudioFormat(
+                        AudioFormat.Builder()
+                            .setSampleRate(SAFETY_TONE_SAMPLE_RATE)
+                            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                            .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                            .build(),
+                    )
+                    .setTransferMode(AudioTrack.MODE_STATIC)
+                    .setBufferSizeInBytes(sampleCount * 2)
+                    .build()
+            } catch (error: Throwable) {
+                onStatus("Safety tone init failed: ${error.message}")
+                return@launch
+            }
+
+            synchronized(safetyActuatorLock) {
+                safetyToneTrack?.release()
+                safetyToneTrack = track
+            }
+
+            runCatching {
+                track.write(samples, 0, samples.size, AudioTrack.WRITE_BLOCKING)
+                track.play()
+            }.onFailure { error ->
+                onStatus("Safety tone play failed: ${error.message}")
+                synchronized(safetyActuatorLock) {
+                    if (safetyToneTrack === track) {
+                        safetyToneTrack = null
+                    }
+                }
+                track.release()
+            }
+        }
+    }
+
+    private fun triggerSafetyVibration(intensity: Float, durationMs: Int) {
+        val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val manager = context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager
+            manager?.defaultVibrator
+        } else {
+            @Suppress("DEPRECATION")
+            context.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+        } ?: return
+
+        if (!vibrator.hasVibrator()) {
+            return
+        }
+
+        val amplitude = (intensity.coerceIn(0.0f, 1.0f) * 255.0f).toInt().coerceIn(1, 255)
+        val effect = VibrationEffect.createOneShot(durationMs.toLong(), amplitude)
+        vibrator.vibrate(effect)
+    }
+
+    private fun stopSafetyActuator() {
+        synchronized(safetyActuatorLock) {
+            safetyToneTrack?.apply {
+                runCatching { stop() }
+                release()
+            }
+            safetyToneTrack = null
+        }
     }
 
     private fun startLocation(onStatus: (String) -> Unit) {
@@ -442,8 +599,9 @@ class RealtimeSessionManager(
                         return@setAnalyzer
                     }
                     val buffer = plane.buffer
-                    val bytes = ByteArray(buffer.remaining())
-                    buffer.get(bytes)
+                    buffer.rewind()
+                    val rowStride = plane.rowStride
+                    val pixelStride = plane.pixelStride
                     val frameTimestampNs = image.imageInfo.timestamp
                     val dtS = if (lastCameraFrameTimestampNs == 0L) {
                         0.033f
@@ -453,11 +611,13 @@ class RealtimeSessionManager(
                     }
                     lastCameraFrameTimestampNs = frameTimestampNs
 
-                    val vo = RustCoreBridge.eskfUpdateVisualOdometryRgba(
+                    val vo = RustCoreBridge.eskfUpdateVisualOdometryRgbaBuffer(
                         handle = eskfHandle,
-                        rgbaBytes = bytes,
+                        rgbaBuffer = buffer,
                         width = image.width,
                         height = image.height,
+                        rowStride = rowStride,
+                        pixelStride = pixelStride,
                         dtS = dtS,
                     )
                     latestVoApplied = vo.applied
@@ -467,10 +627,12 @@ class RealtimeSessionManager(
                     latestVoPoseYM = vo.poseYM
 
                     val kinematic = RustCoreBridge.analyzeDefaultWalkingFrame()
-                    val depth = RustCoreBridge.detectDropAheadRgba(
-                        rgbaBytes = bytes,
+                    val depth = RustCoreBridge.detectDropAheadRgbaBuffer(
+                        rgbaBuffer = buffer,
                         width = image.width,
                         height = image.height,
+                        rowStride = rowStride,
+                        pixelStride = pixelStride,
                         riskScore = kinematic.riskScore,
                         carryModeCode = 1,
                         gyroMagnitude = latestGyroMagnitudeDeg,
@@ -479,7 +641,7 @@ class RealtimeSessionManager(
                     if (depth.detected) {
                         sendHazardObservation(depth, kinematic.riskScore)
                     }
-                    sendMultimodalFrame(kinematic.riskScore, depth.sourceCode)
+                    sendMultimodalFrame(kinematic.riskScore, depth)
                     image.close()
                 }
 
@@ -494,7 +656,7 @@ class RealtimeSessionManager(
         )
     }
 
-    private fun sendMultimodalFrame(riskScore: Float, depthSourceCode: Int) {
+    private fun sendMultimodalFrame(riskScore: Float, depth: DepthHazardResult) {
         if (!running || !wsOpen) {
             return
         }
@@ -514,7 +676,7 @@ class RealtimeSessionManager(
         if (eskf.localizationUncertaintyM > 6.0f) {
             flags.add("localization_uncertain")
         }
-        if (depthSourceCode != 1) {
+        if (depth.sourceCode != 1) {
             flags.add("depth_heuristic_fallback")
         }
         if (!latestVoApplied) {
@@ -544,6 +706,11 @@ class RealtimeSessionManager(
             .put("variance_m2", latestVoVarianceM2.coerceIn(0.0f, 999.0f))
             .put("pose_x_m", latestVoPoseXM)
             .put("pose_y_m", latestVoPoseYM)
+        val cloudLink = JSONObject()
+            .put("connected", wsOpen)
+            .put("rtt_ms", JSONObject.NULL)
+            .put("source", "android-live-ws-v1")
+        val edgeSemanticCues = buildEdgeSemanticCues(depth)
 
         val payload = JSONObject()
             .put("type", "multimodal_frame")
@@ -565,8 +732,45 @@ class RealtimeSessionManager(
             .put("sensor_health", sensorHealth)
             .put("sensor_uncertainty", sensorUncertainty)
             .put("vision_odometry", visionOdometry)
+            .put("cloud_link", cloudLink)
+            .put("edge_semantic_cues", edgeSemanticCues)
 
         webSocket?.send(payload.toString())
+    }
+
+    private fun buildEdgeSemanticCues(depth: DepthHazardResult): org.json.JSONArray {
+        val cues = org.json.JSONArray()
+        if (!depth.detected) {
+            return cues
+        }
+
+        val distanceM = when (depth.distanceCode) {
+            0 -> 1.0f
+            1 -> 2.5f
+            2 -> 4.5f
+            else -> 3.0f
+        }
+        val cue = JSONObject()
+            .put("cue_type", "drop_ahead")
+            .put("text", "Drop ahead")
+            .put("confidence", depth.confidence.coerceIn(0.0f, 1.0f))
+            .put("position_x", depth.positionX.coerceIn(-1.0f, 1.0f))
+            .put("distance_m", distanceM)
+            .put("position_clock", clockFaceFromPositionX(depth.positionX))
+            .put("ttl_ms", 1200)
+            .put("source", if (depth.sourceCode == 1) "edge_depth_onnx" else "edge_depth_heuristic")
+        cues.put(cue)
+        return cues
+    }
+
+    private fun clockFaceFromPositionX(positionX: Float): String {
+        return when {
+            positionX <= -0.6f -> "10h"
+            positionX <= -0.25f -> "11h"
+            positionX < 0.25f -> "12h"
+            positionX < 0.6f -> "1h"
+            else -> "2h"
+        }
     }
 
     private fun sendAudioChunk(audioPcm16: ByteArray) {

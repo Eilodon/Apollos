@@ -39,6 +39,13 @@ enum HumanRtcProvider {
   HUMAN_RTC_PROVIDER_LIVEKIT = 2;
 }
 
+enum CognitionLayer {
+  COGNITION_LAYER_UNSPECIFIED = 0;
+  COGNITION_LAYER_L1_SURVIVAL = 1;
+  COGNITION_LAYER_L2_EDGE = 2;
+  COGNITION_LAYER_L3_CLOUD = 3;
+}
+
 message MotionSnapshot {
   MotionState state = 1;
   float pitch = 2;

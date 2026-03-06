@@ -38,6 +38,40 @@ impl LumaFrame {
         })
     }
 
+    pub fn from_rgba_strided(
+        width: usize,
+        height: usize,
+        rgba: &[u8],
+        row_stride: usize,
+        pixel_stride: usize,
+    ) -> Option<Self> {
+        Self::from_rgbx_strided(
+            width,
+            height,
+            rgba,
+            row_stride,
+            pixel_stride,
+            PixelOrder::Rgba,
+        )
+    }
+
+    pub fn from_bgra_strided(
+        width: usize,
+        height: usize,
+        bgra: &[u8],
+        row_stride: usize,
+        pixel_stride: usize,
+    ) -> Option<Self> {
+        Self::from_rgbx_strided(
+            width,
+            height,
+            bgra,
+            row_stride,
+            pixel_stride,
+            PixelOrder::Bgra,
+        )
+    }
+
     pub fn average_luma(&self) -> f32 {
         if self.pixels.is_empty() {
             return 0.0;
@@ -45,6 +79,55 @@ impl LumaFrame {
 
         self.pixels.iter().sum::<f32>() / self.pixels.len() as f32
     }
+
+    fn from_rgbx_strided(
+        width: usize,
+        height: usize,
+        data: &[u8],
+        row_stride: usize,
+        pixel_stride: usize,
+        pixel_order: PixelOrder,
+    ) -> Option<Self> {
+        let min_row_stride = width.checked_mul(pixel_stride)?;
+        if width == 0 || height == 0 || row_stride < min_row_stride || pixel_stride < 3 {
+            return None;
+        }
+        let required = row_stride.checked_mul(height)?;
+        if data.len() < required {
+            return None;
+        }
+
+        let mut pixels = vec![0.0_f32; width * height];
+        for y in 0..height {
+            let row_offset = y.checked_mul(row_stride)?;
+            for x in 0..width {
+                let base = row_offset.checked_add(x.checked_mul(pixel_stride)?)?;
+                let end = base.checked_add(2)?;
+                if end >= data.len() {
+                    return None;
+                }
+
+                let (r, g, b) = match pixel_order {
+                    PixelOrder::Rgba => (data[base], data[base + 1], data[base + 2]),
+                    PixelOrder::Bgra => (data[base + 2], data[base + 1], data[base]),
+                };
+                let idx = y.checked_mul(width)?.checked_add(x)?;
+                pixels[idx] = 0.299 * (r as f32) + 0.587 * (g as f32) + 0.114 * (b as f32);
+            }
+        }
+
+        Some(Self {
+            width,
+            height,
+            pixels,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PixelOrder {
+    Rgba,
+    Bgra,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

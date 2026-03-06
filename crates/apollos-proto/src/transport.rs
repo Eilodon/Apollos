@@ -95,6 +95,9 @@ pub fn encode_server_message(
         contracts::BackendToClientMessage::HumanHelpSession(value) => {
             messages_v1::server_envelope::Payload::HumanHelpSession(human_help_to_proto(value))
         }
+        contracts::BackendToClientMessage::CognitionState(value) => {
+            messages_v1::server_envelope::Payload::CognitionState(cognition_state_to_proto(value))
+        }
     };
 
     let envelope = messages_v1::ServerEnvelope {
@@ -129,6 +132,9 @@ pub fn decode_server_message(
         }
         messages_v1::server_envelope::Payload::HumanHelpSession(value) => {
             contracts::BackendToClientMessage::HumanHelpSession(human_help_from_proto(value)?)
+        }
+        messages_v1::server_envelope::Payload::CognitionState(value) => {
+            contracts::BackendToClientMessage::CognitionState(cognition_state_from_proto(value)?)
         }
     };
 
@@ -165,6 +171,12 @@ fn multimodal_to_proto(
             .sensor_uncertainty
             .as_ref()
             .map(sensor_uncertainty_to_proto),
+        cloud_link: value.cloud_link.as_ref().map(cloud_link_to_proto),
+        edge_semantic_cues: value
+            .edge_semantic_cues
+            .iter()
+            .map(edge_semantic_cue_to_proto)
+            .collect(),
     })
 }
 
@@ -191,6 +203,12 @@ fn multimodal_from_proto(
         location_age_ms: value.location_age_ms,
         sensor_health: value.sensor_health.map(sensor_health_from_proto),
         sensor_uncertainty: value.sensor_uncertainty.map(sensor_uncertainty_from_proto),
+        cloud_link: value.cloud_link.map(cloud_link_from_proto),
+        edge_semantic_cues: value
+            .edge_semantic_cues
+            .into_iter()
+            .map(edge_semantic_cue_from_proto)
+            .collect(),
     })
 }
 
@@ -384,6 +402,34 @@ fn semantic_cue_from_proto(
     })
 }
 
+fn cognition_state_to_proto(
+    value: &contracts::CognitionStateMessage,
+) -> messages_v1::CognitionStateMessage {
+    messages_v1::CognitionStateMessage {
+        session_id: value.session_id.clone(),
+        timestamp: value.timestamp.clone(),
+        active_layer: cognition_layer_to_proto(value.active_layer) as i32,
+        cloud_link_healthy: value.cloud_link_healthy,
+        edge_cognition_available: value.edge_cognition_available,
+        cloud_rtt_ms: value.cloud_rtt_ms,
+        reason: value.reason.clone(),
+    }
+}
+
+fn cognition_state_from_proto(
+    value: messages_v1::CognitionStateMessage,
+) -> Result<contracts::CognitionStateMessage, TransportError> {
+    Ok(contracts::CognitionStateMessage {
+        session_id: value.session_id,
+        timestamp: value.timestamp,
+        active_layer: cognition_layer_from_proto(value.active_layer)?,
+        cloud_link_healthy: value.cloud_link_healthy,
+        edge_cognition_available: value.edge_cognition_available,
+        cloud_rtt_ms: value.cloud_rtt_ms,
+        reason: value.reason,
+    })
+}
+
 fn human_help_to_proto(
     value: &contracts::HumanHelpSessionMessage,
 ) -> messages_v1::HumanHelpSessionMessage {
@@ -448,6 +494,52 @@ fn sensor_uncertainty_from_proto(
     contracts::SensorUncertaintySnapshot {
         covariance_3x3: value.covariance_3x3,
         innovation_norm: value.innovation_norm,
+        source: value.source,
+    }
+}
+
+fn cloud_link_to_proto(value: &contracts::CloudLinkSnapshot) -> messages_v1::CloudLinkSnapshot {
+    messages_v1::CloudLinkSnapshot {
+        connected: value.connected,
+        rtt_ms: value.rtt_ms,
+        source: value.source.clone(),
+    }
+}
+
+fn cloud_link_from_proto(value: messages_v1::CloudLinkSnapshot) -> contracts::CloudLinkSnapshot {
+    contracts::CloudLinkSnapshot {
+        connected: value.connected,
+        rtt_ms: value.rtt_ms,
+        source: value.source,
+    }
+}
+
+fn edge_semantic_cue_to_proto(
+    value: &contracts::EdgeSemanticCueMessage,
+) -> messages_v1::EdgeSemanticCueMessage {
+    messages_v1::EdgeSemanticCueMessage {
+        cue_type: value.cue_type.clone(),
+        text: value.text.clone(),
+        confidence: value.confidence,
+        position_x: value.position_x,
+        distance_m: value.distance_m,
+        position_clock: value.position_clock.clone(),
+        ttl_ms: value.ttl_ms,
+        source: value.source.clone(),
+    }
+}
+
+fn edge_semantic_cue_from_proto(
+    value: messages_v1::EdgeSemanticCueMessage,
+) -> contracts::EdgeSemanticCueMessage {
+    contracts::EdgeSemanticCueMessage {
+        cue_type: value.cue_type,
+        text: value.text,
+        confidence: value.confidence,
+        position_x: value.position_x,
+        distance_m: value.distance_m,
+        position_clock: value.position_clock,
+        ttl_ms: value.ttl_ms,
         source: value.source,
     }
 }
@@ -625,6 +717,28 @@ fn human_provider_from_proto(value: i32) -> Result<contracts::HumanHelpProvider,
         types_v1::HumanRtcProvider::Twilio => contracts::HumanHelpProvider::Twilio,
         types_v1::HumanRtcProvider::Livekit => contracts::HumanHelpProvider::Livekit,
         types_v1::HumanRtcProvider::Unspecified => contracts::HumanHelpProvider::Twilio,
+    })
+}
+
+fn cognition_layer_to_proto(value: contracts::CognitionLayer) -> types_v1::CognitionLayer {
+    match value {
+        contracts::CognitionLayer::L1Survival => types_v1::CognitionLayer::L1Survival,
+        contracts::CognitionLayer::L2Edge => types_v1::CognitionLayer::L2Edge,
+        contracts::CognitionLayer::L3Cloud => types_v1::CognitionLayer::L3Cloud,
+    }
+}
+
+fn cognition_layer_from_proto(value: i32) -> Result<contracts::CognitionLayer, TransportError> {
+    let value = types_v1::CognitionLayer::try_from(value).map_err(|_| TransportError::UnknownEnum {
+        field: "CognitionLayer",
+        value,
+    })?;
+
+    Ok(match value {
+        types_v1::CognitionLayer::L1Survival => contracts::CognitionLayer::L1Survival,
+        types_v1::CognitionLayer::L2Edge => contracts::CognitionLayer::L2Edge,
+        types_v1::CognitionLayer::L3Cloud => contracts::CognitionLayer::L3Cloud,
+        types_v1::CognitionLayer::Unspecified => contracts::CognitionLayer::L3Cloud,
     })
 }
 

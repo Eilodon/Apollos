@@ -178,6 +178,52 @@ enum RustCoreBridge {
         )
     }
 
+    static func eskfUpdateVisualOdometryBgraStrided(
+        handle: UInt64,
+        baseAddress: UnsafeRawPointer,
+        bufferLen: Int,
+        width: UInt32,
+        height: UInt32,
+        rowStride: UInt32,
+        pixelStride: UInt32,
+        dtS: Float
+    ) -> IOSVisionOdometryResult {
+        if handle == 0 || width == 0 || height == 0 || dtS <= 0 || bufferLen <= 0 {
+            return IOSVisionOdometryResult(
+                applied: false,
+                deltaXM: 0.0,
+                deltaYM: 0.0,
+                poseXM: 0.0,
+                poseYM: 0.0,
+                varianceM2: 999.0,
+                opticalFlowScore: 0.0,
+                lateralBias: 0.0
+            )
+        }
+
+        let output = apollos_eskf_update_visual_odometry_bgra_strided(
+            handle,
+            baseAddress.assumingMemoryBound(to: UInt8.self),
+            bufferLen,
+            width,
+            height,
+            rowStride,
+            pixelStride,
+            dtS
+        )
+
+        return IOSVisionOdometryResult(
+            applied: output.applied != 0,
+            deltaXM: output.delta_x_m,
+            deltaYM: output.delta_y_m,
+            poseXM: output.pose_x_m,
+            poseYM: output.pose_y_m,
+            varianceM2: output.variance_m2,
+            opticalFlowScore: output.optical_flow_score,
+            lateralBias: output.lateral_bias
+        )
+    }
+
     static func detectDropAheadRgba(
         rgba: [UInt8],
         width: UInt32,
@@ -200,6 +246,49 @@ enum RustCoreBridge {
             )
         }
 
+        return IOSDepthHazardResult(
+            detected: output.detected != 0,
+            positionX: output.position_x,
+            confidence: output.confidence,
+            sourceCode: output.source_code,
+            distanceCode: output.distance_code
+        )
+    }
+
+    static func detectDropAheadBgraStrided(
+        baseAddress: UnsafeRawPointer,
+        bufferLen: Int,
+        width: UInt32,
+        height: UInt32,
+        rowStride: UInt32,
+        pixelStride: UInt32,
+        riskScore: Float,
+        carryModeCode: UInt8,
+        gyroMagnitude: Float,
+        nowMs: UInt64
+    ) -> IOSDepthHazardResult {
+        if width == 0 || height == 0 || bufferLen <= 0 {
+            return IOSDepthHazardResult(
+                detected: false,
+                positionX: 0.0,
+                confidence: 0.0,
+                sourceCode: 0,
+                distanceCode: 0
+            )
+        }
+
+        let output = apollos_detect_drop_ahead_bgra_strided(
+            baseAddress.assumingMemoryBound(to: UInt8.self),
+            bufferLen,
+            width,
+            height,
+            rowStride,
+            pixelStride,
+            riskScore,
+            carryModeCode,
+            gyroMagnitude,
+            nowMs
+        )
         return IOSDepthHazardResult(
             detected: output.detected != 0,
             positionX: output.position_x,

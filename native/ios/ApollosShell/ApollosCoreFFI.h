@@ -64,6 +64,30 @@ ApollosDepthHazardOutput apollos_detect_drop_ahead_rgba(
     float gyro_magnitude,
     uint64_t now_ms
 );
+ApollosDepthHazardOutput apollos_detect_drop_ahead_rgba_strided(
+    const uint8_t *rgba_ptr,
+    uintptr_t rgba_len,
+    uint32_t width,
+    uint32_t height,
+    uint32_t row_stride,
+    uint32_t pixel_stride,
+    float risk_score,
+    uint8_t carry_mode_code,
+    float gyro_magnitude,
+    uint64_t now_ms
+);
+ApollosDepthHazardOutput apollos_detect_drop_ahead_bgra_strided(
+    const uint8_t *bgra_ptr,
+    uintptr_t bgra_len,
+    uint32_t width,
+    uint32_t height,
+    uint32_t row_stride,
+    uint32_t pixel_stride,
+    float risk_score,
+    uint8_t carry_mode_code,
+    float gyro_magnitude,
+    uint64_t now_ms
+);
 uint64_t apollos_eskf_create(void);
 uint8_t apollos_eskf_destroy(uint64_t handle);
 uint8_t apollos_eskf_reset(uint64_t handle);
@@ -87,6 +111,26 @@ ApollosVisionOdometryOutput apollos_eskf_update_visual_odometry_rgba(
     uintptr_t rgba_len,
     uint32_t width,
     uint32_t height,
+    float dt_s
+);
+ApollosVisionOdometryOutput apollos_eskf_update_visual_odometry_rgba_strided(
+    uint64_t handle,
+    const uint8_t *rgba_ptr,
+    uintptr_t rgba_len,
+    uint32_t width,
+    uint32_t height,
+    uint32_t row_stride,
+    uint32_t pixel_stride,
+    float dt_s
+);
+ApollosVisionOdometryOutput apollos_eskf_update_visual_odometry_bgra_strided(
+    uint64_t handle,
+    const uint8_t *bgra_ptr,
+    uintptr_t bgra_len,
+    uint32_t width,
+    uint32_t height,
+    uint32_t row_stride,
+    uint32_t pixel_stride,
     float dt_s
 );
 ApollosEskfSnapshot apollos_eskf_snapshot(uint64_t handle);

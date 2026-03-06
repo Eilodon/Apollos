@@ -1,5 +1,7 @@
 package com.apollos.nativeapp
 
+import java.nio.ByteBuffer
+
 data class KinematicResult(
     val riskScore: Float,
     val shouldCapture: Boolean,
@@ -68,6 +70,17 @@ object RustCoreBridge {
         gyroMagnitude: Float,
         nowMs: Long,
     ): FloatArray
+    private external fun nativeDetectDropAheadRgbaBuffer(
+        rgbaBuffer: ByteBuffer,
+        width: Int,
+        height: Int,
+        rowStride: Int,
+        pixelStride: Int,
+        riskScore: Float,
+        carryModeCode: Byte,
+        gyroMagnitude: Float,
+        nowMs: Long,
+    ): FloatArray
     private external fun nativeEskfCreate(): Long
     private external fun nativeEskfDestroy(handle: Long): Int
     private external fun nativeEskfReset(handle: Long): Int
@@ -92,6 +105,15 @@ object RustCoreBridge {
         rgbaBytes: ByteArray,
         width: Int,
         height: Int,
+        dtS: Float,
+    ): FloatArray
+    private external fun nativeEskfUpdateVisualOdometryRgbaBuffer(
+        handle: Long,
+        rgbaBuffer: ByteBuffer,
+        width: Int,
+        height: Int,
+        rowStride: Int,
+        pixelStride: Int,
         dtS: Float,
     ): FloatArray
 
@@ -186,6 +208,52 @@ object RustCoreBridge {
         )
     }
 
+    fun eskfUpdateVisualOdometryRgbaBuffer(
+        handle: Long,
+        rgbaBuffer: ByteBuffer,
+        width: Int,
+        height: Int,
+        rowStride: Int,
+        pixelStride: Int,
+        dtS: Float,
+    ): VisionOdometryResult {
+        if (
+            handle == 0L || width <= 0 || height <= 0 || rowStride <= 0 || pixelStride <= 0
+            || dtS <= 0f || !rgbaBuffer.isDirect
+        ) {
+            return VisionOdometryResult(
+                applied = false,
+                deltaXM = 0.0f,
+                deltaYM = 0.0f,
+                poseXM = 0.0f,
+                poseYM = 0.0f,
+                varianceM2 = 999.0f,
+                opticalFlowScore = 0.0f,
+                lateralBias = 0.0f,
+            )
+        }
+
+        val output = nativeEskfUpdateVisualOdometryRgbaBuffer(
+            handle = handle,
+            rgbaBuffer = rgbaBuffer,
+            width = width,
+            height = height,
+            rowStride = rowStride,
+            pixelStride = pixelStride,
+            dtS = dtS,
+        )
+        return VisionOdometryResult(
+            applied = output.getOrElse(0) { 0.0f } > 0.5f,
+            deltaXM = output.getOrElse(1) { 0.0f },
+            deltaYM = output.getOrElse(2) { 0.0f },
+            poseXM = output.getOrElse(3) { 0.0f },
+            poseYM = output.getOrElse(4) { 0.0f },
+            varianceM2 = output.getOrElse(5) { 999.0f },
+            opticalFlowScore = output.getOrElse(6) { 0.0f },
+            lateralBias = output.getOrElse(7) { 0.0f },
+        )
+    }
+
     fun analyzeDefaultWalkingFrame(): KinematicResult {
         val output = nativeAnalyzeKinematics(
             2,
@@ -222,6 +290,50 @@ object RustCoreBridge {
             rgbaBytes = rgbaBytes,
             width = width,
             height = height,
+            riskScore = riskScore,
+            carryModeCode = carryModeCode,
+            gyroMagnitude = gyroMagnitude,
+            nowMs = nowMs,
+        )
+        return DepthHazardResult(
+            detected = output.getOrElse(0) { 0.0f } > 0.5f,
+            positionX = output.getOrElse(1) { 0.0f },
+            confidence = output.getOrElse(2) { 0.0f },
+            sourceCode = output.getOrElse(3) { 0.0f }.toInt(),
+            distanceCode = output.getOrElse(4) { 0.0f }.toInt(),
+        )
+    }
+
+    fun detectDropAheadRgbaBuffer(
+        rgbaBuffer: ByteBuffer,
+        width: Int,
+        height: Int,
+        rowStride: Int,
+        pixelStride: Int,
+        riskScore: Float,
+        carryModeCode: Byte,
+        gyroMagnitude: Float,
+        nowMs: Long,
+    ): DepthHazardResult {
+        if (
+            width <= 0 || height <= 0 || rowStride <= 0 || pixelStride <= 0
+            || !rgbaBuffer.isDirect
+        ) {
+            return DepthHazardResult(
+                detected = false,
+                positionX = 0.0f,
+                confidence = 0.0f,
+                sourceCode = 0,
+                distanceCode = 0,
+            )
+        }
+
+        val output = nativeDetectDropAheadRgbaBuffer(
+            rgbaBuffer = rgbaBuffer,
+            width = width,
+            height = height,
+            rowStride = rowStride,
+            pixelStride = pixelStride,
             riskScore = riskScore,
             carryModeCode = carryModeCode,
             gyroMagnitude = gyroMagnitude,

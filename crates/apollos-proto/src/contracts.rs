@@ -38,6 +38,14 @@ pub enum CarryMode {
     Pocket,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CognitionLayer {
+    L1Survival,
+    L2Edge,
+    L3Cloud,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MotionSnapshot {
     pub state: MotionState,
@@ -61,6 +69,25 @@ pub struct SensorUncertaintySnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CloudLinkSnapshot {
+    pub connected: bool,
+    pub rtt_ms: Option<f32>,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EdgeSemanticCueMessage {
+    pub cue_type: String,
+    pub text: Option<String>,
+    pub confidence: f32,
+    pub position_x: Option<f32>,
+    pub distance_m: Option<f32>,
+    pub position_clock: Option<String>,
+    pub ttl_ms: Option<u32>,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MultimodalFrameMessage {
     pub session_id: String,
     pub timestamp: String,
@@ -79,6 +106,8 @@ pub struct MultimodalFrameMessage {
     pub location_age_ms: Option<u64>,
     pub sensor_health: Option<SensorHealthSnapshot>,
     pub sensor_uncertainty: Option<SensorUncertaintySnapshot>,
+    pub cloud_link: Option<CloudLinkSnapshot>,
+    pub edge_semantic_cues: Vec<EdgeSemanticCueMessage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -169,6 +198,17 @@ pub struct ConnectionStateMessage {
     pub detail: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CognitionStateMessage {
+    pub session_id: String,
+    pub timestamp: String,
+    pub active_layer: CognitionLayer,
+    pub cloud_link_healthy: bool,
+    pub edge_cognition_available: bool,
+    pub cloud_rtt_ms: Option<f32>,
+    pub reason: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HumanHelpProvider {
@@ -221,6 +261,8 @@ pub enum BackendToClientMessage {
     SemanticCue(SemanticCueMessage),
     #[serde(rename = "human_help_session")]
     HumanHelpSession(HumanHelpSessionMessage),
+    #[serde(rename = "cognition_state")]
+    CognitionState(CognitionStateMessage),
 }
 
 #[cfg(test)]
@@ -247,6 +289,8 @@ mod tests {
             location_age_ms: None,
             sensor_health: None,
             sensor_uncertainty: None,
+            cloud_link: None,
+            edge_semantic_cues: Vec::new(),
         });
 
         let json = serde_json::to_string(&payload).expect("should serialize");
