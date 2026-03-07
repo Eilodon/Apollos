@@ -29,3 +29,40 @@ native/model_manifest.sha256
 .DS_Store
 .vscode/
 .idea/
+
+# Frontend build & dependencies
+frontend/node_modules/
+frontend/dist/
+frontend/public/tflite-wasm/
+frontend/*.tsbuildinfo
+frontend/vite.config.d.ts
+frontend/vite.config.js
+node_modules/
+
+# Android build artifacts
+native/android/app/.cxx/
+native/android/local.properties
+
+# New Android source files (untracked features — add explicitly when ready)
+native/android/app/src/main/java/com/apollos/nativeapp/ApollosService.kt
+native/android/app/src/main/java/com/apollos/nativeapp/SessionPreferences.kt
+native/android/app/src/main/java/com/apollos/nativeapp/ui/
+native/android/app/src/main/res/drawable/
+native/android/app/src/main/res/xml/
+
+# iOS docs
+native/ios/REPRODUCE_IOS.md
+
+# Model downloads
+tmp_models/
+
+# Agent / IDE workspace configs
+.agents/
+.windsurf/
+
+# Test scripts
+test_ws.js
+scripts/android_edge_smoke.sh
+
+# Rust toolchain override (managed by rustup, not project)
+rust-toolchain.toml
