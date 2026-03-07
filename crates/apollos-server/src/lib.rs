@@ -34,6 +34,8 @@ pub struct AppState {
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/health", get(healthz))
+        .route("/ready", get(healthz))
         .route("/config", get(config))
         .route("/ws/live/{session_id}", get(ws_handler::live_ws_handler))
         .route(

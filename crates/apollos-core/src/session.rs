@@ -23,7 +23,7 @@ impl SessionState {
     pub fn bootstrap_message(&self) -> ClientToBackendMessage {
         ClientToBackendMessage::MultimodalFrame(MultimodalFrameMessage {
             session_id: self.session_id.clone(),
-            timestamp: Utc::now().to_rfc3339(),
+            timestamp_ms: Utc::now().timestamp_millis() as u64,
             frame_jpeg_base64: None,
             motion_state: self.motion_state,
             pitch: 0.0,

@@ -24,6 +24,8 @@ tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
+mdns-sd = "0.13"
+
 
 [dev-dependencies]
 tower.workspace = true

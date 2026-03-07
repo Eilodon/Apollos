@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.camera.core.ImageProxy
 import org.tensorflow.lite.DataType
 import org.tensorflow.lite.Interpreter
+import org.tensorflow.lite.gpu.GpuDelegate
 import org.tensorflow.lite.nnapi.NnApiDelegate
 import java.io.FileInputStream
 import java.nio.ByteBuffer
@@ -40,7 +41,7 @@ internal class YoloDa3NnapiPipeline(
 
     private data class ModelRuntime(
         val interpreter: Interpreter,
-        val delegate: NnApiDelegate?,
+        val delegate: AutoCloseable?,
         val inputWidth: Int,
         val inputHeight: Int,
         val inputChannels: Int,
@@ -98,6 +99,7 @@ internal class YoloDa3NnapiPipeline(
     }
 
     fun detect(image: ImageProxy): EdgeInferenceResult {
+        val rotationDegrees = image.imageInfo.rotationDegrees
         val yolo = yoloRuntime
         val depth = depthRuntime
         if (yolo == null || depth == null) {
@@ -121,6 +123,7 @@ internal class YoloDa3NnapiPipeline(
             dstWidth = yolo.inputWidth,
             dstHeight = yolo.inputHeight,
             dstChannels = yolo.inputChannels,
+            rotationDegrees = rotationDegrees,
         )
         val yoloOutput = ByteBuffer.allocateDirect(yolo.interpreter.getOutputTensor(0).numBytes())
             .order(ByteOrder.nativeOrder())
@@ -149,6 +152,7 @@ internal class YoloDa3NnapiPipeline(
             dstWidth = depth.inputWidth,
             dstHeight = depth.inputHeight,
             dstChannels = depth.inputChannels,
+            rotationDegrees = rotationDegrees,
         )
         val depthOutput = ByteBuffer.allocateDirect(depth.interpreter.getOutputTensor(0).numBytes())
             .order(ByteOrder.nativeOrder())
@@ -230,11 +234,24 @@ internal class YoloDa3NnapiPipeline(
         val options = Interpreter.Options()
             .setNumThreads(4)
             .setUseXNNPACK(true)
-        val delegate = runCatching { NnApiDelegate() }.getOrNull()
-        if (delegate != null) {
-            options.addDelegate(delegate)
+        
+        var delegate: AutoCloseable? = null
+        
+        // Strategy: 1. GPU (Most consistent) -> 2. NNAPI (OEM Optimized) -> 3. CPU (XNNPACK)
+        val gpu = runCatching { GpuDelegate() }.getOrNull()
+        if (gpu != null) {
+            options.addDelegate(gpu)
+            delegate = gpu
+            logger("Using GPU acceleration for $assetPath")
         } else {
-            logger("NNAPI delegate unavailable for $assetPath, using XNNPACK only")
+            val nnapi = runCatching { NnApiDelegate() }.getOrNull()
+            if (nnapi != null) {
+                options.addDelegate(nnapi)
+                delegate = nnapi
+                logger("Using NNAPI acceleration for $assetPath")
+            } else {
+                logger("No acceleration hardware found for $assetPath, falling back to XNNPACK CPU")
+            }
         }
         val interpreter = Interpreter(model, options)
         val input = interpreter.getInputTensor(0)
@@ -291,14 +308,47 @@ internal class YoloDa3NnapiPipeline(
         dstWidth: Int,
         dstHeight: Int,
         dstChannels: Int,
+        rotationDegrees: Int,
     ): ByteBuffer {
         val output = ByteBuffer.allocateDirect(dstWidth * dstHeight * dstChannels * 4)
             .order(ByteOrder.nativeOrder())
         val src = rgbaBuffer.duplicate()
+        
+        // Final upright dimensions after rotation
+        val is90or270 = rotationDegrees == 90 || rotationDegrees == 270
+        val finalSrcWidth = if (is90or270) srcHeight else srcWidth
+        val finalSrcHeight = if (is90or270) srcWidth else srcHeight
+
         for (dy in 0 until dstHeight) {
-            val sy = ((dy + 0.5f) * srcHeight / dstHeight).toInt().coerceIn(0, srcHeight - 1)
+            val fy = dy.toFloat() / dstHeight.toFloat()
             for (dx in 0 until dstWidth) {
-                val sx = ((dx + 0.5f) * srcWidth / dstWidth).toInt().coerceIn(0, srcWidth - 1)
+                val fx = dx.toFloat() / dstWidth.toFloat()
+                
+                // Map upright normalized coord (fx, fy) back to raw sensor coord (sx, sy)
+                val (sx, sy) = when (rotationDegrees) {
+                    90 -> {
+                        // (fx, fy) in upright -> x increases along reverse sensor-Y, y increases along sensor-X
+                        val sX = (fy * (srcWidth - 1)).toInt()
+                        val sY = ((1.0f - fx) * (srcHeight - 1)).toInt()
+                        sX to sY
+                    }
+                    180 -> {
+                        val sX = ((1.0f - fx) * (srcWidth - 1)).toInt()
+                        val sY = ((1.0f - fy) * (srcHeight - 1)).toInt()
+                        sX to sY
+                    }
+                    270 -> {
+                        val sX = ((1.0f - fy) * (srcWidth - 1)).toInt()
+                        val sY = (fx * (srcHeight - 1)).toInt()
+                        sX to sY
+                    }
+                    else -> { // 0 or unknown
+                        val sX = (fx * (srcWidth - 1)).toInt()
+                        val sY = (fy * (srcHeight - 1)).toInt()
+                        sX to sY
+                    }
+                }
+
                 val index = sy * srcRowStride + sx * srcPixelStride
                 val r = (src.get(index).toInt() and 0xFF) / 255.0f
                 val g = (src.get(index + 1).toInt() and 0xFF) / 255.0f

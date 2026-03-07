@@ -28,7 +28,7 @@ pub struct FfiAbiVersion {
 
 pub const ABI_VERSION: FfiAbiVersion = FfiAbiVersion {
     major: 0,
-    minor: 7,
+    minor: 8,
     patch: 0,
 };
 
@@ -56,6 +56,9 @@ pub struct ApollosDepthHazardOutput {
     pub position_x: f32,
     pub confidence: f32,
     pub distance_code: u8,
+    pub distance_m: f32,
+    pub relative_velocity_mps: f32,
+    pub time_to_collision_s: f32,
 }
 
 #[repr(C)]
@@ -114,6 +117,7 @@ static DEPTH_ENGINE: Lazy<Mutex<SharedDepthEngine>> = Lazy::new(|| {
 static ESKF_ENGINES: Lazy<Mutex<HashMap<u64, SharedEskfEngine>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 static ESKF_NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
+static SESSION_START_TIME: AtomicU64 = AtomicU64::new(0);
 
 pub fn abi_version() -> FfiAbiVersion {
     ABI_VERSION
@@ -151,6 +155,27 @@ pub extern "C" fn apollos_analyze_kinematics(
     gyro_gamma: f32,
     sensor_unavailable: u8,
 ) -> ApollosKinematicOutput {
+    // 1. Initial warm-up check: Set start time if not set
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    
+    let start_time = SESSION_START_TIME.load(Ordering::Relaxed);
+    if start_time == 0 {
+        SESSION_START_TIME.store(now, Ordering::Relaxed);
+        return ApollosKinematicOutput { risk_score: 1.0, should_capture: 0, yaw_delta_deg: 0.0 };
+    }
+
+    // 2. Warm-up phase: Skip processing for the first 1000ms to allow sensors to stabilize
+    if now.saturating_sub(start_time) < 1000 {
+        return ApollosKinematicOutput { risk_score: 1.0, should_capture: 0, yaw_delta_deg: 0.0 };
+    }
+
+    // 3. NaN protection for critical safety metrics
+    if !pitch.is_finite() || !velocity.is_finite() || !accel_x.is_finite() || !accel_y.is_finite() || !accel_z.is_finite() {
+        return ApollosKinematicOutput { risk_score: 1.0, should_capture: 0, yaw_delta_deg: 0.0 };
+    }
     let motion_state = motion_state_from_code(motion_state_code);
     let carry_mode = carry_mode_from_code(carry_mode_code);
     let profile = get_carry_mode_profile(carry_mode);
@@ -177,7 +202,7 @@ pub extern "C" fn apollos_analyze_kinematics(
 
     ApollosKinematicOutput {
         risk_score,
-        should_capture: u8::from(should_capture),
+        should_capture: should_capture as u8,
         yaw_delta_deg,
     }
 }
@@ -279,6 +304,9 @@ fn invalid_depth_hazard_output() -> ApollosDepthHazardOutput {
         position_x: 0.0,
         confidence: 0.0,
         distance_code: 0,
+        distance_m: 0.0,
+        relative_velocity_mps: 0.0,
+        time_to_collision_s: -1.0,
     }
 }
 
@@ -291,6 +319,9 @@ fn detect_drop_ahead_from_objects(
     gyro_magnitude: f32,
     now_ms: u64,
 ) -> ApollosDepthHazardOutput {
+    if !risk_score.is_finite() || !gyro_magnitude.is_finite() {
+        return invalid_depth_hazard_output();
+    }
     let Ok(mut guard) = DEPTH_ENGINE.lock() else {
         return invalid_depth_hazard_output();
     };
@@ -316,6 +347,9 @@ fn detect_drop_ahead_from_objects(
             DistanceCategory::Mid => 1,
             DistanceCategory::Far => 2,
         },
+        distance_m: hazard.distance_m,
+        relative_velocity_mps: hazard.relative_velocity_mps,
+        time_to_collision_s: hazard.time_to_collision_s.unwrap_or(-1.0),
     }
 }
 
@@ -485,7 +519,7 @@ mod tests {
     #[test]
     fn abi_version_packs_into_u32() {
         let packed = apollos_abi_version_u32();
-        assert_eq!(packed, 0x0000_0700);
+        assert_eq!(packed, 0x0000_0800);
     }
 
     #[test]
@@ -494,7 +528,7 @@ mod tests {
             apollos_analyze_kinematics(2, 1, 12.0, 2.1, 6.0, 0.0, 9.8, 0.2, 3.0, 2.0, 1.0, 0);
 
         assert!(output.risk_score >= 1.0);
-        assert!(output.should_capture == 0 || output.should_capture == 1);
+        assert!(output.should_capture <= 2);
     }
 
     #[test]

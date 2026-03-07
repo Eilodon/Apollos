@@ -2,6 +2,12 @@ const HARD_STOP_THRESHOLD: f32 = 3.2;
 const HUMAN_ASSIST_THRESHOLD: f32 = 6.2;
 const HUMAN_ASSIST_SENSOR_HEALTH_THRESHOLD: f32 = 0.35;
 const SAFE_SILENCE_DEADZONE: f32 = 0.1;
+const PROXIMITY_OVERRIDE_DISTANCE_M: f32 = 0.6;
+const PROXIMITY_OVERRIDE_CONFIDENCE: f32 = 0.6;
+const PROXIMITY_OVERRIDE_MARGIN: f32 = 1.0;
+const TTC_GAIN: f32 = 1.6;
+const TTC_DECAY_S: f32 = 1.2;
+const TTC_MIN_CLOSING_SPEED_MPS: f32 = 0.05;
 
 #[derive(Debug, Clone, Copy)]
 pub struct SafetyPolicyInput {
@@ -12,6 +18,7 @@ pub struct SafetyPolicyInput {
     pub sensor_health_score: f32,
     pub localization_uncertainty_m: f32,
     pub edge_reflex_active: bool,
+    pub continuous_hard_stop_duration_s: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -52,8 +59,18 @@ pub fn evaluate_safety_policy(payload: SafetyPolicyInput) -> SafetyPolicyDecisio
     let distance_risk = alpha * (-lambda * distance_m).exp();
     let velocity_risk = beta * closing_speed;
     let confidence_risk = gamma * confidence;
+    let time_to_collision_s = if closing_speed > TTC_MIN_CLOSING_SPEED_MPS {
+        Some(distance_m / closing_speed)
+    } else {
+        None
+    };
+    let ttc_risk = time_to_collision_s
+        .map(|ttc_s| TTC_GAIN * (-(ttc_s / TTC_DECAY_S)).exp())
+        .unwrap_or(0.0);
+    let proximity_override =
+        distance_m < PROXIMITY_OVERRIDE_DISTANCE_M && confidence > PROXIMITY_OVERRIDE_CONFIDENCE;
 
-    let mut hazard_score = distance_risk + velocity_risk + confidence_risk;
+    let mut hazard_score = distance_risk + velocity_risk + confidence_risk + ttc_risk;
 
     if sensor_health < 0.5 {
         hazard_score *= 1.3;
@@ -66,6 +83,10 @@ pub fn evaluate_safety_policy(payload: SafetyPolicyInput) -> SafetyPolicyDecisio
         hazard_score += 5.0;
     }
 
+    if proximity_override {
+        hazard_score = hazard_score.max(HARD_STOP_THRESHOLD + PROXIMITY_OVERRIDE_MARGIN);
+    }
+
     let activation =
         ((hazard_score - SAFE_SILENCE_DEADZONE) / (HARD_STOP_THRESHOLD + 1.0)).clamp(0.0, 1.0);
     let haptic_intensity = activation.powf(0.75);
@@ -75,12 +96,15 @@ pub fn evaluate_safety_policy(payload: SafetyPolicyInput) -> SafetyPolicyDecisio
         330.0 + activation * 770.0
     };
     let hard_stop = hazard_score > HARD_STOP_THRESHOLD || payload.edge_reflex_active;
-    let human_assistance = hazard_score > HUMAN_ASSIST_THRESHOLD
-        && sensor_health < HUMAN_ASSIST_SENSOR_HEALTH_THRESHOLD;
+    let human_assistance = (hazard_score > HUMAN_ASSIST_THRESHOLD
+        && sensor_health < HUMAN_ASSIST_SENSOR_HEALTH_THRESHOLD)
+        || payload.continuous_hard_stop_duration_s > 5.0;
 
     let reason = format!(
-        "score={hazard_score:.2};conf={confidence:.2};distance_m={distance_m:.2};closing_speed={closing_speed:.2};sensor={sensor_health:.2};loc_uncertainty_m={loc_uncertainty:.1};edge_reflex={};pan={pan:.2};silence={}",
+        "score={hazard_score:.2};conf={confidence:.2};distance_m={distance_m:.2};closing_speed={closing_speed:.2};ttc_s={:.2};sensor={sensor_health:.2};loc_uncertainty_m={loc_uncertainty:.1};edge_reflex={};prox_override={};pan={pan:.2};silence={}",
+        time_to_collision_s.unwrap_or(-1.0),
         if payload.edge_reflex_active { "1" } else { "0" },
+        if proximity_override { "1" } else { "0" },
         if hazard_score < SAFE_SILENCE_DEADZONE { "1" } else { "0" },
     );
 
@@ -109,6 +133,7 @@ mod tests {
             sensor_health_score: 0.9,
             localization_uncertainty_m: 14.0,
             edge_reflex_active: false,
+            continuous_hard_stop_duration_s: 0.0,
         });
 
         assert!(decision.should_emit_hard_stop());
@@ -125,6 +150,7 @@ mod tests {
             sensor_health_score: 0.18,
             localization_uncertainty_m: 220.0,
             edge_reflex_active: true,
+            continuous_hard_stop_duration_s: 0.0,
         });
 
         assert!(decision.should_escalate_human());
@@ -140,10 +166,55 @@ mod tests {
             sensor_health_score: 0.98,
             localization_uncertainty_m: 0.2,
             edge_reflex_active: false,
+            continuous_hard_stop_duration_s: 0.0,
         });
 
         assert!(decision.hazard_score < SAFE_SILENCE_DEADZONE);
         assert_eq!(decision.haptic_intensity, 0.0);
         assert_eq!(decision.spatial_audio_pitch_hz, 0.0);
+    }
+
+    #[test]
+    fn ultra_close_static_hazard_forces_hard_stop() {
+        let decision = evaluate_safety_policy(SafetyPolicyInput {
+            hazard_confidence: 0.95,
+            distance_m: 0.1,
+            relative_velocity_mps: 0.0,
+            bearing_x: 0.0,
+            sensor_health_score: 0.95,
+            localization_uncertainty_m: 0.4,
+            edge_reflex_active: false,
+            continuous_hard_stop_duration_s: 0.0,
+        });
+
+        assert!(decision.hard_stop);
+        assert!(decision.reason.contains("prox_override=1"));
+    }
+
+    #[test]
+    fn short_ttc_increases_hazard_score() {
+        let approaching = evaluate_safety_policy(SafetyPolicyInput {
+            hazard_confidence: 0.7,
+            distance_m: 2.4,
+            relative_velocity_mps: -1.5,
+            bearing_x: 0.0,
+            sensor_health_score: 0.95,
+            localization_uncertainty_m: 2.0,
+            edge_reflex_active: false,
+            continuous_hard_stop_duration_s: 0.0,
+        });
+        let receding = evaluate_safety_policy(SafetyPolicyInput {
+            hazard_confidence: 0.7,
+            distance_m: 2.4,
+            relative_velocity_mps: 0.4,
+            bearing_x: 0.0,
+            sensor_health_score: 0.95,
+            localization_uncertainty_m: 2.0,
+            edge_reflex_active: false,
+            continuous_hard_stop_duration_s: 0.0,
+        });
+
+        assert!(approaching.hazard_score > receding.hazard_score);
+        assert!(approaching.reason.contains("ttc_s="));
     }
 }

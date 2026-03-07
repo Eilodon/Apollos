@@ -120,7 +120,7 @@ impl AgentOrchestrator {
                                 &frame.session_id,
                                 BackendToClientMessage::AssistantText(AssistantTextMessage {
                                     session_id: frame.session_id.clone(),
-                                    timestamp: Utc::now().to_rfc3339(),
+                                    timestamp_ms: Utc::now().timestamp_millis() as u64,
                                     text,
                                 }),
                             )
@@ -211,12 +211,22 @@ impl AgentOrchestrator {
             }
             ClientToBackendMessage::UserCommand(cmd) => {
                 if cmd.command.eq_ignore_ascii_case("help") {
-                    let help = state
+                    if let Some(help) = state
                         .fallback
                         .create_help_session(&cmd.session_id, "manual")
-                        .await;
-
-                    return Some(BackendToClientMessage::HumanHelpSession(help));
+                        .await
+                    {
+                        return Some(BackendToClientMessage::HumanHelpSession(help));
+                    } else {
+                        return Some(BackendToClientMessage::AssistantText(
+                            AssistantTextMessage {
+                                session_id: cmd.session_id,
+                                timestamp_ms: Utc::now().timestamp_millis() as u64,
+                                text: "Dịch vụ hỗ trợ hiện không khả dụng. Vui lòng thử lại sau."
+                                    .to_string(),
+                            },
+                        ));
+                    }
                 }
 
                 if let Some(mode) = extract_mode_from_command(&cmd.command) {
@@ -224,7 +234,7 @@ impl AgentOrchestrator {
                     return Some(BackendToClientMessage::AssistantText(
                         AssistantTextMessage {
                             session_id: cmd.session_id,
-                            timestamp: Utc::now().to_rfc3339(),
+                            timestamp_ms: Utc::now().timestamp_millis() as u64,
                             text: format!("Đã chuyển chế độ {:?}", mode),
                         },
                     ));
@@ -259,7 +269,7 @@ impl AgentOrchestrator {
                 Some(BackendToClientMessage::AssistantText(
                     AssistantTextMessage {
                         session_id: cmd.session_id,
-                        timestamp: Utc::now().to_rfc3339(),
+                        timestamp_ms: Utc::now().timestamp_millis() as u64,
                         text: format!("[{:?}] {}", self.channel, text),
                     },
                 ))
@@ -270,9 +280,10 @@ impl AgentOrchestrator {
                     .map(|ms| (ms.max(500).saturating_add(999)) / 1000);
                 let observability = state.sessions.get_observability(&hazard.session_id).await;
                 let hazard_confidence = hazard.confidence.unwrap_or(0.7).clamp(0.0, 1.0);
-                let distance_m = hazard.distance_m.unwrap_or(2.0).max(0.0);
-                let relative_velocity_mps = hazard.relative_velocity_mps.unwrap_or(-0.8);
+                let distance_m = hazard.distance_m.max(0.0);
+                let relative_velocity_mps = hazard.relative_velocity_mps;
                 let bearing_x = hazard.bearing_x.unwrap_or(0.0).clamp(-1.0, 1.0);
+                let hazard_type_label = hazard.hazard_type.as_str();
                 let reflex_gate =
                     hazard_confidence >= 0.85 && distance_m <= 1.5 && relative_velocity_mps <= -1.0;
 
@@ -285,6 +296,7 @@ impl AgentOrchestrator {
                         sensor_health_score: observability.sensor_health_score,
                         localization_uncertainty_m: observability.localization_uncertainty_m,
                         edge_reflex_active: observability.edge_reflex_active || reflex_gate,
+                        continuous_hard_stop_duration_s: observability.continuous_hard_stop_duration_s,
                     });
 
                 if decision.should_emit_hard_stop() {
@@ -292,7 +304,7 @@ impl AgentOrchestrator {
                         .sessions
                         .mark_edge_hazard(
                             &hazard.session_id,
-                            hazard.hazard_type.clone(),
+                            hazard_type_label.to_string(),
                             suppress_seconds,
                         )
                         .await;
@@ -302,7 +314,7 @@ impl AgentOrchestrator {
                             &hazard.session_id,
                             &format!(
                                 "hazard={};distance_m={distance_m:.2};score={:.2}",
-                                hazard.hazard_type, decision.hazard_score
+                                hazard_type_label, decision.hazard_score
                             ),
                         )
                         .await;
@@ -312,7 +324,7 @@ impl AgentOrchestrator {
                     .sessions
                     .log_hazard(
                         &hazard.session_id,
-                        &hazard.hazard_type,
+                        hazard_type_label,
                         bearing_x,
                         Some(distance_m),
                         Some(relative_velocity_mps),
@@ -339,8 +351,8 @@ impl AgentOrchestrator {
 
                 let directive = BackendToClientMessage::SafetyDirective(SafetyDirectiveMessage {
                     session_id: hazard.session_id.clone(),
-                    timestamp: Utc::now().to_rfc3339(),
-                    hazard_type: Some(hazard.hazard_type.clone()),
+                    timestamp_ms: Utc::now().timestamp_millis() as u64,
+                    hazard_type: Some(hazard.hazard_type),
                     hazard_score: decision.hazard_score,
                     hard_stop: decision.hard_stop,
                     haptic_intensity: decision.haptic_intensity,
@@ -348,6 +360,7 @@ impl AgentOrchestrator {
                     spatial_audio_pan: decision.spatial_audio_pan,
                     needs_human_assistance: decision.human_assistance,
                     reason: Some(decision.reason.clone()),
+                    flush_audio: decision.hard_stop,
                 });
 
                 if decision.should_emit_hard_stop() {
@@ -358,17 +371,33 @@ impl AgentOrchestrator {
                 }
 
                 if decision.should_escalate_human() {
-                    let help = state
+                    if let Some(help) = state
                         .fallback
                         .create_help_session(&hazard.session_id, "safety_policy")
-                        .await;
-                    let _ = self
-                        .send_channel(
-                            state,
-                            &hazard.session_id,
-                            BackendToClientMessage::HumanHelpSession(help),
-                        )
-                        .await;
+                        .await
+                    {
+                        let _ = self
+                            .send_channel(
+                                state,
+                                &hazard.session_id,
+                                BackendToClientMessage::HumanHelpSession(help),
+                            )
+                            .await;
+                    } else {
+                        let _ = self
+                            .send_channel(
+                                state,
+                                &hazard.session_id,
+                                BackendToClientMessage::AssistantText(AssistantTextMessage {
+                                    session_id: hazard.session_id.clone(),
+                                    timestamp_ms: Utc::now().timestamp_millis() as u64,
+                                    text:
+                                        "Cần hỗ trợ? Rất tiếc, dịch vụ cứu hộ tạm thời gián đoạn."
+                                            .to_string(),
+                                }),
+                            )
+                            .await;
+                    }
                 }
 
                 if decision.should_emit_hard_stop() {
@@ -450,7 +479,7 @@ fn format_edge_cue(cue: &apollos_proto::contracts::EdgeSemanticCueMessage) -> St
 #[cfg(test)]
 mod tests {
     use apollos_proto::contracts::{
-        BackendToClientMessage, ClientToBackendMessage, HazardObservationMessage,
+        BackendToClientMessage, ClientToBackendMessage, HazardObservationMessage, HazardType,
     };
 
     use super::*;
@@ -474,11 +503,11 @@ mod tests {
                 &state,
                 ClientToBackendMessage::HazardObservation(HazardObservationMessage {
                     session_id: "s1".to_string(),
-                    timestamp: Utc::now().to_rfc3339(),
-                    hazard_type: "EDGE_DROP_HAZARD".to_string(),
+                    timestamp_ms: Utc::now().timestamp_millis() as u64,
+                    hazard_type: HazardType::DropAhead,
                     bearing_x: Some(0.2),
-                    distance_m: Some(1.0),
-                    relative_velocity_mps: Some(-2.0),
+                    distance_m: 1.0,
+                    relative_velocity_mps: -2.0,
                     confidence: Some(0.92),
                     source: Some("test".to_string()),
                     suppress_ms: Some(3000),

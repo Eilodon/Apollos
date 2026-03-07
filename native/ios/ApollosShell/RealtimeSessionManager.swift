@@ -40,7 +40,9 @@ final class RealtimeSessionManager: NSObject, ObservableObject {
     )
 
     private var sessionId = UUID().uuidString
-    private var wsTask: URLSessionWebSocketTask?
+    private var wsTask: URLSessionWebSocketTask? = nil
+    private var latestFrameBase64: String? = nil
+    private var lastJpegCompressionAt: Double = 0
     private let urlSession = URLSession(configuration: .default)
     private let locationManager = CLLocationManager()
     private let motionManager = CMMotionManager()
@@ -641,7 +643,7 @@ final class RealtimeSessionManager: NSObject, ObservableObject {
             "type": "multimodal_frame",
             "session_id": sessionId,
             "timestamp": iso8601Now(),
-            "frame_jpeg_base64": nil,
+            "frame_jpeg_base64": latestFrameBase64,
             "motion_state": "walking_fast",
             "pitch": 0.0,
             "velocity": velocityMps,
@@ -675,6 +677,7 @@ final class RealtimeSessionManager: NSObject, ObservableObject {
         ]
 
         sendJSON(payload)
+        latestFrameBase64 = nil
     }
 
     private func buildEdgeSemanticCues(depth: IOSDepthHazardResult) -> [[String: Any]] {
@@ -933,7 +936,27 @@ extension RealtimeSessionManager: AVCaptureVideoDataOutputSampleBufferDelegate {
         if depth.detected {
             sendHazardObservation(depth: depth, riskScore: kinematic.riskScore)
         }
+
+        let now = Date().timeIntervalSince1970
+        if (now - lastJpegCompressionAt) > 1.0 {
+            lastJpegCompressionAt = now
+            latestFrameBase64 = encodePixelBufferToJpegB64(pixelBuffer)
+        }
+
         sendMultimodalFrame(riskScore: kinematic.riskScore, depth: depth)
+    }
+
+    private func encodePixelBufferToJpegB64(_ pixelBuffer: CVPixelBuffer) -> String? {
+        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+        let context = CIContext()
+        guard let jpegData = context.jpegRepresentation(
+            of: ciImage,
+            colorSpace: CGColorSpaceCreateDeviceRGB(),
+            options: [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: 0.7]
+        ) else {
+            return nil
+        }
+        return jpegData.base64EncodedString()
     }
 
     private func detectEdgeObjects(pixelBuffer: CVPixelBuffer) -> [IOSEdgeObjectDetection] {

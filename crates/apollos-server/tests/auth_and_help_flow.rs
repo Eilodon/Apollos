@@ -90,8 +90,9 @@ async fn help_ticket_exchange_is_one_time() {
     let state = AppState::default();
     let help_session = state
         .fallback
-        .create_help_session("session-a", "manual")
-        .await;
+        .create_help_session("s1", "manual")
+        .await
+        .expect("should create help session");
     let app = build_router(state.clone());
 
     let link = help_session.help_link.expect("help link should exist");

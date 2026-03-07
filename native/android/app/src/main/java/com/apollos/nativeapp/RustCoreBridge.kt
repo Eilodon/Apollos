@@ -13,6 +13,9 @@ data class DepthHazardResult(
     val positionX: Float,
     val confidence: Float,
     val distanceCode: Int,
+    val distanceM: Float,
+    val relativeVelocityMps: Float,
+    val timeToCollisionS: Float?,
 )
 
 data class EdgeObjectDetection(
@@ -68,6 +71,11 @@ object RustCoreBridge {
         gyroGamma: Float,
         sensorUnavailable: Byte,
     ): FloatArray
+
+    private external fun nativeComputeYawDelta(
+        alphaDegPerSecond: Float,
+        dtMs: Float,
+    ): Float
 
     private external fun nativeDepthOnnxEnabled(): Int
 
@@ -153,20 +161,33 @@ object RustCoreBridge {
     }
 
 
-    fun analyzeDefaultWalkingFrame(): KinematicResult {
+    fun analyzeKinematics(
+        motionStateCode: Byte,
+        carryModeCode: Byte,
+        pitch: Float,
+        velocity: Float,
+        yawDeltaDeg: Float,
+        accelX: Float,
+        accelY: Float,
+        accelZ: Float,
+        gyroAlpha: Float,
+        gyroBeta: Float,
+        gyroGamma: Float,
+        sensorUnavailable: Boolean,
+    ): KinematicResult {
         val output = nativeAnalyzeKinematics(
-            2,
-            1,
-            11.0f,
-            2.0f,
-            6.0f,
-            0.0f,
-            9.8f,
-            0.2f,
-            4.0f,
-            2.0f,
-            1.0f,
-            0,
+            motionStateCode,
+            carryModeCode,
+            pitch,
+            velocity,
+            yawDeltaDeg,
+            accelX,
+            accelY,
+            accelZ,
+            gyroAlpha,
+            gyroBeta,
+            gyroGamma,
+            if (sensorUnavailable) 1 else 0,
         )
 
         return KinematicResult(
@@ -174,6 +195,10 @@ object RustCoreBridge {
             shouldCapture = output.getOrElse(1) { 0.0f } > 0.5f,
             yawDeltaDeg = output.getOrElse(2) { 0.0f },
         )
+    }
+
+    fun computeYawDelta(alphaDegPerSecond: Float, dtMs: Float): Float {
+        return nativeComputeYawDelta(alphaDegPerSecond, dtMs)
     }
 
 
@@ -190,6 +215,9 @@ object RustCoreBridge {
                 positionX = 0.0f,
                 confidence = 0.0f,
                 distanceCode = 0,
+                distanceM = 0.0f,
+                relativeVelocityMps = 0.0f,
+                timeToCollisionS = null,
             )
         }
 
@@ -221,6 +249,9 @@ object RustCoreBridge {
             positionX = output.getOrElse(1) { 0.0f },
             confidence = output.getOrElse(2) { 0.0f },
             distanceCode = output.getOrElse(3) { 0.0f }.toInt(),
+            distanceM = output.getOrElse(4) { 0.0f }.coerceAtLeast(0.0f),
+            relativeVelocityMps = output.getOrElse(5) { 0.0f },
+            timeToCollisionS = output.getOrNull(6)?.takeIf { it.isFinite() && it > 0.0f },
         )
     }
 }

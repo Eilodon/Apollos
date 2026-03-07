@@ -1,5 +1,9 @@
 use apollos_proto::contracts::{SensorHealthSnapshot, SensorUncertaintySnapshot};
 use nalgebra::{Matrix3, Matrix3x6, Matrix6, Vector3};
+use std::time::Instant;
+
+const MAX_COVARIANCE_TRACE: f32 = 50.0;
+const MAX_VISION_GAP_S: f32 = 30.0;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SensorSample {
@@ -13,7 +17,7 @@ pub struct SensorSample {
 /// Compact continuous-state fusion (position + velocity) for edge observability.
 ///
 /// This is a lightweight ESKF-style approximation for T1 use:
-/// - `predict_imu` propagates state and covariance with IMU acceleration.
+/// - `predict_imu` propagates state and covariance with gravity-compensated IMU acceleration.
 /// - `update_vision` corrects position from camera/depth observation.
 #[derive(Debug, Clone)]
 pub struct EskfFusionEngine {
@@ -23,6 +27,8 @@ pub struct EskfFusionEngine {
     imu_noise_variance: f32,
     vision_noise_variance: f32,
     last_innovation_norm: f32,
+    last_vision_update: Instant,
+    pub drift_reset_count: u32,
 }
 
 impl Default for EskfFusionEngine {
@@ -40,6 +46,8 @@ impl EskfFusionEngine {
             imu_noise_variance: 0.1,
             vision_noise_variance: 0.02,
             last_innovation_norm: 0.0,
+            last_vision_update: Instant::now(),
+            drift_reset_count: 0,
         }
     }
 
@@ -49,6 +57,7 @@ impl EskfFusionEngine {
         self
     }
 
+    /// `accel_m_s2` must be linear acceleration with gravity removed.
     pub fn predict_imu(&mut self, accel_m_s2: Vector3<f32>, dt_s: f32) {
         let dt = dt_s.clamp(1e-4, 0.2);
         let dt2 = dt * dt;
@@ -80,6 +89,21 @@ impl EskfFusionEngine {
 
         self.covariance = f * self.covariance * f.transpose() + q;
         self.repair_covariance();
+
+        // Auto-reset: nếu covariance trace vượt ngưỡng, position đã trôi quá xa
+        let trace = self.covariance.trace();
+        if trace > MAX_COVARIANCE_TRACE {
+            self.reset();
+        }
+    }
+
+    /// Reset ESKF về trạng thái ban đầu khi drift mất kiểm soát.
+    pub fn reset(&mut self) {
+        self.covariance = Matrix6::identity() * 0.5;
+        self.position = Vector3::zeros();
+        self.velocity = Vector3::zeros();
+        self.last_innovation_norm = 0.0;
+        self.drift_reset_count += 1;
     }
 
     pub fn update_vision(&mut self, vision_pos: Vector3<f32>) -> bool {
@@ -116,6 +140,7 @@ impl EskfFusionEngine {
 
         let nis = (y.transpose() * s_inv * y)[(0, 0)];
         self.last_innovation_norm = nis.max(0.0).sqrt();
+        self.last_vision_update = Instant::now();
         true
     }
 
@@ -126,8 +151,9 @@ impl EskfFusionEngine {
 
     pub fn compute_health(&self) -> SensorHealthSnapshot {
         let uncertainty = self.localization_uncertainty_m();
+        let vision_gap_s = self.last_vision_update.elapsed().as_secs_f32();
         let score = (-0.5 * uncertainty).exp().clamp(0.0, 1.0);
-        let degraded = score < 0.6 || uncertainty > 2.0;
+        let degraded = score < 0.6 || uncertainty > 2.0 || vision_gap_s > MAX_VISION_GAP_S;
 
         let mut flags = Vec::new();
         if uncertainty > 2.0 {
@@ -135,6 +161,12 @@ impl EskfFusionEngine {
         }
         if uncertainty > 4.0 {
             flags.push("tracking_lost".to_string());
+        }
+        if vision_gap_s > MAX_VISION_GAP_S {
+            flags.push(format!("vision_gap_{:.0}s", vision_gap_s));
+        }
+        if self.drift_reset_count > 0 {
+            flags.push(format!("drift_resets_{}", self.drift_reset_count));
         }
 
         SensorHealthSnapshot {

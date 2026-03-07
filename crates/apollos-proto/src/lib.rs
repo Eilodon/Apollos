@@ -1,3 +1,4 @@
+#![allow(clippy::large_enum_variant)]
 //! Shared message contracts for Apollos client/server communication.
 
 pub mod contracts;

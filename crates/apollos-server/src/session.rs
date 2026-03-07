@@ -35,6 +35,7 @@ pub struct SessionState {
     pub degraded_reason: String,
     pub last_hazard_score: f32,
     pub last_hard_stop: bool,
+    pub continuous_hard_stop_since_epoch: Option<f64>,
     pub cloud_link_healthy: bool,
     pub cloud_rtt_ms: Option<f32>,
     pub edge_cognition_available: bool,
@@ -68,6 +69,7 @@ impl SessionState {
             degraded_reason: String::new(),
             last_hazard_score: 0.0,
             last_hard_stop: false,
+            continuous_hard_stop_since_epoch: None,
             cloud_link_healthy: true,
             cloud_rtt_ms: None,
             edge_cognition_available: false,
@@ -92,6 +94,7 @@ pub struct SessionObservability {
     pub edge_hazard_type: String,
     pub last_hazard_score: f32,
     pub last_hard_stop: bool,
+    pub continuous_hard_stop_duration_s: f32,
     pub cloud_link_healthy: bool,
     pub cloud_rtt_ms: Option<f32>,
     pub edge_cognition_available: bool,
@@ -153,7 +156,7 @@ impl Default for SessionStore {
 impl SessionStore {
     const SENSOR_HEALTH_DEGRADED_THRESHOLD: f32 = 0.55;
     const LOCALIZATION_UNCERTAINTY_DEGRADED_M: f32 = 6.0;
-    const CLOUD_RTT_DEGRADED_MS: f32 = 900.0;
+    const CLOUD_RTT_DEGRADED_MS: f32 = 300.0;
     const EDGE_COGNITION_STALE_S: f64 = 20.0;
     const EDGE_COGNITION_RECENCY_S: f64 = 8.0;
 
@@ -344,6 +347,7 @@ impl SessionStore {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_observability(
         &self,
         session_id: &str,
@@ -377,6 +381,11 @@ impl SessionStore {
             }
 
             if let Some(hard_stop) = latest_hard_stop {
+                if hard_stop && !state.last_hard_stop {
+                    state.continuous_hard_stop_since_epoch = Some(now_epoch());
+                } else if !hard_stop {
+                    state.continuous_hard_stop_since_epoch = None;
+                }
                 state.last_hard_stop = hard_stop;
             }
 
@@ -454,7 +463,7 @@ impl SessionStore {
             {
                 transition = Some(CognitionStateMessage {
                     session_id: state.session_id.clone(),
-                    timestamp: Utc::now().to_rfc3339(),
+                    timestamp_ms: Utc::now().timestamp_millis() as u64,
                     active_layer: state.active_cognition_layer,
                     cloud_link_healthy: state.cloud_link_healthy,
                     edge_cognition_available: state.edge_cognition_available,
@@ -494,6 +503,7 @@ impl SessionStore {
                 edge_hazard_type: String::new(),
                 last_hazard_score: 0.0,
                 last_hard_stop: false,
+                continuous_hard_stop_duration_s: 0.0,
                 cloud_link_healthy: true,
                 cloud_rtt_ms: None,
                 edge_cognition_available: false,
@@ -513,6 +523,9 @@ impl SessionStore {
             edge_hazard_type: state.edge_hazard_type.clone(),
             last_hazard_score: state.last_hazard_score,
             last_hard_stop: state.last_hard_stop,
+            continuous_hard_stop_duration_s: state.continuous_hard_stop_since_epoch
+                .map(|since| (now_epoch() - since) as f32)
+                .unwrap_or(0.0),
             cloud_link_healthy: state.cloud_link_healthy,
             cloud_rtt_ms: state.cloud_rtt_ms,
             edge_cognition_available: state.edge_cognition_available,
@@ -610,6 +623,7 @@ impl SessionStore {
         true
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn log_hazard(
         &self,
         session_id: &str,
@@ -654,7 +668,7 @@ impl SessionStore {
             let guard = self.inner.read().await;
             if let Some(state) = guard.get(session_id) {
                 if let (Some(lat), Some(lng)) = (state.lat, state.lng) {
-                    let geohash = encode_geohash(lat, lng, 7);
+                    let geohash = encode_geohash(lat, lng, 9);
                     let doc_id = format!("{}-{}", geohash, sanitize_doc_id_fragment(hazard_type));
 
                     let mut crowd_guard = self.crowd_hazard_map.write().await;

@@ -161,7 +161,7 @@ impl Default for HumanFallbackService {
         let twilio = TwilioConfig::from_env(viewer_ttl_seconds);
 
         if twilio_required && twilio.is_none() {
-            panic!("TWILIO_REQUIRED is enabled but Twilio config is missing");
+            tracing::error!("TWILIO_REQUIRED is enabled but Twilio config is missing. Human fallback will be severely degraded.");
         }
 
         Self {
@@ -184,16 +184,14 @@ impl HumanFallbackService {
         &self,
         session_id: &str,
         reason: &str,
-    ) -> HumanHelpSessionMessage {
+    ) -> Option<HumanHelpSessionMessage> {
         self.prune().await;
 
         let help_ticket = mint_token("help", session_id);
         let expires_at = Utc::now() + Duration::seconds(self.ticket_ttl_seconds);
         let room_name = self.room_name(session_id);
         let publisher_identity = format!("patient-{session_id}");
-        let publisher_token = self
-            .mint_twilio_video_token(&room_name, &publisher_identity)
-            .expect("failed to mint Twilio publisher token");
+        let publisher_token = self.mint_twilio_video_token(&room_name, &publisher_identity)?;
         let rtc_expires_in = self.twilio_token_ttl_seconds() as u32;
 
         let mut guard = self.state.write().await;
@@ -207,9 +205,9 @@ impl HumanFallbackService {
             },
         );
 
-        HumanHelpSessionMessage {
+        Some(HumanHelpSessionMessage {
             session_id: session_id.to_string(),
-            timestamp: Utc::now().to_rfc3339(),
+            timestamp_ms: Utc::now().timestamp_millis() as u64,
             help_link: Some(format!(
                 "{}?help_ticket={help_ticket}",
                 self.public_help_base
@@ -221,7 +219,7 @@ impl HumanFallbackService {
                 token: publisher_token,
                 expires_in: rtc_expires_in,
             },
-        }
+        })
     }
 
     pub async fn exchange_help_ticket(&self, ticket: &str) -> Option<HelpTicketExchangeResult> {
@@ -246,9 +244,7 @@ impl HumanFallbackService {
         let expires_at = Utc::now() + Duration::seconds(self.viewer_ttl_seconds);
         let room_name = self.room_name(&session_id);
         let helper_identity = format!("helper-{}", Uuid::new_v4().simple());
-        let viewer_rtc_token = self
-            .mint_twilio_video_token(&room_name, &helper_identity)
-            .expect("failed to mint Twilio viewer token");
+        let viewer_rtc_token = self.mint_twilio_video_token(&room_name, &helper_identity)?;
         let rtc_expires_in = self.twilio_token_ttl_seconds() as u32;
 
         let mut guard = self.state.write().await;
@@ -414,7 +410,10 @@ mod tests {
     #[tokio::test]
     async fn help_ticket_is_one_time_exchange() {
         let service = test_service();
-        let session = service.create_help_session("s1", "manual").await;
+        let session = service
+            .create_help_session("s1", "manual")
+            .await
+            .expect("must create help session");
         let link = session.help_link.expect("must have link");
         let ticket = link
             .split("help_ticket=")
@@ -432,7 +431,10 @@ mod tests {
     #[tokio::test]
     async fn viewer_token_must_match_session() {
         let service = test_service();
-        let session = service.create_help_session("s2", "manual").await;
+        let session = service
+            .create_help_session("s2", "manual")
+            .await
+            .expect("must create help session");
         let link = session.help_link.expect("must have link");
         let ticket = link
             .split("help_ticket=")

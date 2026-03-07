@@ -66,7 +66,7 @@ pub fn decode_client_message(
         messages_v1::client_envelope::Payload::HazardObservation(value) => {
             contracts::ClientToBackendMessage::HazardObservation(hazard_observation_from_proto(
                 value,
-            ))
+            )?)
         }
     };
 
@@ -122,7 +122,7 @@ pub fn decode_server_message(
             contracts::BackendToClientMessage::AssistantAudio(assistant_audio_from_proto(value))
         }
         messages_v1::server_envelope::Payload::SafetyDirective(value) => {
-            contracts::BackendToClientMessage::SafetyDirective(safety_directive_from_proto(value))
+            contracts::BackendToClientMessage::SafetyDirective(safety_directive_from_proto(value)?)
         }
         messages_v1::server_envelope::Payload::ConnectionState(value) => {
             contracts::BackendToClientMessage::ConnectionState(connection_state_from_proto(value)?)
@@ -146,7 +146,7 @@ fn multimodal_to_proto(
 ) -> Result<messages_v1::MultimodalFrameMessage, TransportError> {
     Ok(messages_v1::MultimodalFrameMessage {
         session_id: value.session_id.clone(),
-        timestamp: value.timestamp.clone(),
+        timestamp_ms: value.timestamp_ms,
         frame_jpeg: value
             .frame_jpeg_base64
             .as_deref()
@@ -186,7 +186,7 @@ fn multimodal_from_proto(
 ) -> Result<contracts::MultimodalFrameMessage, TransportError> {
     Ok(contracts::MultimodalFrameMessage {
         session_id: value.session_id,
-        timestamp: value.timestamp,
+        timestamp_ms: value.timestamp_ms,
         frame_jpeg_base64: value
             .frame_jpeg
             .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)),
@@ -217,7 +217,7 @@ fn multimodal_from_proto(
 fn audio_chunk_to_proto(value: &contracts::AudioChunkMessage) -> messages_v1::AudioChunkMessage {
     messages_v1::AudioChunkMessage {
         session_id: value.session_id.clone(),
-        timestamp: value.timestamp.clone(),
+        timestamp_ms: value.timestamp_ms,
         audio_chunk_pcm16: value.audio_chunk_pcm16.clone(),
     }
 }
@@ -225,7 +225,7 @@ fn audio_chunk_to_proto(value: &contracts::AudioChunkMessage) -> messages_v1::Au
 fn audio_chunk_from_proto(value: messages_v1::AudioChunkMessage) -> contracts::AudioChunkMessage {
     contracts::AudioChunkMessage {
         session_id: value.session_id,
-        timestamp: value.timestamp,
+        timestamp_ms: value.timestamp_ms,
         audio_chunk_pcm16: value.audio_chunk_pcm16,
     }
 }
@@ -233,7 +233,7 @@ fn audio_chunk_from_proto(value: messages_v1::AudioChunkMessage) -> contracts::A
 fn user_command_to_proto(value: &contracts::UserCommandMessage) -> messages_v1::UserCommandMessage {
     messages_v1::UserCommandMessage {
         session_id: value.session_id.clone(),
-        timestamp: value.timestamp.clone(),
+        timestamp_ms: value.timestamp_ms,
         command: value.command.clone(),
     }
 }
@@ -243,7 +243,7 @@ fn user_command_from_proto(
 ) -> contracts::UserCommandMessage {
     contracts::UserCommandMessage {
         session_id: value.session_id,
-        timestamp: value.timestamp,
+        timestamp_ms: value.timestamp_ms,
         command: value.command,
     }
 }
@@ -253,8 +253,8 @@ fn hazard_observation_to_proto(
 ) -> messages_v1::HazardObservationMessage {
     messages_v1::HazardObservationMessage {
         session_id: value.session_id.clone(),
-        timestamp: value.timestamp.clone(),
-        hazard_type: value.hazard_type.clone(),
+        timestamp_ms: value.timestamp_ms,
+        hazard_type: hazard_type_to_proto(value.hazard_type) as i32,
         bearing_x: value.bearing_x,
         distance_m: value.distance_m,
         relative_velocity_mps: value.relative_velocity_mps,
@@ -266,18 +266,18 @@ fn hazard_observation_to_proto(
 
 fn hazard_observation_from_proto(
     value: messages_v1::HazardObservationMessage,
-) -> contracts::HazardObservationMessage {
-    contracts::HazardObservationMessage {
+) -> Result<contracts::HazardObservationMessage, TransportError> {
+    Ok(contracts::HazardObservationMessage {
         session_id: value.session_id,
-        timestamp: value.timestamp,
-        hazard_type: value.hazard_type,
+        timestamp_ms: value.timestamp_ms,
+        hazard_type: hazard_type_from_proto(value.hazard_type)?,
         bearing_x: value.bearing_x,
         distance_m: value.distance_m,
         relative_velocity_mps: value.relative_velocity_mps,
         confidence: value.confidence,
         source: value.source,
         suppress_ms: value.suppress_ms,
-    }
+    })
 }
 
 fn assistant_text_to_proto(
@@ -285,7 +285,7 @@ fn assistant_text_to_proto(
 ) -> messages_v1::AssistantTextMessage {
     messages_v1::AssistantTextMessage {
         session_id: value.session_id.clone(),
-        timestamp: value.timestamp.clone(),
+        timestamp_ms: value.timestamp_ms,
         text: value.text.clone(),
     }
 }
@@ -295,7 +295,7 @@ fn assistant_text_from_proto(
 ) -> contracts::AssistantTextMessage {
     contracts::AssistantTextMessage {
         session_id: value.session_id,
-        timestamp: value.timestamp,
+        timestamp_ms: value.timestamp_ms,
         text: value.text,
     }
 }
@@ -305,7 +305,7 @@ fn assistant_audio_to_proto(
 ) -> Result<messages_v1::AssistantAudioMessage, TransportError> {
     Ok(messages_v1::AssistantAudioMessage {
         session_id: value.session_id.clone(),
-        timestamp: value.timestamp.clone(),
+        timestamp_ms: value.timestamp_ms,
         pcm24: value
             .pcm24
             .as_deref()
@@ -325,7 +325,7 @@ fn assistant_audio_from_proto(
 ) -> contracts::AssistantAudioMessage {
     contracts::AssistantAudioMessage {
         session_id: value.session_id,
-        timestamp: value.timestamp,
+        timestamp_ms: value.timestamp_ms,
         pcm24: value
             .pcm24
             .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)),
@@ -341,8 +341,8 @@ fn safety_directive_to_proto(
 ) -> messages_v1::SafetyDirectiveMessage {
     messages_v1::SafetyDirectiveMessage {
         session_id: value.session_id.clone(),
-        timestamp: value.timestamp.clone(),
-        hazard_type: value.hazard_type.clone(),
+        timestamp_ms: value.timestamp_ms,
+        hazard_type: value.hazard_type.map(|hazard| hazard_type_to_proto(hazard) as i32),
         hazard_score: value.hazard_score,
         hard_stop: value.hard_stop,
         haptic_intensity: value.haptic_intensity,
@@ -350,16 +350,17 @@ fn safety_directive_to_proto(
         spatial_audio_pan: value.spatial_audio_pan,
         needs_human_assistance: value.needs_human_assistance,
         reason: value.reason.clone(),
+        flush_audio: value.flush_audio,
     }
 }
 
 fn safety_directive_from_proto(
     value: messages_v1::SafetyDirectiveMessage,
-) -> contracts::SafetyDirectiveMessage {
-    contracts::SafetyDirectiveMessage {
+) -> Result<contracts::SafetyDirectiveMessage, TransportError> {
+    Ok(contracts::SafetyDirectiveMessage {
         session_id: value.session_id,
-        timestamp: value.timestamp,
-        hazard_type: value.hazard_type,
+        timestamp_ms: value.timestamp_ms,
+        hazard_type: value.hazard_type.map(hazard_type_from_proto).transpose()?,
         hazard_score: value.hazard_score,
         hard_stop: value.hard_stop,
         haptic_intensity: value.haptic_intensity,
@@ -367,7 +368,8 @@ fn safety_directive_from_proto(
         spatial_audio_pan: value.spatial_audio_pan,
         needs_human_assistance: value.needs_human_assistance,
         reason: value.reason,
-    }
+        flush_audio: value.flush_audio,
+    })
 }
 
 fn connection_state_to_proto(
@@ -409,7 +411,7 @@ fn cognition_state_to_proto(
 ) -> messages_v1::CognitionStateMessage {
     messages_v1::CognitionStateMessage {
         session_id: value.session_id.clone(),
-        timestamp: value.timestamp.clone(),
+        timestamp_ms: value.timestamp_ms,
         active_layer: cognition_layer_to_proto(value.active_layer) as i32,
         cloud_link_healthy: value.cloud_link_healthy,
         edge_cognition_available: value.edge_cognition_available,
@@ -423,7 +425,7 @@ fn cognition_state_from_proto(
 ) -> Result<contracts::CognitionStateMessage, TransportError> {
     Ok(contracts::CognitionStateMessage {
         session_id: value.session_id,
-        timestamp: value.timestamp,
+        timestamp_ms: value.timestamp_ms,
         active_layer: cognition_layer_from_proto(value.active_layer)?,
         cloud_link_healthy: value.cloud_link_healthy,
         edge_cognition_available: value.edge_cognition_available,
@@ -437,7 +439,7 @@ fn human_help_to_proto(
 ) -> messages_v1::HumanHelpSessionMessage {
     messages_v1::HumanHelpSessionMessage {
         session_id: value.session_id.clone(),
-        timestamp: value.timestamp.clone(),
+        timestamp_ms: value.timestamp_ms,
         help_link: value.help_link.clone(),
         rtc: Some(human_help_rtc_to_proto(&value.rtc)),
     }
@@ -452,7 +454,7 @@ fn human_help_from_proto(
 
     Ok(contracts::HumanHelpSessionMessage {
         session_id: value.session_id,
-        timestamp: value.timestamp,
+        timestamp_ms: value.timestamp_ms,
         help_link: value.help_link,
         rtc: human_help_rtc_from_proto(rtc)?,
     })
@@ -662,6 +664,31 @@ fn carry_mode_from_proto(value: i32) -> Result<contracts::CarryMode, TransportEr
     })
 }
 
+fn hazard_type_to_proto(value: contracts::HazardType) -> types_v1::HazardType {
+    match value {
+        contracts::HazardType::Unspecified => types_v1::HazardType::Unspecified,
+        contracts::HazardType::DropAhead => types_v1::HazardType::DropAhead,
+        contracts::HazardType::StaticObstacle => types_v1::HazardType::StaticObstacle,
+        contracts::HazardType::DynamicObstacle => types_v1::HazardType::DynamicObstacle,
+        contracts::HazardType::Vehicle => types_v1::HazardType::Vehicle,
+    }
+}
+
+fn hazard_type_from_proto(value: i32) -> Result<contracts::HazardType, TransportError> {
+    let value = types_v1::HazardType::try_from(value).map_err(|_| TransportError::UnknownEnum {
+        field: "HazardType",
+        value,
+    })?;
+
+    Ok(match value {
+        types_v1::HazardType::Unspecified => contracts::HazardType::Unspecified,
+        types_v1::HazardType::DropAhead => contracts::HazardType::DropAhead,
+        types_v1::HazardType::StaticObstacle => contracts::HazardType::StaticObstacle,
+        types_v1::HazardType::DynamicObstacle => contracts::HazardType::DynamicObstacle,
+        types_v1::HazardType::Vehicle => contracts::HazardType::Vehicle,
+    })
+}
+
 fn connection_state_to_proto_enum(
     value: contracts::ConnectionState,
 ) -> messages_v1::ConnectionStateKind {
@@ -780,7 +807,7 @@ mod tests {
         let message =
             contracts::ClientToBackendMessage::UserCommand(contracts::UserCommandMessage {
                 session_id: "s1".to_string(),
-                timestamp: "2026-03-05T10:00:00Z".to_string(),
+                timestamp_ms: 1_741_255_200_000,
                 command: "help".to_string(),
             });
 
@@ -807,11 +834,11 @@ mod tests {
         let message = contracts::ClientToBackendMessage::HazardObservation(
             contracts::HazardObservationMessage {
                 session_id: "haz-1".to_string(),
-                timestamp: "2026-03-06T10:00:00Z".to_string(),
-                hazard_type: "DROP_AHEAD".to_string(),
+                timestamp_ms: 1_741_341_600_000,
+                hazard_type: contracts::HazardType::DropAhead,
                 bearing_x: Some(-0.2),
-                distance_m: Some(1.4),
-                relative_velocity_mps: Some(-2.1),
+                distance_m: 1.4,
+                relative_velocity_mps: -2.1,
                 confidence: Some(0.93),
                 source: Some("native_depth".to_string()),
                 suppress_ms: Some(2800),
@@ -828,8 +855,8 @@ mod tests {
         let message =
             contracts::BackendToClientMessage::SafetyDirective(contracts::SafetyDirectiveMessage {
                 session_id: "s-dir-1".to_string(),
-                timestamp: "2026-03-06T10:00:00Z".to_string(),
-                hazard_type: Some("DROP_AHEAD".to_string()),
+                timestamp_ms: 1_741_341_600_000,
+                hazard_type: Some(contracts::HazardType::DropAhead),
                 hazard_score: 4.8,
                 hard_stop: true,
                 haptic_intensity: 0.92,
@@ -837,6 +864,7 @@ mod tests {
                 spatial_audio_pan: -0.3,
                 needs_human_assistance: false,
                 reason: Some("trace_replay".to_string()),
+                flush_audio: true,
             });
 
         let encoded = encode_server_message(&message).expect("encode should pass");

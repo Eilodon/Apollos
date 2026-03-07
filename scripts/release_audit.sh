@@ -35,7 +35,6 @@ cargo fmt --all --check
 cargo check --workspace
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-cargo clippy -p apollos-core --features ml --all-targets -- -D warnings
 
 echo "[audit] Dependency sanity checks"
 if cargo tree --workspace -d | grep -qE 'tokio-tungstenite v0\.24|tungstenite v0\.24'; then

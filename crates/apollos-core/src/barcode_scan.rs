@@ -16,7 +16,7 @@ pub struct DeterministicScanTracker {
 impl Default for DeterministicScanTracker {
     fn default() -> Self {
         Self {
-            min_emit_interval_ms: 2500,
+            min_emit_interval_ms: 500,
             last_emit_at_ms: 0,
             candidate_value: String::new(),
             candidate_stable_count: 0,
@@ -51,7 +51,7 @@ impl DeterministicScanTracker {
             self.candidate_stable_count = 1;
         }
 
-        if self.candidate_stable_count < 2
+        if self.candidate_stable_count < 1
             || now_ms.saturating_sub(self.last_emit_at_ms) < self.min_emit_interval_ms
         {
             return None;

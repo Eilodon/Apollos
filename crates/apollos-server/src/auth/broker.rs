@@ -22,6 +22,7 @@ struct WsTicketRecord {
     expires_at: DateTime<Utc>,
 }
 
+// TODO: KRONOS-CRITICAL: Di chuyển BrokerState sang Redis
 #[derive(Debug, Default)]
 struct BrokerState {
     sessions: HashMap<String, SessionRecord>,
@@ -197,9 +198,14 @@ pub async fn oidc_exchange_handler(
     State(state): State<AppState>,
     Json(payload): Json<OidcExchangeRequest>,
 ) -> Result<Json<OidcExchangeResponse>, StatusCode> {
-    let identity = crate::auth::oidc::verify_id_token(&payload.id_token)
-        .await
-        .ok_or(StatusCode::UNAUTHORIZED)?;
+    tracing::debug!("oidc_exchange_handler: received id_token={}", payload.id_token);
+    let Some(identity) = crate::auth::oidc::verify_id_token(&payload.id_token).await else {
+        tracing::warn!(
+            "oidc_exchange_handler: verify_id_token failed for token={}",
+            payload.id_token
+        );
+        return Err(StatusCode::UNAUTHORIZED);
+    };
 
     let session_token = state.broker.create_session(identity.subject).await;
     Ok(Json(OidcExchangeResponse {

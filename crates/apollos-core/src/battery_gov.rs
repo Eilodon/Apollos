@@ -11,7 +11,7 @@ pub fn compute_duty_cycle(battery_percent: u8, motion_state: MotionState) -> Dut
 
     if low_power {
         return DutyCycle {
-            camera_interval_ms: 250,
+            camera_interval_ms: 100,
             depth_interval_ms: 200,
         };
     }

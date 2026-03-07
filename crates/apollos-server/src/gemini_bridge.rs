@@ -6,8 +6,8 @@ use std::{
 use anyhow::Context;
 use apollos_proto::contracts::{
     AssistantAudioMessage, AssistantTextMessage, BackendToClientMessage, CognitionLayer,
-    ConnectionState, ConnectionStateMessage, HumanHelpSessionMessage, NavigationMode,
-    SafetyDirectiveMessage, SemanticCue, SemanticCueMessage,
+    ConnectionState, ConnectionStateMessage, HazardType, NavigationMode, SafetyDirectiveMessage,
+    SemanticCue, SemanticCueMessage,
 };
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
@@ -375,7 +375,7 @@ impl GeminiBridge {
             {
                 tracing::warn!(
                     session_id = %session_key,
-                    error = %error,
+                    error = ?error,
                     "gemini live runner exited with error"
                 );
             }
@@ -455,22 +455,66 @@ impl LiveSessionRunner {
         control_tx: mpsc::Sender<LiveControl>,
         mut control_rx: mpsc::Receiver<LiveControl>,
     ) -> anyhow::Result<()> {
-        let result = self
-            .run_inner(tx, &mut outbound_rx, control_tx, &mut control_rx)
-            .await;
+        const MAX_RESUME_ATTEMPTS: u32 = 3;
+        let mut attempt = 0u32;
 
-        if let Err(error) = &result {
-            self.emit_connection_state(
-                ConnectionState::Reconnecting,
-                format!("gemini_live_error: {error}"),
-            )
-            .await;
-        } else {
-            self.emit_connection_state(ConnectionState::Disconnected, "gemini_live_closed")
+        loop {
+            let result = self
+                .run_inner(tx.clone(), &mut outbound_rx, control_tx.clone(), &mut control_rx)
                 .await;
-        }
 
-        result
+            match &result {
+                Ok(()) => {
+                    // Graceful close (LiveControl::Close hoặc socket đóng bình thường)
+                    self.emit_connection_state(ConnectionState::Disconnected, "gemini_live_closed")
+                        .await;
+                    return Ok(());
+                }
+                Err(error) => {
+                    attempt += 1;
+                    if attempt > MAX_RESUME_ATTEMPTS {
+                        self.emit_connection_state(
+                            ConnectionState::Disconnected,
+                            format!("gemini_live_max_retries_exceeded: {error}"),
+                        )
+                        .await;
+                        return result;
+                    }
+
+                    tracing::warn!(
+                        session_id = %self.session_id,
+                        attempt = attempt,
+                        error = %error,
+                        "gemini_live_session_reconnecting"
+                    );
+
+                    self.emit_connection_state(
+                        ConnectionState::Reconnecting,
+                        format!("gemini_live_reconnect_attempt_{attempt}: {error}"),
+                    )
+                    .await;
+
+                    // Backoff ngắn trước khi retry
+                    tokio::time::sleep(std::time::Duration::from_millis(500 * u64::from(attempt)))
+                        .await;
+
+                    // Inject context summary vào session mới sau reconnect
+                    // (run_inner sẽ gửi setup payload + connect WS mới)
+                    // Sau setup, gửi context summary dưới dạng client content
+                    let context_summary = self.sessions.get_context_summary(&self.session_id).await;
+                    if !context_summary.is_empty() {
+                        let context_msg = format!(
+                            "[SYSTEM CONTEXT RESUME] Previous session context: {}",
+                            context_summary
+                        );
+                        let _ = tx.send(LiveOutgoing::ClientContent {
+                            parts: vec![serde_json::json!({ "text": context_msg })],
+                            turn_complete: true,
+                        }).await;
+                    }
+                }
+            }
+        }
     }
 
     async fn run_inner(
@@ -617,7 +661,7 @@ impl LiveSessionRunner {
                         &self.session_id,
                         BackendToClientMessage::AssistantText(AssistantTextMessage {
                             session_id: self.session_id.clone(),
-                            timestamp: Utc::now().to_rfc3339(),
+                            timestamp_ms: Utc::now().timestamp_millis() as u64,
                             text,
                         }),
                     )
@@ -631,7 +675,7 @@ impl LiveSessionRunner {
                         &self.session_id,
                         BackendToClientMessage::AssistantAudio(AssistantAudioMessage {
                             session_id: self.session_id.clone(),
-                            timestamp: Utc::now().to_rfc3339(),
+                            timestamp_ms: Utc::now().timestamp_millis() as u64,
                             pcm24: None,
                             pcm16: Some(chunk),
                             hazard_position_x: None,
@@ -718,8 +762,11 @@ impl LiveSessionRunner {
         control_tx: &mpsc::Sender<LiveControl>,
         args: &Map<String, Value>,
     ) -> Value {
-        let hazard_type =
+        let hazard_type_str =
             arg_str(args, "hazard_type").unwrap_or_else(|| "UNKNOWN_HAZARD".to_string());
+        let hazard_type =
+            HazardType::from_str(&hazard_type_str).unwrap_or(HazardType::Unspecified);
+        let hazard_type_label = hazard_type.as_str();
         let position_x = arg_f32(args, "position_x").unwrap_or(0.0).clamp(-1.0, 1.0);
         let confidence = arg_f32(args, "confidence").unwrap_or(0.7).clamp(0.0, 1.0);
         let distance_m = arg_f32(args, "distance_m").unwrap_or(2.0).max(0.0);
@@ -738,13 +785,14 @@ impl LiveSessionRunner {
             sensor_health_score: observability.sensor_health_score,
             localization_uncertainty_m: observability.localization_uncertainty_m,
             edge_reflex_active: observability.edge_reflex_active || reflex_gate,
+            continuous_hard_stop_duration_s: observability.continuous_hard_stop_duration_s,
         });
 
         if decision.should_emit_hard_stop() {
             self.sessions
                 .mark_edge_hazard(
                     &self.session_id,
-                    hazard_type.clone(),
+                    hazard_type_label.to_string(),
                     Some(suppress_seconds),
                 )
                 .await;
@@ -752,7 +800,7 @@ impl LiveSessionRunner {
             let _ = control_tx
                 .send(LiveControl::Interrupt {
                     reason: format!(
-                        "hazard={hazard_type};distance_m={distance_m:.2};closing={:.2};score={:.2}",
+                        "hazard={hazard_type_label};distance_m={distance_m:.2};closing={:.2};score={:.2}",
                         (-relative_velocity_mps).max(0.0),
                         decision.hazard_score
                     ),
@@ -763,7 +811,7 @@ impl LiveSessionRunner {
         self.sessions
             .log_hazard(
                 &self.session_id,
-                &hazard_type,
+                hazard_type_label,
                 position_x,
                 Some(distance_m),
                 Some(relative_velocity_mps),
@@ -789,8 +837,8 @@ impl LiveSessionRunner {
 
         let directive = BackendToClientMessage::SafetyDirective(SafetyDirectiveMessage {
             session_id: self.session_id.clone(),
-            timestamp: Utc::now().to_rfc3339(),
-            hazard_type: Some(hazard_type.clone()),
+            timestamp_ms: Utc::now().timestamp_millis() as u64,
+            hazard_type: Some(hazard_type),
             hazard_score: decision.hazard_score,
             hard_stop: decision.hard_stop,
             haptic_intensity: decision.haptic_intensity,
@@ -798,6 +846,7 @@ impl LiveSessionRunner {
             spatial_audio_pan: decision.spatial_audio_pan,
             needs_human_assistance: decision.human_assistance,
             reason: Some(decision.reason.clone()),
+            flush_audio: decision.hard_stop,
         });
 
         if decision.should_emit_hard_stop() {
@@ -812,17 +861,19 @@ impl LiveSessionRunner {
         }
 
         if decision.should_escalate_human() {
-            let help = self
+            if let Some(help) = self
                 .fallback
                 .create_help_session(&self.session_id, "gemini_safety_policy")
-                .await;
-            let _ = self
-                .ws_registry
-                .send_live(
-                    &self.session_id,
-                    BackendToClientMessage::HumanHelpSession(help),
-                )
-                .await;
+                .await
+            {
+                let _ = self
+                    .ws_registry
+                    .send_live(
+                        &self.session_id,
+                        BackendToClientMessage::HumanHelpSession(help),
+                    )
+                    .await;
+            }
         }
 
         let _ = self
@@ -940,31 +991,30 @@ impl LiveSessionRunner {
     }
 
     async fn tool_request_human_help(&self) -> Value {
-        let help = self
+        if let Some(help) = self
             .fallback
             .create_help_session(&self.session_id, "gemini_tool")
-            .await;
+            .await
+        {
+            let _ = self
+                .ws_registry
+                .send_live(
+                    &self.session_id,
+                    BackendToClientMessage::HumanHelpSession(help.clone()),
+                )
+                .await;
 
-        let help_payload = HumanHelpSessionMessage {
-            session_id: help.session_id.clone(),
-            timestamp: help.timestamp.clone(),
-            help_link: help.help_link.clone(),
-            rtc: help.rtc.clone(),
-        };
-
-        let _ = self
-            .ws_registry
-            .send_live(
-                &self.session_id,
-                BackendToClientMessage::HumanHelpSession(help_payload),
-            )
-            .await;
-
-        json!({
-            "ok": true,
-            "help_link": help.help_link,
-            "rtc": serde_json::to_value(help.rtc).unwrap_or_else(|_| json!({})),
-        })
+            json!({
+                "ok": true,
+                "help_link": help.help_link,
+                "rtc": serde_json::to_value(help.rtc).unwrap_or_else(|_| json!({})),
+            })
+        } else {
+            json!({
+                "ok": false,
+                "error": "human_fallback_unavailable",
+            })
+        }
     }
 }
 

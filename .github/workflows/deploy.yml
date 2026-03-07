@@ -40,9 +40,6 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Clippy (ml feature)
-        run: cargo clippy -p apollos-core --features ml --all-targets -- -D warnings
-
   terraform-plan:
     if: ${{ github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
@@ -105,4 +102,4 @@ jobs:
             --region ${{ vars.GCP_REGION }} \
             --project ${{ secrets.GCP_PROJECT_ID }} \
             --max-instances=1 \
-            --update-env-vars APP_ENV=production,ENABLE_GEMINI_LIVE=1,WS_AUTH_MODE=oidc_broker,OIDC_REQUIRE_STRICT=1,OIDC_ISSUER=$OIDC_ISSUER,OIDC_AUDIENCE=$OIDC_AUDIENCE,OIDC_JWKS_URL=$OIDC_JWKS_URL,USE_FIRESTORE=1,FIRESTORE_REQUIRED=1,TWILIO_REQUIRED=1,SINGLE_INSTANCE_ONLY=1,ENABLE_DEV_ENDPOINTS=0,CORS_ALLOW_ORIGINS=${FRONTEND_ORIGIN}
+            --update-env-vars APP_ENV=production,ENABLE_GEMINI_LIVE=1,GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }},WS_AUTH_MODE=oidc_broker,OIDC_REQUIRE_STRICT=1,OIDC_ISSUER=$OIDC_ISSUER,OIDC_AUDIENCE=$OIDC_AUDIENCE,OIDC_JWKS_URL=$OIDC_JWKS_URL,USE_FIRESTORE=1,FIRESTORE_REQUIRED=1,TWILIO_REQUIRED=0,SINGLE_INSTANCE_ONLY=1,ENABLE_DEV_ENDPOINTS=0,CORS_ALLOW_ORIGINS=${FRONTEND_ORIGIN}

@@ -97,7 +97,7 @@ mod tests {
     fn protobuf_roundtrip_with_transport_module() {
         let outbound = ClientToBackendMessage::UserCommand(UserCommandMessage {
             session_id: "s1".to_string(),
-            timestamp: "2026-03-05T10:00:00Z".to_string(),
+            timestamp_ms: 1_741_255_200_000,
             command: "status".to_string(),
         });
         let encoded = encode_message_protobuf(&outbound).expect("encode should pass");

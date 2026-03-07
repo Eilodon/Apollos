@@ -2,6 +2,12 @@ const HARD_STOP_THRESHOLD: f32 = 3.2;
 const HUMAN_ASSIST_THRESHOLD: f32 = 6.2;
 const HUMAN_ASSIST_SENSOR_HEALTH_THRESHOLD: f32 = 0.35;
 const SAFE_SILENCE_DEADZONE: f32 = 0.1;
+const PROXIMITY_OVERRIDE_DISTANCE_M: f32 = 0.6;
+const PROXIMITY_OVERRIDE_CONFIDENCE: f32 = 0.6;
+const PROXIMITY_OVERRIDE_MARGIN: f32 = 1.0;
+const TTC_GAIN: f32 = 1.6;
+const TTC_DECAY_S: f32 = 1.2;
+const TTC_MIN_CLOSING_SPEED_MPS: f32 = 0.05;
 
 #[derive(Debug, Clone, Copy)]
 pub struct FluidSafetyInput {
@@ -39,8 +45,18 @@ pub fn evaluate_fluid_safety(payload: FluidSafetyInput) -> SafetyPolicyDecision 
     let distance_risk = alpha * (-lambda * distance_m).exp();
     let velocity_risk = beta * closing_speed;
     let confidence_risk = gamma * confidence;
+    let time_to_collision_s = if closing_speed > TTC_MIN_CLOSING_SPEED_MPS {
+        Some(distance_m / closing_speed)
+    } else {
+        None
+    };
+    let ttc_risk = time_to_collision_s
+        .map(|ttc_s| TTC_GAIN * (-(ttc_s / TTC_DECAY_S)).exp())
+        .unwrap_or(0.0);
 
-    let mut hazard_score = distance_risk + velocity_risk + confidence_risk;
+    let mut hazard_score = distance_risk + velocity_risk + confidence_risk + ttc_risk;
+    let proximity_override =
+        distance_m < PROXIMITY_OVERRIDE_DISTANCE_M && confidence > PROXIMITY_OVERRIDE_CONFIDENCE;
 
     if sensor_health < 0.5 {
         hazard_score *= 1.3;
@@ -51,6 +67,10 @@ pub fn evaluate_fluid_safety(payload: FluidSafetyInput) -> SafetyPolicyDecision 
 
     if payload.edge_reflex_active {
         hazard_score += 5.0;
+    }
+
+    if proximity_override {
+        hazard_score = hazard_score.max(HARD_STOP_THRESHOLD + PROXIMITY_OVERRIDE_MARGIN);
     }
 
     let activation =
@@ -72,8 +92,10 @@ pub fn evaluate_fluid_safety(payload: FluidSafetyInput) -> SafetyPolicyDecision 
         needs_hard_stop,
         needs_human_assistance,
         reason: format!(
-            "score={hazard_score:.2};conf={confidence:.2};distance_m={distance_m:.2};closing_speed={closing_speed:.2};sensor={sensor_health:.2};loc_unc_m={loc_uncertainty:.1};edge_reflex={};silence={}",
+            "score={hazard_score:.2};conf={confidence:.2};distance_m={distance_m:.2};closing_speed={closing_speed:.2};ttc_s={:.2};sensor={sensor_health:.2};loc_unc_m={loc_uncertainty:.1};edge_reflex={};prox_override={};silence={}",
+            time_to_collision_s.unwrap_or(-1.0),
             if payload.edge_reflex_active { "1" } else { "0" },
+            if proximity_override { "1" } else { "0" },
             if hazard_score < SAFE_SILENCE_DEADZONE { "1" } else { "0" },
         ),
     }
@@ -127,5 +149,47 @@ mod tests {
         assert!(decision.hazard_score < SAFE_SILENCE_DEADZONE);
         assert_eq!(decision.haptic_intensity, 0.0);
         assert_eq!(decision.spatial_audio_pitch_hz, 0.0);
+    }
+
+    #[test]
+    fn ultra_close_static_hazard_forces_hard_stop() {
+        let decision = evaluate_fluid_safety(FluidSafetyInput {
+            hazard_confidence: 1.0,
+            distance_m: 0.1,
+            relative_velocity_mps: 0.0,
+            sensor_health_score: 1.0,
+            localization_uncertainty_m: 0.5,
+            edge_reflex_active: false,
+        });
+
+        assert!(decision.needs_hard_stop);
+        assert!(decision.hazard_score > HARD_STOP_THRESHOLD);
+        assert!(decision.reason.contains("prox_override=1"));
+    }
+
+    #[test]
+    fn short_ttc_boosts_score_for_closing_hazard() {
+        let approaching = evaluate_fluid_safety(FluidSafetyInput {
+            hazard_confidence: 0.7,
+            distance_m: 2.4,
+            relative_velocity_mps: -1.5,
+            sensor_health_score: 0.95,
+            localization_uncertainty_m: 2.0,
+            edge_reflex_active: false,
+        });
+        let receding = evaluate_fluid_safety(FluidSafetyInput {
+            relative_velocity_mps: 0.4,
+            ..FluidSafetyInput {
+                hazard_confidence: 0.7,
+                distance_m: 2.4,
+                relative_velocity_mps: -1.5,
+                sensor_health_score: 0.95,
+                localization_uncertainty_m: 2.0,
+                edge_reflex_active: false,
+            }
+        });
+
+        assert!(approaching.hazard_score > receding.hazard_score);
+        assert!(approaching.reason.contains("ttc_s="));
     }
 }

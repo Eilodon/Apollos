@@ -23,7 +23,7 @@ enum SemanticCueKind {
 
 message MultimodalFrameMessage {
   string session_id = 1;
-  string timestamp = 2;
+  uint64 timestamp_ms = 2;
   optional bytes frame_jpeg = 3;
   apollos.types.v1.MotionState motion_state = 4;
   float pitch = 5;
@@ -72,23 +72,23 @@ message VisionOdometrySnapshot {
 
 message AudioChunkMessage {
   string session_id = 1;
-  string timestamp = 2;
+  uint64 timestamp_ms = 2;
   string audio_chunk_pcm16 = 3;
 }
 
 message UserCommandMessage {
   string session_id = 1;
-  string timestamp = 2;
+  uint64 timestamp_ms = 2;
   string command = 3;
 }
 
 message HazardObservationMessage {
   string session_id = 1;
-  string timestamp = 2;
-  string hazard_type = 3;
+  uint64 timestamp_ms = 2;
+  apollos.types.v1.HazardType hazard_type = 3;
   optional float bearing_x = 4;
-  optional float distance_m = 5;
-  optional float relative_velocity_mps = 6;
+  float distance_m = 5;
+  float relative_velocity_mps = 6;
   optional float confidence = 7;
   optional string source = 8;
   optional uint32 suppress_ms = 9;
@@ -96,8 +96,8 @@ message HazardObservationMessage {
 
 message SafetyDirectiveMessage {
   string session_id = 1;
-  string timestamp = 2;
-  optional string hazard_type = 3;
+  uint64 timestamp_ms = 2;
+  optional apollos.types.v1.HazardType hazard_type = 3;
   float hazard_score = 4;
   bool hard_stop = 5;
   float haptic_intensity = 6;
@@ -105,17 +105,18 @@ message SafetyDirectiveMessage {
   float spatial_audio_pan = 8;
   bool needs_human_assistance = 9;
   optional string reason = 10;
+  bool flush_audio = 11;
 }
 
 message AssistantTextMessage {
   string session_id = 1;
-  string timestamp = 2;
+  uint64 timestamp_ms = 2;
   string text = 3;
 }
 
 message AssistantAudioMessage {
   string session_id = 1;
-  string timestamp = 2;
+  uint64 timestamp_ms = 2;
   optional bytes pcm24 = 3;
   optional bytes pcm16 = 4;
   optional float hazard_position_x = 5;
@@ -133,7 +134,7 @@ message ConnectionStateMessage {
 
 message CognitionStateMessage {
   string session_id = 1;
-  string timestamp = 2;
+  uint64 timestamp_ms = 2;
   apollos.types.v1.CognitionLayer active_layer = 3;
   bool cloud_link_healthy = 4;
   bool edge_cognition_available = 5;
@@ -143,7 +144,7 @@ message CognitionStateMessage {
 
 message HumanHelpSessionMessage {
   string session_id = 1;
-  string timestamp = 2;
+  uint64 timestamp_ms = 2;
   optional string help_link = 3;
   apollos.types.v1.HumanHelpRtcSession rtc = 4;
 }

@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_repr::{Deserialize_repr, Serialize_repr};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -15,6 +16,42 @@ pub enum DistanceCategory {
     VeryClose,
     Mid,
     Far,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize_repr, Deserialize_repr)]
+#[repr(i32)]
+pub enum HazardType {
+    Unspecified = 0,
+    DropAhead = 1,
+    StaticObstacle = 2,
+    DynamicObstacle = 3,
+    Vehicle = 4,
+}
+
+impl HazardType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unspecified => "unspecified",
+            Self::DropAhead => "drop_ahead",
+            Self::StaticObstacle => "static_obstacle",
+            Self::DynamicObstacle => "dynamic_obstacle",
+            Self::Vehicle => "vehicle",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        let normalized = value.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "drop_ahead" | "dropahead" | "edge_drop_hazard" => Some(Self::DropAhead),
+            "static_obstacle" | "staticobstacle" | "pole" => Some(Self::StaticObstacle),
+            "dynamic_obstacle" | "dynamicobstacle" | "moving_obstacle" => {
+                Some(Self::DynamicObstacle)
+            }
+            "vehicle" | "bike" | "motorbike" | "car" => Some(Self::Vehicle),
+            "unspecified" | "unknown_hazard" | "unknown" => Some(Self::Unspecified),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,7 +137,7 @@ pub struct EdgeSemanticCueMessage {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MultimodalFrameMessage {
     pub session_id: String,
-    pub timestamp: String,
+    pub timestamp_ms: u64,
     pub frame_jpeg_base64: Option<String>,
     pub motion_state: MotionState,
     pub pitch: f32,
@@ -124,25 +161,25 @@ pub struct MultimodalFrameMessage {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AudioChunkMessage {
     pub session_id: String,
-    pub timestamp: String,
+    pub timestamp_ms: u64,
     pub audio_chunk_pcm16: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UserCommandMessage {
     pub session_id: String,
-    pub timestamp: String,
+    pub timestamp_ms: u64,
     pub command: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HazardObservationMessage {
     pub session_id: String,
-    pub timestamp: String,
-    pub hazard_type: String,
+    pub timestamp_ms: u64,
+    pub hazard_type: HazardType,
     pub bearing_x: Option<f32>,
-    pub distance_m: Option<f32>,
-    pub relative_velocity_mps: Option<f32>,
+    pub distance_m: f32,
+    pub relative_velocity_mps: f32,
     pub confidence: Option<f32>,
     pub source: Option<String>,
     pub suppress_ms: Option<u32>,
@@ -151,14 +188,14 @@ pub struct HazardObservationMessage {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AssistantTextMessage {
     pub session_id: String,
-    pub timestamp: String,
+    pub timestamp_ms: u64,
     pub text: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AssistantAudioMessage {
     pub session_id: String,
-    pub timestamp: String,
+    pub timestamp_ms: u64,
     pub pcm24: Option<String>,
     pub pcm16: Option<String>,
     pub hazard_position_x: Option<f32>,
@@ -183,8 +220,8 @@ pub struct SemanticCueMessage {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SafetyDirectiveMessage {
     pub session_id: String,
-    pub timestamp: String,
-    pub hazard_type: Option<String>,
+    pub timestamp_ms: u64,
+    pub hazard_type: Option<HazardType>,
     pub hazard_score: f32,
     pub hard_stop: bool,
     pub haptic_intensity: f32,
@@ -192,6 +229,7 @@ pub struct SafetyDirectiveMessage {
     pub spatial_audio_pan: f32,
     pub needs_human_assistance: bool,
     pub reason: Option<String>,
+    pub flush_audio: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -212,7 +250,7 @@ pub struct ConnectionStateMessage {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CognitionStateMessage {
     pub session_id: String,
-    pub timestamp: String,
+    pub timestamp_ms: u64,
     pub active_layer: CognitionLayer,
     pub cloud_link_healthy: bool,
     pub edge_cognition_available: bool,
@@ -239,7 +277,7 @@ pub struct HumanHelpRtcSession {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HumanHelpSessionMessage {
     pub session_id: String,
-    pub timestamp: String,
+    pub timestamp_ms: u64,
     pub help_link: Option<String>,
     pub rtc: HumanHelpRtcSession,
 }
@@ -284,7 +322,7 @@ mod tests {
     fn serializes_multimodal_frame_with_type_tag() {
         let payload = ClientToBackendMessage::MultimodalFrame(MultimodalFrameMessage {
             session_id: "s1".to_string(),
-            timestamp: "2026-03-05T10:00:00Z".to_string(),
+            timestamp_ms: 1_741_169_200_000,
             frame_jpeg_base64: None,
             motion_state: MotionState::WalkingFast,
             pitch: 10.0,

@@ -16,6 +16,9 @@ struct ApollosDepthHazardOutput {
     float position_x;
     float confidence;
     uint8_t distance_code;
+    float distance_m;
+    float relative_velocity_mps;
+    float time_to_collision_s;
 };
 
 struct ApollosEskfSnapshot {
@@ -63,6 +66,7 @@ ApollosKinematicOutput apollos_analyze_kinematics(
     float gyro_gamma,
     uint8_t sensor_unavailable
 );
+float apollos_compute_yaw_delta(float alpha_deg_per_second, float dt_ms);
 ApollosDepthHazardOutput apollos_detect_drop_ahead_objects(
     const ApollosObjectSensorFusionInput* objects_ptr,
     uintptr_t objects_len,
@@ -153,6 +157,19 @@ Java_com_apollos_nativeapp_RustCoreBridge_nativeDepthOnnxEnabled(
     return static_cast<jint>(apollos_depth_onnx_runtime_enabled());
 }
 
+JNIEXPORT jfloat JNICALL
+Java_com_apollos_nativeapp_RustCoreBridge_nativeComputeYawDelta(
+    JNIEnv* /* env */,
+    jobject /* thiz */,
+    jfloat alpha_deg_per_second,
+    jfloat dt_ms
+) {
+    return static_cast<jfloat>(apollos_compute_yaw_delta(
+        static_cast<float>(alpha_deg_per_second),
+        static_cast<float>(dt_ms)
+    ));
+}
+
 
 JNIEXPORT jfloatArray JNICALL
 Java_com_apollos_nativeapp_RustCoreBridge_nativeDetectDropAheadObjects(
@@ -200,18 +217,21 @@ Java_com_apollos_nativeapp_RustCoreBridge_nativeDetectDropAheadObjects(
         static_cast<uint64_t>(now_ms)
     );
 
-    jfloat values[4] = {
+    jfloat values[7] = {
         output.detected == 0 ? 0.0f : 1.0f,
         output.position_x,
         output.confidence,
         static_cast<float>(output.distance_code),
+        output.distance_m,
+        output.relative_velocity_mps,
+        output.time_to_collision_s,
     };
 
-    jfloatArray array = env->NewFloatArray(4);
+    jfloatArray array = env->NewFloatArray(7);
     if (array == nullptr) {
         return nullptr;
     }
-    env->SetFloatArrayRegion(array, 0, 4, values);
+    env->SetFloatArrayRegion(array, 0, 7, values);
     return array;
 }
 

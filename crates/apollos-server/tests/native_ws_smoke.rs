@@ -103,7 +103,7 @@ fn native_frame_payload(
     json!({
         "type": "multimodal_frame",
         "session_id": session_id,
-        "timestamp": "2026-03-06T00:00:00Z",
+        "timestamp_ms": 1_741_324_800_000u64,
         "frame_jpeg_base64": Value::Null,
         "motion_state": "walking_fast",
         "pitch": 0.0,

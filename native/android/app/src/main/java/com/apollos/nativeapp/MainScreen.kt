@@ -35,12 +35,16 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.launch
 
-private val REQUIRED_PERMISSIONS = arrayOf(
+private val REQUIRED_PERMISSIONS = mutableListOf(
     Manifest.permission.CAMERA,
     Manifest.permission.RECORD_AUDIO,
     Manifest.permission.ACCESS_FINE_LOCATION,
     Manifest.permission.ACCESS_COARSE_LOCATION,
-)
+).apply {
+    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+        add(Manifest.permission.POST_NOTIFICATIONS)
+    }
+}.toTypedArray()
 
 @Composable
 fun MainScreen() {
@@ -62,7 +66,6 @@ fun MainScreen() {
     var serverBaseUrl by remember { mutableStateOf("http://10.0.2.2:8000") }
     var idToken by remember { mutableStateOf("") }
     val logs = remember { mutableStateListOf<String>() }
-    val kinematicResult = remember { mutableStateOf<KinematicResult?>(null) }
     val depthOnnxEnabled = remember { RustCoreBridge.depthOnnxEnabled() }
 
     val permissionLauncher = rememberLauncherForActivityResult(
@@ -173,16 +176,6 @@ fun MainScreen() {
             ) {
                 Text(text = "Stop")
             }
-        }
-
-        Button(onClick = { kinematicResult.value = RustCoreBridge.analyzeDefaultWalkingFrame() }) {
-            Text(text = "Run Rust FFI")
-        }
-
-        kinematicResult.value?.let { output ->
-            Text(text = "Risk score: ${output.riskScore}")
-            Text(text = "Should capture: ${output.shouldCapture}")
-            Text(text = "Yaw delta: ${output.yawDeltaDeg}")
         }
 
         Spacer(modifier = Modifier.height(8.dp))

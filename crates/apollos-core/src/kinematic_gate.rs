@@ -22,6 +22,13 @@ pub struct KinematicReading {
     pub gyro: Option<GyroRotation>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureDecision {
+    Drop = 0,
+    CaptureNormal = 1,
+    EmergencyFrameLocked = 2,
+}
+
 pub fn compute_risk_score(
     motion_state: MotionState,
     pitch: f32,
@@ -51,19 +58,23 @@ pub fn compute_risk_score(
     score.clamp(1.0, 4.0)
 }
 
-pub fn should_capture_frame(reading: KinematicReading, profile: CarryModeProfile) -> bool {
+pub fn should_capture_frame(reading: KinematicReading, profile: CarryModeProfile) -> CaptureDecision {
     if !profile.cloud_enabled {
-        return false;
+        return CaptureDecision::Drop;
     }
 
     let (accel, gyro) = match (reading.accel, reading.gyro) {
         (Some(accel), Some(gyro)) => (accel, gyro),
-        _ => return true,
+        _ => return CaptureDecision::CaptureNormal,
     };
+
+    if gyro.alpha.abs() > 200.0 || gyro.beta.abs() > 200.0 || gyro.gamma.abs() > 200.0 {
+        return CaptureDecision::EmergencyFrameLocked;
+    }
 
     let magnitude = (accel.x * accel.x + accel.y * accel.y + accel.z * accel.z).sqrt();
     if !(8.0..=12.0).contains(&magnitude) {
-        return false;
+        return CaptureDecision::Drop;
     }
 
     let cos_tilt = accel.y / magnitude;
@@ -75,7 +86,11 @@ pub fn should_capture_frame(reading: KinematicReading, profile: CarryModeProfile
         && gyro.beta.abs() < profile.gyro_threshold
         && gyro.gamma.abs() < profile.gyro_threshold;
 
-    is_vertical && is_stable
+    if is_vertical && is_stable {
+        CaptureDecision::CaptureNormal
+    } else {
+        CaptureDecision::Drop
+    }
 }
 
 pub fn compute_yaw_delta(gyro: Option<GyroRotation>, dt_ms: f32) -> f32 {
@@ -102,7 +117,7 @@ mod tests {
     fn pocket_mode_blocks_capture() {
         let profile = get_carry_mode_profile(CarryMode::Pocket);
         let reading = KinematicReading::default();
-        assert!(!should_capture_frame(reading, profile));
+        assert_eq!(should_capture_frame(reading, profile), CaptureDecision::Drop);
     }
 
     #[test]
@@ -121,7 +136,7 @@ mod tests {
             }),
         };
 
-        assert!(should_capture_frame(reading, profile));
+        assert_eq!(should_capture_frame(reading, profile), CaptureDecision::CaptureNormal);
     }
 
     #[test]
