@@ -1,7 +1,8 @@
 import { useCallback, useMemo, useState } from 'react';
-import {
+import type {
   CarryMode,
-  CarryModeProfile,
+  CarryModeProfile} from '../services/carryMode';
+import {
   DEFAULT_CARRY_MODE,
   getCarryModeProfile,
   loadStoredCarryMode,

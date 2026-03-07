@@ -158,14 +158,9 @@ async function ensureDepthModel(modelUrl: string, wasmBaseUrl: string): Promise<
 function normalize(values: Float32Array): Float32Array {
   let min = Number.POSITIVE_INFINITY;
   let max = Number.NEGATIVE_INFINITY;
-  for (let i = 0; i < values.length; i += 1) {
-    const value = values[i] ?? 0;
-    if (value < min) {
-      min = value;
-    }
-    if (value > max) {
-      max = value;
-    }
+  for (const value of values) {
+    if (value < min) { min = value; }
+    if (value > max) { max = value; }
   }
   const span = Math.max(max - min, 1e-6);
   const normalized = new Float32Array(values.length);

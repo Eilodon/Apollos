@@ -1,11 +1,13 @@
-import { MutableRefObject, useEffect, useMemo, useRef } from 'react';
-import { KinematicReading, computeRiskScore, computeYawDelta, shouldCaptureFrame } from '../services/kinematicGating';
+import type { MutableRefObject } from 'react';
+import { useEffect, useMemo, useRef } from 'react';
+import type { KinematicReading } from '../services/kinematicGating';
+import { computeRiskScore, computeYawDelta, shouldCaptureFrame } from '../services/kinematicGating';
 import type { CarryMode, CarryModeProfile } from '../services/carryMode';
-import { HardStopMessage, MotionSnapshot } from '../types/contracts';
+import type { HardStopMessage, MotionSnapshot } from '../types/contracts';
 
 interface CameraFramePayload {
   frameBase64: string;
-  timestamp: string;
+  timestamp_ms: number;
   /** Góc xoay ngang tích lũy (độ) kể từ frame trước → Semantic Odometry */
   yaw_delta_deg: number;
   carry_mode?: CarryMode;
@@ -40,9 +42,9 @@ function intervalForMotionState(state: MotionSnapshot['state']): number {
     return 5000;
   }
   if (state === 'running') {
-    return 150; // Tăng cường: ~6.6 FPS
+    return 500;
   }
-  return 250; // Tăng cường: ~4 FPS (trước đây là 1000)
+  return 750;
 }
 
 async function getOptimalCameraStream() {
@@ -90,8 +92,10 @@ export function useCamera({
   const reflexWorkerRef = useRef<Worker | null>(null);
   const depthWorkerRef = useRef<Worker | null>(null);
   const kinematicRef = useRef<KinematicReading>({ accel: null, gyro: null });
+  // eslint-disable-next-line react-hooks/purity
   const lastCloudPostRef = useRef<number>(Date.now());
   const accumulatedYawRef = useRef<number>(0);
+  // eslint-disable-next-line react-hooks/purity
   const lastMotionEventTsRef = useRef<number>(Date.now());
   const lastYawDeltaDegRef = useRef<number>(0);
   const lastEdgeHazardAtRef = useRef<number>(0);
@@ -118,7 +122,9 @@ export function useCamera({
   }, []);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/purity
     reflexWorkerRef.current = new Worker(new URL('../workers/survivalReflex.worker.ts', import.meta.url), { type: 'module' });
+    // eslint-disable-next-line react-hooks/purity
     depthWorkerRef.current = new Worker(new URL('../workers/depthGuard.worker.ts', import.meta.url));
     const configuredModelUrl = import.meta.env.VITE_DEPTH_MODEL_URL;
     const depthModelUrl = typeof configuredModelUrl === 'string'
@@ -328,7 +334,7 @@ export function useCamera({
         motionSnapshot.velocity,
         lastYawDeltaDegRef.current,
       );
-      const edgeInterval = Math.max(16, 150 - riskScore * 33);
+      const edgeInterval = Math.max(500, 1250 - riskScore * 90);
 
       reflexWorkerRef.current?.postMessage({ currentFrame: edgeImageData, riskScore });
       depthWorkerRef.current?.postMessage({ type: 'depth_frame', currentFrame: edgeImageData, riskScore });
@@ -350,7 +356,7 @@ export function useCamera({
         accumulatedYawRef.current = 0; // Reset sau khi đã capture
         onFrame({
           frameBase64,
-          timestamp: new Date().toISOString(),
+          timestamp_ms: now,
           yaw_delta_deg: yawSnapshot,
           carry_mode: carryMode,
           lat: locationSnapshot?.lat,

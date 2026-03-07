@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { MotionSnapshot, MotionState } from '../types/contracts';
+import type { MotionSnapshot, MotionState } from '../types/contracts';
 
 type DeviceMotionPermissionEvent = typeof DeviceMotionEvent & {
   requestPermission?: () => Promise<'granted' | 'denied'>;

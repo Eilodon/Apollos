@@ -34,6 +34,7 @@ export function useBatteryGovernor(enabled: boolean): BatteryGovernorSnapshot {
 
     const nav = navigator as Navigator & { getBattery?: () => Promise<BatteryManagerLike> };
     if (typeof nav.getBattery !== 'function') {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setSupported(false);
       return;
     }
@@ -97,6 +98,7 @@ export function useBatteryGovernor(enabled: boolean): BatteryGovernorSnapshot {
         battery.addEventListener('chargingchange', onBatteryUpdate);
         pollTimerRef.current = window.setInterval(onBatteryUpdate, 60_000);
       } catch {
+        // eslint-disable-next-line react-hooks/set-state-in-effect
         setSupported(false);
       }
     };

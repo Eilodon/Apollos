@@ -1,4 +1,4 @@
-import { NavigationMode } from '../types/contracts';
+import type { NavigationMode } from '../types/contracts';
 
 interface ModeIndicatorProps {
   mode: NavigationMode;

@@ -1,4 +1,4 @@
-import { DistanceCategory } from '../types/contracts';
+import type { DistanceCategory } from '../types/contracts';
 import { pcm16Base64ToFloat32 } from '../utils/pcm';
 
 const PING_INTERVALS: Record<DistanceCategory, number> = {
@@ -29,7 +29,7 @@ export class SpatialAudioEngine {
   private sirenBuffer: AudioBuffer | null = null;
   private pingInterval: number | null = null;
   private activeSources = new Set<AudioBufferSourceNode>();
-  private nextPlayTime: number = 0;
+  private nextPlayTime = 0;
   private readonly JITTER_DELAY = 0.1;
   private outputMode: OutputMode = 'unknown';
 

@@ -3,9 +3,9 @@ import { useCallback, useMemo, useRef, useState } from 'react';
 export type SmartCaneDirection = 'left' | 'right' | 'stop';
 export type SmartCaneUrgency = 'soft' | 'hard';
 
-type BluetoothLike = {
+interface BluetoothLike {
   requestDevice: (options: {
-    filters?: Array<{ namePrefix?: string }>;
+    filters?: { namePrefix?: string }[];
     optionalServices?: string[];
   }) => Promise<{
     name?: string;
@@ -22,7 +22,7 @@ type BluetoothLike = {
       disconnect: () => void;
     };
   }>;
-};
+}
 
 const SMART_CANE_SERVICE_UUID = '0000fff0-0000-1000-8000-00805f9b34fb';
 const DIRECTION_CHAR_UUID = '0000fff1-0000-1000-8000-00805f9b34fb';

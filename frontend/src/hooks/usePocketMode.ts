@@ -9,7 +9,7 @@ interface DeviceProximityEventLike extends Event {
 interface UsePocketModeOptions {
   onPocketModeActive?: () => void;
   onSensorUnavailable?: (reason: string) => void;
-  manualPocketMode?: boolean;
+  manualOverride?: 'auto' | 'force_in' | 'force_out';
 }
 
 interface UsePocketModeResult {
@@ -33,22 +33,29 @@ interface UsePocketModeResult {
 export function usePocketMode({
   onPocketModeActive,
   onSensorUnavailable,
-  manualPocketMode = false,
+  manualOverride = 'auto',
 }: UsePocketModeOptions = {}): UsePocketModeResult {
-  const [inPocket, setInPocket] = useState(Boolean(manualPocketMode));
+  const [inPocket, setInPocket] = useState(manualOverride === 'force_in');
   const [sensorAvailable, setSensorAvailable] = useState(false);
   const sensorPocketRef = useRef(false);
-  const manualPocketRef = useRef(Boolean(manualPocketMode));
-  const inPocketRef = useRef(Boolean(manualPocketMode));
+  const manualOverrideRef = useRef(manualOverride);
   const announcedRef = useRef(false);
   const unavailableReasonRef = useRef('');
 
+  const applyResolvedPocketState = (sensorPocket: boolean, override: 'auto' | 'force_in' | 'force_out') => {
+    if (override === 'force_in') {
+      return true;
+    }
+    if (override === 'force_out') {
+      return false;
+    }
+    return sensorPocket;
+  };
+
   useEffect(() => {
-    manualPocketRef.current = Boolean(manualPocketMode);
-    const next = sensorPocketRef.current || manualPocketRef.current;
-    inPocketRef.current = next;
+    manualOverrideRef.current = manualOverride;
+    const next = applyResolvedPocketState(sensorPocketRef.current, manualOverride);
     setInPocket(next);
-    document.body.style.pointerEvents = next ? 'none' : 'auto';
     if (next && !announcedRef.current) {
       announcedRef.current = true;
       onPocketModeActive?.();
@@ -56,7 +63,7 @@ export function usePocketMode({
     if (!next) {
       announcedRef.current = false;
     }
-  }, [manualPocketMode, onPocketModeActive]);
+  }, [manualOverride, onPocketModeActive]);
 
   useEffect(() => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -66,10 +73,8 @@ export function usePocketMode({
     let hasSensorPath = false;
 
     const applyPocketState = () => {
-      const next = sensorPocketRef.current || manualPocketRef.current;
-      inPocketRef.current = next;
+      const next = applyResolvedPocketState(sensorPocketRef.current, manualOverrideRef.current);
       setInPocket(next);
-      document.body.style.pointerEvents = next ? 'none' : 'auto';
       if (next && !announcedRef.current) {
         announcedRef.current = true;
         onPocketModeActive?.();
@@ -123,6 +128,7 @@ export function usePocketMode({
       };
     }
 
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setSensorAvailable(hasSensorPath);
     if (!hasSensorPath) {
       const reason = 'sensor_unavailable:ambient_light_and_proximity';
@@ -134,20 +140,9 @@ export function usePocketMode({
       unavailableReasonRef.current = '';
     }
 
-    const preventTouch = (event: TouchEvent) => {
-      if (inPocketRef.current) {
-        event.preventDefault();
-        event.stopImmediatePropagation();
-      }
-    };
-
-    document.addEventListener('touchstart', preventTouch, { passive: false });
-
     return () => {
       ambientCleanup?.();
       proximityCleanup?.();
-      document.removeEventListener('touchstart', preventTouch);
-      document.body.style.pointerEvents = 'auto';
     };
   }, [onPocketModeActive, onSensorUnavailable]);
 

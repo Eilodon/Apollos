@@ -167,8 +167,8 @@ function averageLuma(gray: Float32Array): number {
     return 0;
   }
   let sum = 0;
-  for (let i = 0; i < gray.length; i += 1) {
-    sum += gray[i] ?? 0;
+  for (const luma of gray) {
+    sum += luma;
   }
   return sum / gray.length;
 }

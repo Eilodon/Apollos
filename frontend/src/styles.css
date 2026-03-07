@@ -321,6 +321,25 @@ body {
   z-index: 50;
 }
 
+.overlay-escape-button {
+  position: fixed;
+  right: 1rem;
+  bottom: 1rem;
+  z-index: 60;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  border-radius: 999px;
+  background: rgba(8, 12, 20, 0.92);
+  color: var(--text);
+  padding: 0.8rem 1rem;
+  font: inherit;
+  box-shadow: 0 0.8rem 2rem rgba(0, 0, 0, 0.35);
+}
+
+.overlay-escape-button:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+
 @keyframes fade-in {
   from {
     opacity: 0;

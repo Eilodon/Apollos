@@ -1,5 +1,5 @@
 export interface CachedAudioEntry {
-  timestamp: string;
+  timestampMs: number;
   text?: string;
   pcmBase64?: string;
 }

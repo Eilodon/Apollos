@@ -1,11 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import {
+import type {
   AudioChunkMessage,
   BackendToClientMessage,
-  EdgeHazardMessage,
+  HazardObservationMessage,
   HardStopMessage,
   MultimodalFrameMessage,
-  UserCommandMessage,
+  SafetyDirectiveMessage,
+  UserCommandMessage
+} from '../types/contracts';
+import {
+  hazardTypeToLabel,
+  metersToDistanceCategory,
 } from '../types/contracts';
 
 interface UseARIAOptions {
@@ -23,7 +28,7 @@ interface UseARIAResult {
   sendFrame: (message: Omit<MultimodalFrameMessage, 'type' | 'session_id'>) => void;
   sendAudioChunk: (chunkBase64: string) => void;
   sendUserCommand: (command: string) => void;
-  sendEdgeHazard: (payload: Omit<EdgeHazardMessage, 'type' | 'session_id' | 'timestamp'>) => void;
+  sendEdgeHazard: (payload: Omit<HazardObservationMessage, 'type' | 'session_id' | 'timestamp_ms'>) => void;
 }
 
 const MAX_RETRIES = 6;
@@ -54,7 +59,7 @@ export function useARIA({ sessionId, clientId, authToken, onBackendMessage, onHa
 
   const liveSocketRef = useRef<WebSocket | null>(null);
   const emergencySocketRef = useRef<WebSocket | null>(null);
-  const pendingEdgeHazardsRef = useRef<EdgeHazardMessage[]>([]);
+  const pendingEdgeHazardsRef = useRef<HazardObservationMessage[]>([]);
   const reconnectAttempts = useRef(0);
   const reconnectTimer = useRef<number | null>(null);
   const emergencyRetryTimer = useRef<number | null>(null);
@@ -64,6 +69,8 @@ export function useARIA({ sessionId, clientId, authToken, onBackendMessage, onHa
     (import.meta.env.VITE_OIDC_TOKEN_STORAGE_KEY as string | undefined)?.trim()
     || 'apollos_oidc_token'
   );
+
+  const nowMs = useCallback(() => Date.now(), []);
 
   const handleInboundMessage = useCallback((payload: unknown) => {
     if (!payload || typeof payload !== 'object') {
@@ -75,14 +82,32 @@ export function useARIA({ sessionId, clientId, authToken, onBackendMessage, onHa
       return;
     }
 
-    if (type === 'HARD_STOP') {
-      const hardStop = payload as HardStopMessage;
-      onBackendMessage?.(hardStop);
-      onHardStop?.(hardStop);
+    if (type === 'safety_directive') {
+      const directive = payload as SafetyDirectiveMessage;
+      onBackendMessage?.(directive);
+      if (!directive.hard_stop) {
+        return;
+      }
+
+      onHardStop?.({
+        type: 'HARD_STOP',
+        position_x: directive.spatial_audio_pan,
+        distance: metersToDistanceCategory(0.45),
+        hazard_type: hazardTypeToLabel(directive.hazard_type),
+        confidence: Math.max(0.6, Math.min(1, directive.haptic_intensity || directive.hazard_score / 6)),
+        ts: new Date(directive.timestamp_ms).toISOString(),
+      });
       return;
     }
 
-    if (type === 'assistant_text' || type === 'audio_chunk' || type === 'connection_state' || type === 'semantic_cue') {
+    if (
+      type === 'assistant_text'
+      || type === 'audio_chunk'
+      || type === 'connection_state'
+      || type === 'semantic_cue'
+      || type === 'human_help_session'
+      || type === 'cognition_state'
+    ) {
       onBackendMessage?.(payload as BackendToClientMessage);
     }
   }, [onBackendMessage, onHardStop]);
@@ -162,7 +187,6 @@ export function useARIA({ sessionId, clientId, authToken, onBackendMessage, onHa
       emergencySocketRef.current = emergencySocket;
 
       emergencySocket.onopen = () => {
-        emergencySocket.send(JSON.stringify({ type: 'heartbeat', session_id: sessionId, timestamp: new Date().toISOString() }));
         if (pendingEdgeHazardsRef.current.length > 0) {
           const pending = [...pendingEdgeHazardsRef.current];
           pendingEdgeHazardsRef.current = [];
@@ -253,6 +277,7 @@ export function useARIA({ sessionId, clientId, authToken, onBackendMessage, onHa
       const delay = Math.min(1000 * 2 ** reconnectAttempts.current, 8000);
       reconnectTimer.current = window.setTimeout(() => {
         reconnectTimer.current = null;
+        // eslint-disable-next-line react-hooks/immutability
         connect();
       }, delay);
     };
@@ -290,13 +315,13 @@ export function useARIA({ sessionId, clientId, authToken, onBackendMessage, onHa
       const payload: AudioChunkMessage = {
         type: 'audio_chunk',
         session_id: sessionId,
-        timestamp: new Date().toISOString(),
+        timestamp_ms: nowMs(),
         audio_chunk_pcm16: chunkBase64,
       };
 
       liveSocketRef.current.send(JSON.stringify(payload));
     },
-    [sessionId],
+    [nowMs, sessionId],
   );
 
   const sendUserCommand = useCallback(
@@ -308,21 +333,21 @@ export function useARIA({ sessionId, clientId, authToken, onBackendMessage, onHa
       const payload: UserCommandMessage = {
         type: 'user_command',
         session_id: sessionId,
-        timestamp: new Date().toISOString(),
+        timestamp_ms: nowMs(),
         command,
       };
 
       liveSocketRef.current.send(JSON.stringify(payload));
     },
-    [sessionId],
+    [nowMs, sessionId],
   );
 
   const sendEdgeHazard = useCallback(
-    (payload: Omit<EdgeHazardMessage, 'type' | 'session_id' | 'timestamp'>) => {
-      const message: EdgeHazardMessage = {
-        type: 'EDGE_HAZARD',
+    (payload: Omit<HazardObservationMessage, 'type' | 'session_id' | 'timestamp_ms'>) => {
+      const message: HazardObservationMessage = {
+        type: 'hazard_observation',
         session_id: sessionId,
-        timestamp: new Date().toISOString(),
+        timestamp_ms: nowMs(),
         ...payload,
       };
 
@@ -339,7 +364,7 @@ export function useARIA({ sessionId, clientId, authToken, onBackendMessage, onHa
         pendingEdgeHazardsRef.current.shift();
       }
     },
-    [sessionId],
+    [nowMs, sessionId],
   );
 
   useEffect(() => {

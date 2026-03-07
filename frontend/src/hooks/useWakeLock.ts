@@ -1,13 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
-type WakeLockSentinelLike = {
+interface WakeLockSentinelLike {
   released: boolean;
   release: () => Promise<void>;
-};
+}
 
-type WakeLockProvider = {
+interface WakeLockProvider {
   request: (type: 'screen') => Promise<WakeLockSentinelLike>;
-};
+}
 
 interface UseWakeLockResult {
   oledBlackMode: boolean;

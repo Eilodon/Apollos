@@ -19,20 +19,30 @@ import type { CarryMode } from './services/carryMode';
 import { SpatialAudioEngine } from './services/spatialAudioEngine';
 import { vibrateHardStop, vibrateReconnect, vibrateSoftConfirm } from './services/haptics';
 import { getPlatformCapabilities } from './services/platformDetect';
-import { BackendToClientMessage, HardStopMessage, NavigationMode, SemanticCueMessage } from './types/contracts';
+import type {
+  BackendToClientMessage,
+  HardStopMessage,
+  NavigationMode,
+  SemanticCueMessage
+} from './types/contracts';
+import {
+  distanceCategoryToMeters,
+  parseHazardType,
+} from './types/contracts';
 
-type TranscriptEntry = {
+interface TranscriptEntry {
   id: string;
   role: 'assistant' | 'user' | 'system';
   text: string;
   ts: string;
-};
+}
 
 const MODE_ORDER: NavigationMode[] = ['NAVIGATION', 'EXPLORE', 'READ', 'QUIET'];
 const MAX_TRANSCRIPT_ENTRIES = 200;
 const ONBOARDING_KEY = 'apollos_onboarding_completed_v1';
 const SESSION_ID_KEY = 'apollos_session_id_v1';
 const CLIENT_ID_KEY = 'apollos_client_id_v1';
+type PocketOverride = 'auto' | 'force_in' | 'force_out';
 
 const CARRY_MODE_LABELS: Record<CarryMode, string> = {
   hand_held: 'Hand-Held',
@@ -98,7 +108,7 @@ export default function App(): JSX.Element {
   const [hazardVisible, setHazardVisible] = useState(false);
   const [hazardDistance, setHazardDistance] = useState<'very_close' | 'mid' | 'far'>('mid');
   const [onboardingState, setOnboardingState] = useState<'await_carry' | 'pending' | 'running' | 'await_mode' | 'done'>('pending');
-  const [manualPocketMode, setManualPocketMode] = useState(false);
+  const [pocketOverride, setPocketOverride] = useState<PocketOverride>('auto');
   const [pocketSensorUnavailable, setPocketSensorUnavailable] = useState(false);
   const [indoorLikely, setIndoorLikely] = useState(false);
 
@@ -109,6 +119,7 @@ export default function App(): JSX.Element {
   const lowBatteryHandledRef = useRef(false);
   const highDischargeHandledRef = useRef(false);
   const indoorThrottleHandledRef = useRef(false);
+  // eslint-disable-next-line react-hooks/purity
   const lastActivityAtRef = useRef(Date.now());
   const lastHeartbeatAtRef = useRef(0);
   const indoorAnchorRef = useRef<{ lat: number; lng: number; sinceMs: number } | null>(null);
@@ -141,7 +152,7 @@ export default function App(): JSX.Element {
   const { inPocket, sensorAvailable: pocketSensorAvailable } = usePocketMode({
     onPocketModeActive,
     onSensorUnavailable: onPocketSensorUnavailable,
-    manualPocketMode,
+    manualOverride: pocketOverride,
   });
   const overlayActive = (oledBlackMode || inPocket) && sessionActive;
   const locationSnapshot = useLocationContext(sessionActive);
@@ -178,7 +189,7 @@ export default function App(): JSX.Element {
         const updated = [...prev, createEntry('assistant', message.text)];
         return updated.length > MAX_TRANSCRIPT_ENTRIES ? updated.slice(-MAX_TRANSCRIPT_ENTRIES) : updated;
       });
-      audioCacheRef.current.add({ timestamp: message.timestamp, text: message.text });
+      audioCacheRef.current.add({ timestampMs: message.timestamp_ms, text: message.text });
       return;
     }
 
@@ -189,7 +200,7 @@ export default function App(): JSX.Element {
       }
 
       spatialRef.current.playChunkFromBase64(pcmBase64, message.hazard_position_x ?? hazardPosition);
-      audioCacheRef.current.add({ timestamp: message.timestamp, pcmBase64 });
+      audioCacheRef.current.add({ timestampMs: message.timestamp_ms, pcmBase64 });
       return;
     }
 
@@ -202,8 +213,46 @@ export default function App(): JSX.Element {
       return;
     }
 
-    if (message.type === 'connection_state' && message.state === 'reconnecting') {
-      vibrateReconnect();
+    if (message.type === 'connection_state') {
+      if (message.state === 'reconnecting') {
+        vibrateReconnect();
+      }
+      if (message.state === 'degraded' && message.detail) {
+        setTranscriptEntries((prev) => {
+          const updated = [...prev, createEntry('system', `Backend degraded: ${message.detail}`)];
+          return updated.length > MAX_TRANSCRIPT_ENTRIES ? updated.slice(-MAX_TRANSCRIPT_ENTRIES) : updated;
+        });
+      }
+      return;
+    }
+
+    if (message.type === 'safety_directive') {
+      if (message.flush_audio) {
+        spatialRef.current?.stopAll();
+      }
+      if (message.needs_human_assistance) {
+        setTranscriptEntries((prev) => {
+          const updated = [...prev, createEntry('system', 'Human assistance escalation recommended.')];
+          return updated.length > MAX_TRANSCRIPT_ENTRIES ? updated.slice(-MAX_TRANSCRIPT_ENTRIES) : updated;
+        });
+      }
+      return;
+    }
+
+    if (message.type === 'human_help_session') {
+      setTranscriptEntries((prev) => {
+        const provider = message.rtc.provider.toUpperCase();
+        const updated = [...prev, createEntry('system', `Human help session ready via ${provider}.`)];
+        return updated.length > MAX_TRANSCRIPT_ENTRIES ? updated.slice(-MAX_TRANSCRIPT_ENTRIES) : updated;
+      });
+      return;
+    }
+
+    if (message.type === 'cognition_state' && message.reason) {
+      setTranscriptEntries((prev) => {
+        const updated = [...prev, createEntry('system', `Cognition layer ${message.active_layer}: ${message.reason}`)];
+        return updated.length > MAX_TRANSCRIPT_ENTRIES ? updated.slice(-MAX_TRANSCRIPT_ENTRIES) : updated;
+      });
     }
   }, [hazardPosition]);
 
@@ -252,12 +301,28 @@ export default function App(): JSX.Element {
   });
 
   const onEdgeHazard = useCallback((message: HardStopMessage) => {
+    const distanceM = distanceCategoryToMeters(message.distance);
+    const relativeVelocityMps = (() => {
+      if (message.hazard_type.toLowerCase().includes('vehicle')) {
+        return -2.4;
+      }
+      if (message.distance === 'very_close') {
+        return -1.6;
+      }
+      if (message.distance === 'mid') {
+        return -1.0;
+      }
+      return -0.55;
+    })();
+
     sendEdgeHazard({
-      hazard_type: message.hazard_type,
-      position_x: message.position_x,
-      distance: message.distance,
+      hazard_type: parseHazardType(message.hazard_type),
+      bearing_x: message.position_x,
+      distance_m: distanceM,
+      relative_velocity_mps: relativeVelocityMps,
       confidence: message.confidence,
-      suppress_seconds: 2.5,
+      source: 'web_edge_reflex',
+      suppress_ms: 2500,
     });
   }, [sendEdgeHazard]);
 
@@ -304,9 +369,9 @@ export default function App(): JSX.Element {
     carryMode: activeCarryMode,
     carryProfile,
     minCloudIntervalMs,
-    onFrame: ({ frameBase64, timestamp, yaw_delta_deg, carry_mode }) => {
+    onFrame: ({ frameBase64, timestamp_ms, yaw_delta_deg, carry_mode }) => {
       sendFrame({
-        timestamp,
+        timestamp_ms,
         frame_jpeg_base64: frameBase64,
         motion_state: motionSnapshot.state,
         pitch: motionSnapshot.pitch,
@@ -317,6 +382,7 @@ export default function App(): JSX.Element {
         lat: locationSnapshot?.lat,
         lng: locationSnapshot?.lng,
         heading_deg: locationSnapshot?.headingDeg,
+        edge_semantic_cues: [],
       });
     },
   });
@@ -342,7 +408,7 @@ export default function App(): JSX.Element {
 
   const selectCarryMode = useCallback((mode: CarryMode) => {
     setCarryMode(mode);
-    setManualPocketMode(mode === 'pocket');
+    setPocketOverride(mode === 'pocket' && !pocketSensorAvailable ? 'force_in' : 'auto');
     appendSystemEntry(`Carry mode set: ${CARRY_MODE_LABELS[mode]}.`);
     if (mode === 'pocket') {
       appendSystemEntry('Pocket mode active: cloud frame streaming paused until carry mode changes.');
@@ -352,7 +418,7 @@ export default function App(): JSX.Element {
     } else {
       setOnboardingState('pending');
     }
-  }, [appendSystemEntry, setCarryMode]);
+  }, [appendSystemEntry, pocketSensorAvailable, setCarryMode]);
 
   const runTrustProtocol = useCallback(async () => {
     if (onboardingState !== 'pending' || !sessionActive) {
@@ -586,9 +652,6 @@ export default function App(): JSX.Element {
 
   useEffect(() => {
     const completed = localStorage.getItem(ONBOARDING_KEY) === '1';
-    if (carryMode === 'pocket') {
-      setManualPocketMode(true);
-    }
     if (completed && carryMode) {
       setOnboardingState('done');
     }
@@ -726,11 +789,28 @@ export default function App(): JSX.Element {
           <button type="button" onClick={requestHumanHelp} disabled={!sessionActive} aria-label="Request human help immediately">
             Human Help
           </button>
-          {!pocketSensorAvailable && (
-            <button type="button" onClick={() => setManualPocketMode((prev) => !prev)} disabled={!sessionActive} aria-label={manualPocketMode ? 'Disable manual pocket mode' : 'Enable manual pocket mode'}>
-              {manualPocketMode ? 'Pocket Manual Off' : 'Pocket Manual On'}
-            </button>
-          )}
+          <button
+            type="button"
+            onClick={() => {
+              setPocketOverride((prev) => (prev === 'auto' ? 'force_in' : 'auto'));
+              appendSystemEntry(pocketOverride === 'auto' ? 'Pocket shield forced on.' : 'Pocket shield returned to automatic control.');
+            }}
+            disabled={!sessionActive}
+            aria-label={pocketOverride === 'auto' ? 'Force pocket shield on' : 'Return pocket shield to automatic mode'}
+          >
+            {pocketOverride === 'auto' ? 'Pocket Shield On' : 'Pocket Shield Auto'}
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setPocketOverride('force_out');
+              appendSystemEntry('Pocket shield manually released.');
+            }}
+            disabled={!sessionActive}
+            aria-label="Force pocket shield off and resume controls"
+          >
+            Resume Controls
+          </button>
           {smartCaneSupported && (
             <button
               type="button"
@@ -779,6 +859,20 @@ export default function App(): JSX.Element {
           Use the controls below. With TalkBack or VoiceOver, focus a control and double tap to activate it.
         </p>
       </div>
+
+      {sessionActive && inPocket && (
+        <button
+          type="button"
+          className="overlay-escape-button"
+          onClick={() => {
+            setPocketOverride('force_out');
+            appendSystemEntry('Pocket shield manually released from overlay.');
+          }}
+          aria-label="Resume controls and unlock screen guard"
+        >
+          Resume Controls
+        </button>
+      )}
 
       <OLEDBlackOverlay enabled={overlayActive} />
     </div>

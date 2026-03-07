@@ -53,17 +53,16 @@ function computeRms(buffer: Float32Array): number {
     return 0;
   }
   let energy = 0;
-  for (let i = 0; i < buffer.length; i += 1) {
-    const sample = buffer[i] ?? 0;
+  for (const sample of buffer) {
     energy += sample * sample;
   }
   return Math.sqrt(energy / buffer.length);
 }
 
-type WorkletGateMessage = {
+interface WorkletGateMessage {
   type?: string;
   chunk?: Float32Array;
-};
+}
 
 export function useAudioStream({ onAudioChunk }: UseAudioStreamOptions): UseAudioStreamResult {
   const [micActive, setMicActive] = useState(false);
