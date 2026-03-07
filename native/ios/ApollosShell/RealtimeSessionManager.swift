@@ -2,8 +2,10 @@ import AVFoundation
 import AudioToolbox
 import Combine
 import CoreLocation
+import CoreML
 import CoreMotion
 import Foundation
+import Vision
 
 struct NativePermissionStatus {
     var camera: Bool
@@ -57,12 +59,15 @@ final class RealtimeSessionManager: NSObject, ObservableObject {
     private var captureSession: AVCaptureSession?
     private let cameraQueue = DispatchQueue(label: "com.apollos.ios.camera")
     private var lastFrameSentAt: TimeInterval = 0
-    private var lastCameraFrameTimestampS: TimeInterval = 0
     private var latestVoApplied: Bool = false
     private var latestVoFlowScore: Float = 0.0
     private var latestVoVarianceM2: Float = 999.0
     private var latestVoPoseXM: Float = 0.0
     private var latestVoPoseYM: Float = 0.0
+    private var latestDepthObjectsFeedAvailable: Bool = false
+    private lazy var edgePipeline = IOSYoloDa3CoreMLPipeline { [weak self] message in
+        self?.appendLog(message)
+    }
     private let safetyActuatorLock = NSLock()
     private var safetyToneEngine: AVAudioEngine?
     private var safetyToneNode: AVAudioPlayerNode?
@@ -141,12 +146,12 @@ final class RealtimeSessionManager: NSObject, ObservableObject {
                 geoOrigin = nil
                 lastMotionTimestamp = 0
                 setGyroMagnitudeDeg(0)
-                lastCameraFrameTimestampS = 0
                 latestVoApplied = false
                 latestVoFlowScore = 0.0
                 latestVoVarianceM2 = 999.0
                 latestVoPoseXM = 0.0
                 latestVoPoseYM = 0.0
+                latestDepthObjectsFeedAvailable = false
                 latestSafetyDirectiveAt = 0
 
                 connectWebSocket(serverBaseURL: trimmedURL, wsToken: wsToken)
@@ -183,12 +188,12 @@ final class RealtimeSessionManager: NSObject, ObservableObject {
         motionManager.stopDeviceMotionUpdates()
         lastMotionTimestamp = 0
         setGyroMagnitudeDeg(0)
-        lastCameraFrameTimestampS = 0
         latestVoApplied = false
         latestVoFlowScore = 0.0
         latestVoVarianceM2 = 999.0
         latestVoPoseXM = 0.0
         latestVoPoseYM = 0.0
+        latestDepthObjectsFeedAvailable = false
         latestSafetyDirectiveAt = 0
         if eskfHandle != 0 {
             _ = RustCoreBridge.eskfDestroy(handle: eskfHandle)
@@ -491,13 +496,18 @@ final class RealtimeSessionManager: NSObject, ObservableObject {
         let posX = Float((location.lng - origin.lng) * lngScaleM)
         let posY = Float((location.lat - origin.lat) * latScaleM)
         let varianceM2 = Float(max(4.0, min(50.0, location.accuracyM)))
-        _ = RustCoreBridge.eskfUpdateVision(
+        let applied = RustCoreBridge.eskfUpdateVision(
             handle: eskfHandle,
             positionX: posX,
             positionY: posY,
             positionZ: 0.0,
             varianceM2: varianceM2 * varianceM2
         )
+        latestVoApplied = applied
+        latestVoFlowScore = applied ? 1.0 : 0.0
+        latestVoVarianceM2 = varianceM2 * varianceM2
+        latestVoPoseXM = posX
+        latestVoPoseYM = posY
     }
 
     private func startCamera() {
@@ -605,8 +615,8 @@ final class RealtimeSessionManager: NSObject, ObservableObject {
         if eskf.localizationUncertaintyM > 6.0 {
             healthFlags.append("localization_uncertain")
         }
-        if depth.sourceCode != 1 {
-            healthFlags.append("depth_heuristic_fallback")
+        if !latestDepthObjectsFeedAvailable {
+            healthFlags.append("depth_objects_feed_missing")
         }
         if !latestVoApplied {
             healthFlags.append("vision_odometry_fallback")
@@ -692,7 +702,7 @@ final class RealtimeSessionManager: NSObject, ObservableObject {
             "distance_m": distanceM,
             "position_clock": clockFaceFromPositionX(depth.positionX),
             "ttl_ms": 1200,
-            "source": depth.sourceCode == 1 ? "edge_depth_onnx" : "edge_depth_heuristic",
+            "source": "edge_depth_objects_v3",
         ]]
     }
 
@@ -727,7 +737,7 @@ final class RealtimeSessionManager: NSObject, ObservableObject {
             distanceM = 3.0
         }
         let relativeVelocityMps = -max(0.4, min(3.0, riskScore))
-        let source = depth.sourceCode == 1 ? "depth_onnx" : "depth_heuristic"
+        let source = "depth_objects_v3"
 
         let payload: [String: Any] = [
             "type": "hazard_observation",
@@ -907,48 +917,14 @@ extension RealtimeSessionManager: AVCaptureVideoDataOutputSampleBufferDelegate {
             CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly)
         }
 
-        let width = CVPixelBufferGetWidth(pixelBuffer)
-        let height = CVPixelBufferGetHeight(pixelBuffer)
-        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
-        guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else {
+        guard CVPixelBufferGetBaseAddress(pixelBuffer) != nil else {
             return
         }
-        let bufferLen = bytesPerRow * height
-
-        let frameTimestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer).seconds
-        let currentTimestamp = frameTimestamp.isFinite ? frameTimestamp : Date().timeIntervalSince1970
-        let dtS: Float
-        if lastCameraFrameTimestampS <= 0 {
-            dtS = 0.033
-        } else {
-            dtS = Float(max(0.01, min(0.2, currentTimestamp - lastCameraFrameTimestampS)))
-        }
-        lastCameraFrameTimestampS = currentTimestamp
-
-        let vo = RustCoreBridge.eskfUpdateVisualOdometryBgraStrided(
-            handle: eskfHandle,
-            baseAddress: baseAddress,
-            bufferLen: bufferLen,
-            width: UInt32(width),
-            height: UInt32(height),
-            rowStride: UInt32(bytesPerRow),
-            pixelStride: 4,
-            dtS: dtS
-        )
-        latestVoApplied = vo.applied
-        latestVoFlowScore = vo.opticalFlowScore
-        latestVoVarianceM2 = vo.varianceM2
-        latestVoPoseXM = vo.poseXM
-        latestVoPoseYM = vo.poseYM
 
         let kinematic = RustCoreBridge.analyzeDefaultWalkingFrame()
-        let depth = RustCoreBridge.detectDropAheadBgraStrided(
-            baseAddress: baseAddress,
-            bufferLen: bufferLen,
-            width: UInt32(width),
-            height: UInt32(height),
-            rowStride: UInt32(bytesPerRow),
-            pixelStride: 4,
+        let objects = detectEdgeObjects(pixelBuffer: pixelBuffer)
+        let depth = RustCoreBridge.detectDropAheadObjects(
+            objects: objects,
             riskScore: kinematic.riskScore,
             carryModeCode: 1,
             gyroMagnitude: currentGyroMagnitudeDeg(),
@@ -958,5 +934,483 @@ extension RealtimeSessionManager: AVCaptureVideoDataOutputSampleBufferDelegate {
             sendHazardObservation(depth: depth, riskScore: kinematic.riskScore)
         }
         sendMultimodalFrame(riskScore: kinematic.riskScore, depth: depth)
+    }
+
+    private func detectEdgeObjects(pixelBuffer: CVPixelBuffer) -> [IOSEdgeObjectDetection] {
+        let inference = edgePipeline.detect(pixelBuffer: pixelBuffer)
+        latestDepthObjectsFeedAvailable = inference.feedAvailable
+        return inference.objects
+    }
+}
+
+private struct IOSEdgeInferenceResult {
+    let objects: [IOSEdgeObjectDetection]
+    let feedAvailable: Bool
+}
+
+private final class IOSYoloDa3CoreMLPipeline {
+    private struct RawDetection {
+        let labelId: UInt32
+        let confidence: Float
+        let xMin: Float
+        let yMin: Float
+        let xMax: Float
+        let yMax: Float
+    }
+
+    private struct DepthStats {
+        let low: Float
+        let high: Float
+        let metricLike: Bool
+    }
+
+    private struct DepthMap {
+        let width: Int
+        let height: Int
+        let values: [Float]
+        let stats: DepthStats
+    }
+
+    private let logger: (String) -> Void
+    private let yoloModel: VNCoreMLModel?
+    private let depthModel: VNCoreMLModel?
+
+    init(logger: @escaping (String) -> Void) {
+        self.logger = logger
+        self.yoloModel = IOSYoloDa3CoreMLPipeline.loadVisionModel(
+            candidates: [
+                "YOLOv12Detector",
+                "YoloV12Detector",
+                "yolov12",
+                "yolo_v12",
+                "yolo",
+            ],
+            logger: logger
+        )
+        self.depthModel = IOSYoloDa3CoreMLPipeline.loadVisionModel(
+            candidates: [
+                "DepthAnythingV3",
+                "DepthAnything3",
+                "depth_anything_v3",
+                "da3",
+                "depth",
+            ],
+            logger: logger
+        )
+        if yoloModel != nil, depthModel != nil {
+            logger("Edge model runtime ready (CoreML): YOLO+DA3")
+        } else {
+            logger("Edge model runtime unavailable: missing CoreML model(s)")
+        }
+    }
+
+    func detect(pixelBuffer: CVPixelBuffer) -> IOSEdgeInferenceResult {
+        guard let yoloModel, let depthModel else {
+            return IOSEdgeInferenceResult(objects: [], feedAvailable: false)
+        }
+
+        let yoloDetections = runYolo(pixelBuffer: pixelBuffer, model: yoloModel)
+        if yoloDetections.isEmpty {
+            return IOSEdgeInferenceResult(objects: [], feedAvailable: true)
+        }
+
+        guard let depthMap = runDepth(pixelBuffer: pixelBuffer, model: depthModel) else {
+            return IOSEdgeInferenceResult(objects: [], feedAvailable: false)
+        }
+
+        let fused = yoloDetections.prefix(16).map { det in
+            let (medianDepth, minDepth) = sampleDepth(box: det, depthMap: depthMap)
+            return IOSEdgeObjectDetection(
+                labelId: det.labelId,
+                xMin: det.xMin,
+                yMin: det.yMin,
+                xMax: det.xMax,
+                yMax: det.yMax,
+                confidence: det.confidence,
+                medianDepthM: medianDepth,
+                minDepthM: minDepth
+            )
+        }
+        return IOSEdgeInferenceResult(objects: fused, feedAvailable: true)
+    }
+
+    private func runYolo(pixelBuffer: CVPixelBuffer, model: VNCoreMLModel) -> [RawDetection] {
+        let request = VNCoreMLRequest(model: model)
+        request.imageCropAndScaleOption = .scaleFill
+        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
+        do {
+            try handler.perform([request])
+        } catch {
+            logger("YOLO request failed: \(error.localizedDescription)")
+            return []
+        }
+
+        guard let results = request.results, !results.isEmpty else {
+            return []
+        }
+
+        if let recognized = results as? [VNRecognizedObjectObservation] {
+            let mapped = recognized.compactMap { observation -> RawDetection? in
+                guard let top = observation.labels.first else {
+                    return nil
+                }
+                let box = observation.boundingBox
+                let xMin = Float(box.origin.x).clamp(0.0, 1.0)
+                let yMin = (1.0 - Float(box.origin.y) - Float(box.height)).clamp(0.0, 1.0)
+                let xMax = (xMin + Float(box.width)).clamp(0.0, 1.0)
+                let yMax = (yMin + Float(box.height)).clamp(0.0, 1.0)
+                if xMax <= xMin || yMax <= yMin {
+                    return nil
+                }
+                let confidence = Float(top.confidence).clamp(0.0, 1.0)
+                if confidence < 0.35 {
+                    return nil
+                }
+                let stableLabel = UInt32(truncatingIfNeeded: top.identifier.hashValue)
+                return RawDetection(
+                    labelId: stableLabel,
+                    confidence: confidence,
+                    xMin: xMin,
+                    yMin: yMin,
+                    xMax: xMax,
+                    yMax: yMax
+                )
+            }
+            return nonMaxSuppression(mapped, iouThreshold: 0.45)
+        }
+
+        for result in results {
+            if
+                let featureObservation = result as? VNCoreMLFeatureValueObservation,
+                let multiArray = featureObservation.featureValue.multiArrayValue
+            {
+                return decodeYoloMultiArray(multiArray)
+            }
+        }
+
+        return []
+    }
+
+    private func runDepth(pixelBuffer: CVPixelBuffer, model: VNCoreMLModel) -> DepthMap? {
+        let request = VNCoreMLRequest(model: model)
+        request.imageCropAndScaleOption = .scaleFill
+        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
+        do {
+            try handler.perform([request])
+        } catch {
+            logger("Depth request failed: \(error.localizedDescription)")
+            return nil
+        }
+
+        guard let results = request.results else {
+            return nil
+        }
+        for result in results {
+            if
+                let featureObservation = result as? VNCoreMLFeatureValueObservation,
+                let multiArray = featureObservation.featureValue.multiArrayValue
+            {
+                return decodeDepthMap(multiArray)
+            }
+        }
+        return nil
+    }
+
+    private func decodeYoloMultiArray(_ multiArray: MLMultiArray) -> [RawDetection] {
+        guard let flat = flattenMultiArray(multiArray) else {
+            return []
+        }
+        let shape = multiArray.shape.map { Int(truncating: $0) }
+        let count: Int
+        let features: Int
+        let valueAt: (Int, Int) -> Float
+        switch shape.count {
+        case 3:
+            let a = shape[1]
+            let b = shape[2]
+            if (5...512).contains(a), b > a {
+                features = a
+                count = b
+                valueAt = { c, f in
+                    flat[f * count + c]
+                }
+            } else {
+                count = a
+                features = b
+                valueAt = { c, f in
+                    flat[c * features + f]
+                }
+            }
+        case 2:
+            count = shape[0]
+            features = shape[1]
+            valueAt = { c, f in
+                flat[c * features + f]
+            }
+        default:
+            return []
+        }
+        if count <= 0 || features < 5 {
+            return []
+        }
+
+        var detections: [RawDetection] = []
+        detections.reserveCapacity(min(count, 64))
+        for c in 0..<count {
+            let cx = valueAt(c, 0)
+            let cy = valueAt(c, 1)
+            let w = valueAt(c, 2)
+            let h = valueAt(c, 3)
+            if !cx.isFinite || !cy.isFinite || !w.isFinite || !h.isFinite || w <= 0 || h <= 0 {
+                continue
+            }
+
+            let objectness = valueAt(c, 4).clamp(0.0, 1.0)
+            var classId: UInt32 = 0
+            var classScore: Float = 1.0
+            if features > 5 {
+                classScore = 0.0
+                for idx in 5..<features {
+                    let score = valueAt(c, idx)
+                    if score > classScore {
+                        classScore = score
+                        classId = UInt32(idx - 5)
+                    }
+                }
+                classScore = classScore.clamp(0.0, 1.0)
+            }
+            let confidence = (objectness * classScore).clamp(0.0, 1.0)
+            if confidence < 0.35 {
+                continue
+            }
+
+            let xCenter = (cx > 1.0 ? cx / Float(640.0) : cx).clamp(0.0, 1.0)
+            let yCenter = (cy > 1.0 ? cy / Float(640.0) : cy).clamp(0.0, 1.0)
+            let boxW = (w > 1.0 ? w / Float(640.0) : w).clamp(0.0, 1.0)
+            let boxH = (h > 1.0 ? h / Float(640.0) : h).clamp(0.0, 1.0)
+            let xMin = (xCenter - boxW * 0.5).clamp(0.0, 1.0)
+            let yMin = (yCenter - boxH * 0.5).clamp(0.0, 1.0)
+            let xMax = (xCenter + boxW * 0.5).clamp(0.0, 1.0)
+            let yMax = (yCenter + boxH * 0.5).clamp(0.0, 1.0)
+            if xMax <= xMin || yMax <= yMin {
+                continue
+            }
+
+            detections.append(
+                RawDetection(
+                    labelId: classId,
+                    confidence: confidence,
+                    xMin: xMin,
+                    yMin: yMin,
+                    xMax: xMax,
+                    yMax: yMax
+                )
+            )
+        }
+
+        return nonMaxSuppression(detections, iouThreshold: 0.45)
+    }
+
+    private func decodeDepthMap(_ multiArray: MLMultiArray) -> DepthMap? {
+        guard let flat = flattenMultiArray(multiArray) else {
+            return nil
+        }
+        let shape = multiArray.shape.map { Int(truncating: $0) }
+        let width: Int
+        let height: Int
+        let values: [Float]
+
+        switch shape.count {
+        case 4 where shape[1] == 1:
+            height = shape[2]
+            width = shape[3]
+            values = Array(flat.prefix(width * height))
+        case 4 where shape[3] == 1:
+            height = shape[1]
+            width = shape[2]
+            values = Array(flat.prefix(width * height))
+        case 3:
+            height = shape[1]
+            width = shape[2]
+            values = Array(flat.prefix(width * height))
+        case 2:
+            height = shape[0]
+            width = shape[1]
+            values = Array(flat.prefix(width * height))
+        default:
+            return nil
+        }
+
+        guard width > 0, height > 0, !values.isEmpty else {
+            return nil
+        }
+        guard let stats = computeDepthStats(values: values) else {
+            return nil
+        }
+
+        return DepthMap(width: width, height: height, values: values, stats: stats)
+    }
+
+    private func computeDepthStats(values: [Float]) -> DepthStats? {
+        let step = max(1, values.count / 512)
+        var sample: [Float] = []
+        sample.reserveCapacity(min(512, values.count))
+        var idx = 0
+        while idx < values.count {
+            let value = values[idx]
+            if value.isFinite, value > 0 {
+                sample.append(value)
+            }
+            idx += step
+        }
+        guard sample.count >= 8 else {
+            return nil
+        }
+        sample.sort()
+        let p10 = sample[Int(Float(sample.count - 1) * 0.1)]
+        let p90 = sample[Int(Float(sample.count - 1) * 0.9)]
+        let low = min(p10, p90)
+        let high = max(p10, p90)
+        guard (high - low) > 1e-6 else {
+            return nil
+        }
+        let metricLike = low >= 0.05 && high <= 12.0
+        return DepthStats(low: low, high: high, metricLike: metricLike)
+    }
+
+    private func sampleDepth(box: RawDetection, depthMap: DepthMap) -> (Float, Float) {
+        let minX = Int(box.xMin * Float(depthMap.width - 1)).clamp(0, depthMap.width - 1)
+        let maxX = Int(box.xMax * Float(depthMap.width - 1)).clamp(0, depthMap.width - 1)
+        let minY = Int(box.yMin * Float(depthMap.height - 1)).clamp(0, depthMap.height - 1)
+        let maxY = Int(box.yMax * Float(depthMap.height - 1)).clamp(0, depthMap.height - 1)
+        if maxX <= minX || maxY <= minY {
+            return (6.0, 6.0)
+        }
+
+        let stepX = max(1, (maxX - minX) / 4)
+        let stepY = max(1, (maxY - minY) / 4)
+        var depths: [Float] = []
+        depths.reserveCapacity(32)
+
+        var y = minY
+        while y <= maxY {
+            var x = minX
+            while x <= maxX {
+                let raw = depthMap.values[y * depthMap.width + x]
+                let meters = rawDepthToMeters(raw: raw, stats: depthMap.stats)
+                if meters.isFinite, meters > 0 {
+                    depths.append(meters)
+                }
+                x += stepX
+            }
+            y += stepY
+        }
+
+        guard !depths.isEmpty else {
+            return (6.0, 6.0)
+        }
+        depths.sort()
+        let median = depths[depths.count / 2].clamp(0.25, 8.0)
+        let minDepth = depths[0].clamp(0.25, 8.0)
+        return (median, minDepth)
+    }
+
+    private func rawDepthToMeters(raw: Float, stats: DepthStats) -> Float {
+        guard raw.isFinite, raw > 0 else {
+            return 6.0
+        }
+        if stats.metricLike {
+            return raw.clamp(0.25, 8.0)
+        }
+        let span = max(1e-6, stats.high - stats.low)
+        let normalized = ((raw - stats.low) / span).clamp(0.0, 1.0)
+        let proximity = normalized
+        let near: Float = 0.35
+        let far: Float = 6.0
+        return (near + (1.0 - proximity) * (far - near)).clamp(near, far)
+    }
+
+    private func nonMaxSuppression(_ detections: [RawDetection], iouThreshold: Float) -> [RawDetection] {
+        let sorted = detections.sorted { $0.confidence > $1.confidence }
+        var selected: [RawDetection] = []
+        selected.reserveCapacity(min(16, sorted.count))
+        for candidate in sorted {
+            if selected.count >= 16 {
+                break
+            }
+            if selected.allSatisfy({ iou($0, candidate) <= iouThreshold }) {
+                selected.append(candidate)
+            }
+        }
+        return selected
+    }
+
+    private func iou(_ a: RawDetection, _ b: RawDetection) -> Float {
+        let xA = max(a.xMin, b.xMin)
+        let yA = max(a.yMin, b.yMin)
+        let xB = min(a.xMax, b.xMax)
+        let yB = min(a.yMax, b.yMax)
+        let intersectionW = max(0, xB - xA)
+        let intersectionH = max(0, yB - yA)
+        let intersection = intersectionW * intersectionH
+        if intersection <= 0 {
+            return 0
+        }
+        let areaA = max(0, a.xMax - a.xMin) * max(0, a.yMax - a.yMin)
+        let areaB = max(0, b.xMax - b.xMin) * max(0, b.yMax - b.yMin)
+        let union = areaA + areaB - intersection
+        if union <= 1e-6 {
+            return 0
+        }
+        return (intersection / union).clamp(0.0, 1.0)
+    }
+
+    private func flattenMultiArray(_ multiArray: MLMultiArray) -> [Float]? {
+        let count = multiArray.count
+        guard count > 0 else {
+            return nil
+        }
+        switch multiArray.dataType {
+        case .float32:
+            let ptr = multiArray.dataPointer.bindMemory(to: Float.self, capacity: count)
+            return Array(UnsafeBufferPointer(start: ptr, count: count))
+        case .double:
+            let ptr = multiArray.dataPointer.bindMemory(to: Double.self, capacity: count)
+            return (0..<count).map { Float(ptr[$0]) }
+        default:
+            return nil
+        }
+    }
+
+    private static func loadVisionModel(
+        candidates: [String],
+        logger: (String) -> Void
+    ) -> VNCoreMLModel? {
+        for name in candidates {
+            let compiledURL =
+                Bundle.main.url(forResource: name, withExtension: "mlmodelc")
+                ?? Bundle.main.url(forResource: name, withExtension: "mlmodelc", subdirectory: "Models")
+            if let compiledURL {
+                if let model = try? MLModel(contentsOf: compiledURL),
+                    let vision = try? VNCoreMLModel(for: model)
+                {
+                    return vision
+                }
+            }
+        }
+        logger("Missing CoreML model in app bundle. Tried: \(candidates.joined(separator: ", "))")
+        return nil
+    }
+}
+
+private extension Int {
+    func clamp(_ minValue: Int, _ maxValue: Int) -> Int {
+        max(minValue, min(maxValue, self))
+    }
+}
+
+private extension Float {
+    func clamp(_ minValue: Float, _ maxValue: Float) -> Float {
+        max(minValue, min(maxValue, self))
     }
 }

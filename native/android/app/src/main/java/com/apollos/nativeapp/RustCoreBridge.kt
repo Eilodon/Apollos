@@ -12,8 +12,18 @@ data class DepthHazardResult(
     val detected: Boolean,
     val positionX: Float,
     val confidence: Float,
-    val sourceCode: Int,
     val distanceCode: Int,
+)
+
+data class EdgeObjectDetection(
+    val labelId: Int,
+    val xMin: Float,
+    val yMin: Float,
+    val xMax: Float,
+    val yMax: Float,
+    val confidence: Float,
+    val medianDepthM: Float,
+    val minDepthM: Float,
 )
 
 data class EskfSnapshot(
@@ -61,21 +71,10 @@ object RustCoreBridge {
 
     private external fun nativeDepthOnnxEnabled(): Int
 
-    private external fun nativeDetectDropAheadRgba(
-        rgbaBytes: ByteArray,
-        width: Int,
-        height: Int,
-        riskScore: Float,
-        carryModeCode: Byte,
-        gyroMagnitude: Float,
-        nowMs: Long,
-    ): FloatArray
-    private external fun nativeDetectDropAheadRgbaBuffer(
-        rgbaBuffer: ByteBuffer,
-        width: Int,
-        height: Int,
-        rowStride: Int,
-        pixelStride: Int,
+
+    private external fun nativeDetectDropAheadObjects(
+        objectVector: FloatArray,
+        objectCount: Int,
         riskScore: Float,
         carryModeCode: Byte,
         gyroMagnitude: Float,
@@ -100,22 +99,6 @@ object RustCoreBridge {
         varianceM2: Float,
     ): Int
 
-    private external fun nativeEskfUpdateVisualOdometryRgba(
-        handle: Long,
-        rgbaBytes: ByteArray,
-        width: Int,
-        height: Int,
-        dtS: Float,
-    ): FloatArray
-    private external fun nativeEskfUpdateVisualOdometryRgbaBuffer(
-        handle: Long,
-        rgbaBuffer: ByteBuffer,
-        width: Int,
-        height: Int,
-        rowStride: Int,
-        pixelStride: Int,
-        dtS: Float,
-    ): FloatArray
 
     private external fun nativeEskfSnapshot(handle: Long): FloatArray
 
@@ -169,90 +152,6 @@ object RustCoreBridge {
         )
     }
 
-    fun eskfUpdateVisualOdometryRgba(
-        handle: Long,
-        rgbaBytes: ByteArray,
-        width: Int,
-        height: Int,
-        dtS: Float,
-    ): VisionOdometryResult {
-        if (handle == 0L || width <= 0 || height <= 0 || dtS <= 0f) {
-            return VisionOdometryResult(
-                applied = false,
-                deltaXM = 0.0f,
-                deltaYM = 0.0f,
-                poseXM = 0.0f,
-                poseYM = 0.0f,
-                varianceM2 = 999.0f,
-                opticalFlowScore = 0.0f,
-                lateralBias = 0.0f,
-            )
-        }
-
-        val output = nativeEskfUpdateVisualOdometryRgba(
-            handle = handle,
-            rgbaBytes = rgbaBytes,
-            width = width,
-            height = height,
-            dtS = dtS,
-        )
-        return VisionOdometryResult(
-            applied = output.getOrElse(0) { 0.0f } > 0.5f,
-            deltaXM = output.getOrElse(1) { 0.0f },
-            deltaYM = output.getOrElse(2) { 0.0f },
-            poseXM = output.getOrElse(3) { 0.0f },
-            poseYM = output.getOrElse(4) { 0.0f },
-            varianceM2 = output.getOrElse(5) { 999.0f },
-            opticalFlowScore = output.getOrElse(6) { 0.0f },
-            lateralBias = output.getOrElse(7) { 0.0f },
-        )
-    }
-
-    fun eskfUpdateVisualOdometryRgbaBuffer(
-        handle: Long,
-        rgbaBuffer: ByteBuffer,
-        width: Int,
-        height: Int,
-        rowStride: Int,
-        pixelStride: Int,
-        dtS: Float,
-    ): VisionOdometryResult {
-        if (
-            handle == 0L || width <= 0 || height <= 0 || rowStride <= 0 || pixelStride <= 0
-            || dtS <= 0f || !rgbaBuffer.isDirect
-        ) {
-            return VisionOdometryResult(
-                applied = false,
-                deltaXM = 0.0f,
-                deltaYM = 0.0f,
-                poseXM = 0.0f,
-                poseYM = 0.0f,
-                varianceM2 = 999.0f,
-                opticalFlowScore = 0.0f,
-                lateralBias = 0.0f,
-            )
-        }
-
-        val output = nativeEskfUpdateVisualOdometryRgbaBuffer(
-            handle = handle,
-            rgbaBuffer = rgbaBuffer,
-            width = width,
-            height = height,
-            rowStride = rowStride,
-            pixelStride = pixelStride,
-            dtS = dtS,
-        )
-        return VisionOdometryResult(
-            applied = output.getOrElse(0) { 0.0f } > 0.5f,
-            deltaXM = output.getOrElse(1) { 0.0f },
-            deltaYM = output.getOrElse(2) { 0.0f },
-            poseXM = output.getOrElse(3) { 0.0f },
-            poseYM = output.getOrElse(4) { 0.0f },
-            varianceM2 = output.getOrElse(5) { 999.0f },
-            opticalFlowScore = output.getOrElse(6) { 0.0f },
-            lateralBias = output.getOrElse(7) { 0.0f },
-        )
-    }
 
     fun analyzeDefaultWalkingFrame(): KinematicResult {
         val output = nativeAnalyzeKinematics(
@@ -277,63 +176,41 @@ object RustCoreBridge {
         )
     }
 
-    fun detectDropAheadRgba(
-        rgbaBytes: ByteArray,
-        width: Int,
-        height: Int,
-        riskScore: Float,
-        carryModeCode: Byte,
-        gyroMagnitude: Float,
-        nowMs: Long,
-    ): DepthHazardResult {
-        val output = nativeDetectDropAheadRgba(
-            rgbaBytes = rgbaBytes,
-            width = width,
-            height = height,
-            riskScore = riskScore,
-            carryModeCode = carryModeCode,
-            gyroMagnitude = gyroMagnitude,
-            nowMs = nowMs,
-        )
-        return DepthHazardResult(
-            detected = output.getOrElse(0) { 0.0f } > 0.5f,
-            positionX = output.getOrElse(1) { 0.0f },
-            confidence = output.getOrElse(2) { 0.0f },
-            sourceCode = output.getOrElse(3) { 0.0f }.toInt(),
-            distanceCode = output.getOrElse(4) { 0.0f }.toInt(),
-        )
-    }
 
-    fun detectDropAheadRgbaBuffer(
-        rgbaBuffer: ByteBuffer,
-        width: Int,
-        height: Int,
-        rowStride: Int,
-        pixelStride: Int,
+    fun detectDropAheadObjects(
+        objects: List<EdgeObjectDetection>,
         riskScore: Float,
         carryModeCode: Byte,
         gyroMagnitude: Float,
         nowMs: Long,
     ): DepthHazardResult {
-        if (
-            width <= 0 || height <= 0 || rowStride <= 0 || pixelStride <= 0
-            || !rgbaBuffer.isDirect
-        ) {
+        if (objects.isEmpty()) {
             return DepthHazardResult(
                 detected = false,
                 positionX = 0.0f,
                 confidence = 0.0f,
-                sourceCode = 0,
                 distanceCode = 0,
             )
         }
 
-        val output = nativeDetectDropAheadRgbaBuffer(
-            rgbaBuffer = rgbaBuffer,
-            width = width,
-            height = height,
-            rowStride = rowStride,
-            pixelStride = pixelStride,
+        val count = objects.size.coerceAtMost(32)
+        val packed = FloatArray(count * 8)
+        for (idx in 0 until count) {
+            val obj = objects[idx]
+            val base = idx * 8
+            packed[base] = obj.labelId.toFloat().coerceAtLeast(0.0f)
+            packed[base + 1] = obj.xMin.coerceIn(0.0f, 1.0f)
+            packed[base + 2] = obj.yMin.coerceIn(0.0f, 1.0f)
+            packed[base + 3] = obj.xMax.coerceIn(0.0f, 1.0f)
+            packed[base + 4] = obj.yMax.coerceIn(0.0f, 1.0f)
+            packed[base + 5] = obj.confidence.coerceIn(0.0f, 1.0f)
+            packed[base + 6] = obj.medianDepthM.coerceAtLeast(0.0f)
+            packed[base + 7] = obj.minDepthM.coerceAtLeast(0.0f)
+        }
+
+        val output = nativeDetectDropAheadObjects(
+            objectVector = packed,
+            objectCount = count,
             riskScore = riskScore,
             carryModeCode = carryModeCode,
             gyroMagnitude = gyroMagnitude,
@@ -343,8 +220,7 @@ object RustCoreBridge {
             detected = output.getOrElse(0) { 0.0f } > 0.5f,
             positionX = output.getOrElse(1) { 0.0f },
             confidence = output.getOrElse(2) { 0.0f },
-            sourceCode = output.getOrElse(3) { 0.0f }.toInt(),
-            distanceCode = output.getOrElse(4) { 0.0f }.toInt(),
+            distanceCode = output.getOrElse(3) { 0.0f }.toInt(),
         )
     }
 }

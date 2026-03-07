@@ -41,6 +41,7 @@ message MultimodalFrameMessage {
   optional apollos.types.v1.SensorUncertaintySnapshot sensor_uncertainty = 17;
   optional CloudLinkSnapshot cloud_link = 18;
   repeated EdgeSemanticCueMessage edge_semantic_cues = 19;
+  optional VisionOdometrySnapshot vision_odometry = 20;
 }
 
 message CloudLinkSnapshot {
@@ -58,6 +59,15 @@ message EdgeSemanticCueMessage {
   optional string position_clock = 6;
   optional uint32 ttl_ms = 7;
   string source = 8;
+}
+
+message VisionOdometrySnapshot {
+  string source = 1;
+  bool applied = 2;
+  optional float optical_flow_score = 3;
+  optional float variance_m2 = 4;
+  optional float pose_x_m = 5;
+  optional float pose_y_m = 6;
 }
 
 message AudioChunkMessage {

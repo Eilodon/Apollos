@@ -171,6 +171,7 @@ fn multimodal_to_proto(
             .sensor_uncertainty
             .as_ref()
             .map(sensor_uncertainty_to_proto),
+        vision_odometry: value.vision_odometry.as_ref().map(vision_odometry_to_proto),
         cloud_link: value.cloud_link.as_ref().map(cloud_link_to_proto),
         edge_semantic_cues: value
             .edge_semantic_cues
@@ -203,6 +204,7 @@ fn multimodal_from_proto(
         location_age_ms: value.location_age_ms,
         sensor_health: value.sensor_health.map(sensor_health_from_proto),
         sensor_uncertainty: value.sensor_uncertainty.map(sensor_uncertainty_from_proto),
+        vision_odometry: value.vision_odometry.map(vision_odometry_from_proto),
         cloud_link: value.cloud_link.map(cloud_link_from_proto),
         edge_semantic_cues: value
             .edge_semantic_cues
@@ -544,6 +546,32 @@ fn edge_semantic_cue_from_proto(
     }
 }
 
+fn vision_odometry_to_proto(
+    value: &contracts::VisionOdometrySnapshot,
+) -> messages_v1::VisionOdometrySnapshot {
+    messages_v1::VisionOdometrySnapshot {
+        source: value.source.clone(),
+        applied: value.applied,
+        optical_flow_score: value.optical_flow_score,
+        variance_m2: value.variance_m2,
+        pose_x_m: value.pose_x_m,
+        pose_y_m: value.pose_y_m,
+    }
+}
+
+fn vision_odometry_from_proto(
+    value: messages_v1::VisionOdometrySnapshot,
+) -> contracts::VisionOdometrySnapshot {
+    contracts::VisionOdometrySnapshot {
+        source: value.source,
+        applied: value.applied,
+        optical_flow_score: value.optical_flow_score,
+        variance_m2: value.variance_m2,
+        pose_x_m: value.pose_x_m,
+        pose_y_m: value.pose_y_m,
+    }
+}
+
 fn human_help_rtc_to_proto(
     value: &contracts::HumanHelpRtcSession,
 ) -> types_v1::HumanHelpRtcSession {
@@ -729,10 +757,11 @@ fn cognition_layer_to_proto(value: contracts::CognitionLayer) -> types_v1::Cogni
 }
 
 fn cognition_layer_from_proto(value: i32) -> Result<contracts::CognitionLayer, TransportError> {
-    let value = types_v1::CognitionLayer::try_from(value).map_err(|_| TransportError::UnknownEnum {
-        field: "CognitionLayer",
-        value,
-    })?;
+    let value =
+        types_v1::CognitionLayer::try_from(value).map_err(|_| TransportError::UnknownEnum {
+            field: "CognitionLayer",
+            value,
+        })?;
 
     Ok(match value {
         types_v1::CognitionLayer::L1Survival => contracts::CognitionLayer::L1Survival,

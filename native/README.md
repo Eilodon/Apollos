@@ -44,3 +44,14 @@ Run end-to-end WebSocket smoke verification for native payload contracts:
 This test opens a local server, obtains a dev WS ticket, sends Android/iOS-style
 `multimodal_frame` payloads (including `sensor_health` + `sensor_uncertainty`),
 and verifies observability updates end-to-end.
+
+## Model + Build Automation
+
+Canonical model install and native app build:
+
+```bash
+./scripts/install_native_models.sh --help
+./scripts/build_native_apps.sh
+```
+
+Detailed model naming and runtime behavior: `native/MODEL_RUNTIME.md`.

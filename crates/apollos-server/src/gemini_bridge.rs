@@ -5,8 +5,8 @@ use std::{
 
 use anyhow::Context;
 use apollos_proto::contracts::{
-    AssistantAudioMessage, AssistantTextMessage, BackendToClientMessage, ConnectionState,
-    ConnectionStateMessage, CognitionLayer, HumanHelpSessionMessage, NavigationMode,
+    AssistantAudioMessage, AssistantTextMessage, BackendToClientMessage, CognitionLayer,
+    ConnectionState, ConnectionStateMessage, HumanHelpSessionMessage, NavigationMode,
     SafetyDirectiveMessage, SemanticCue, SemanticCueMessage,
 };
 use chrono::Utc;
@@ -15,7 +15,10 @@ use serde_json::{json, Map, Value};
 use tokio::sync::{mpsc, RwLock};
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::{prompts::SYSTEM_PROMPT, safety_policy, AppState};
+use crate::{
+    prompts::{HARD_STOP_PROMPT, SYSTEM_PROMPT},
+    safety_policy, AppState,
+};
 
 type LiveSocket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -1003,12 +1006,9 @@ fn build_live_setup_payload(model: &str, temperature: f32) -> Value {
 fn build_interrupt_payload(reason: &str) -> Value {
     let reason = reason.trim();
     let text = if reason.is_empty() {
-        "<CRITICAL OVERRIDE> HAZARD DETECTED. CEASE ALL GENERATION AND AUDIO IMMEDIATELY."
-            .to_string()
+        HARD_STOP_PROMPT.trim().to_string()
     } else {
-        format!(
-            "<CRITICAL OVERRIDE> HAZARD DETECTED ({reason}). CEASE ALL GENERATION AND AUDIO IMMEDIATELY."
-        )
+        format!("{} reason={reason}", HARD_STOP_PROMPT.trim())
     };
 
     json!({

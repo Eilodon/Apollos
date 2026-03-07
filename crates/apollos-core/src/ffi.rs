@@ -10,12 +10,11 @@ use std::{
 
 use crate::{
     carry_mode::get_carry_mode_profile,
-    depth_engine::{DepthEngine, DepthSource},
+    depth_engine::{BoundingBox, DepthEngine, DepthSpatials, ObjectSensorFusionInput},
     kinematic_gate::{
         compute_risk_score, compute_yaw_delta, should_capture_frame, Acceleration, GyroRotation,
         KinematicReading,
     },
-    optical_flow::{compute_optical_expansion, ExpansionPattern, LumaFrame},
     sensor_fusion::EskfFusionEngine,
 };
 use nalgebra::Vector3;
@@ -29,7 +28,7 @@ pub struct FfiAbiVersion {
 
 pub const ABI_VERSION: FfiAbiVersion = FfiAbiVersion {
     major: 0,
-    minor: 6,
+    minor: 7,
     patch: 0,
 };
 
@@ -56,8 +55,32 @@ pub struct ApollosDepthHazardOutput {
     pub detected: u8,
     pub position_x: f32,
     pub confidence: f32,
-    pub source_code: u8,
     pub distance_code: u8,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ApollosBoundingBox {
+    pub label_id: u32,
+    pub x_min: f32,
+    pub y_min: f32,
+    pub x_max: f32,
+    pub y_max: f32,
+    pub confidence: f32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ApollosDepthSpatials {
+    pub median_depth_m: f32,
+    pub min_depth_m: f32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ApollosObjectSensorFusionInput {
+    pub bbox: ApollosBoundingBox,
+    pub spatial: ApollosDepthSpatials,
 }
 
 #[repr(C)]
@@ -72,117 +95,19 @@ pub struct ApollosEskfSnapshot {
     pub covariance_zz: f32,
 }
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ApollosVisionOdometryOutput {
-    pub applied: u8,
-    pub delta_x_m: f32,
-    pub delta_y_m: f32,
-    pub pose_x_m: f32,
-    pub pose_y_m: f32,
-    pub variance_m2: f32,
-    pub optical_flow_score: f32,
-    pub lateral_bias: f32,
-}
-
 #[derive(Debug)]
 struct SharedDepthEngine {
     engine: DepthEngine,
-    onnx_probe_done: bool,
-}
-
-#[derive(Debug, Default)]
-struct VisionOdometryState {
-    previous_frame: Option<LumaFrame>,
-    pose_x_m: f32,
-    pose_y_m: f32,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct VisionOdometryMeasurement {
-    delta_x_m: f32,
-    delta_y_m: f32,
-    pose_x_m: f32,
-    pose_y_m: f32,
-    variance_m2: f32,
-    optical_flow_score: f32,
-    lateral_bias: f32,
-}
-
-impl VisionOdometryState {
-    fn reset(&mut self) {
-        self.previous_frame = None;
-        self.pose_x_m = 0.0;
-        self.pose_y_m = 0.0;
-    }
-
-    fn ingest_frame(
-        &mut self,
-        current_frame: LumaFrame,
-        dt_s: f32,
-    ) -> Option<VisionOdometryMeasurement> {
-        let dt = dt_s.clamp(1e-3, 0.2);
-        let previous = self.previous_frame.take();
-        let mut measurement = None;
-
-        if let Some(previous_frame) = previous.as_ref() {
-            if previous_frame.width == current_frame.width
-                && previous_frame.height == current_frame.height
-            {
-                let expansion = compute_optical_expansion(previous_frame, &current_frame);
-                let flow_score = (expansion.avg_diff / 35.0).clamp(0.0, 1.0);
-                let pattern_scale = match expansion.pattern {
-                    ExpansionPattern::Radial => 1.0,
-                    ExpansionPattern::Uniform => 0.85,
-                    ExpansionPattern::Directional => 0.65,
-                    ExpansionPattern::None => 0.4,
-                };
-                let forward_speed_mps =
-                    ((expansion.avg_diff / 255.0) * 3.2 * pattern_scale).clamp(0.0, 2.2);
-
-                if flow_score >= 0.05 && forward_speed_mps > 1e-3 {
-                    let lateral_speed_mps = expansion.lateral_bias * forward_speed_mps * 0.7;
-                    let delta_x_m = lateral_speed_mps * dt;
-                    let delta_y_m = forward_speed_mps * dt;
-
-                    self.pose_x_m += delta_x_m;
-                    self.pose_y_m += delta_y_m;
-
-                    let mut variance_m2 = (1.8 - flow_score * 1.3).clamp(0.25, 2.5);
-                    if matches!(expansion.pattern, ExpansionPattern::Directional) {
-                        variance_m2 = (variance_m2 * 1.2).clamp(0.25, 3.0);
-                    } else if matches!(expansion.pattern, ExpansionPattern::None) {
-                        variance_m2 = 3.0;
-                    }
-
-                    measurement = Some(VisionOdometryMeasurement {
-                        delta_x_m,
-                        delta_y_m,
-                        pose_x_m: self.pose_x_m,
-                        pose_y_m: self.pose_y_m,
-                        variance_m2,
-                        optical_flow_score: flow_score,
-                        lateral_bias: expansion.lateral_bias,
-                    });
-                }
-            }
-        }
-
-        self.previous_frame = Some(current_frame);
-        measurement
-    }
 }
 
 #[derive(Debug)]
 struct SharedEskfEngine {
     engine: EskfFusionEngine,
-    vision_odometry: VisionOdometryState,
 }
 
 static DEPTH_ENGINE: Lazy<Mutex<SharedDepthEngine>> = Lazy::new(|| {
     Mutex::new(SharedDepthEngine {
         engine: DepthEngine::default(),
-        onnx_probe_done: false,
     })
 });
 
@@ -282,14 +207,7 @@ pub extern "C" fn apollos_get_carry_mode_profile(carry_mode_code: u8) -> Apollos
 
 #[no_mangle]
 pub extern "C" fn apollos_depth_onnx_runtime_enabled() -> u8 {
-    let Ok(mut guard) = DEPTH_ENGINE.lock() else {
-        return 0;
-    };
-    if !guard.onnx_probe_done {
-        let _ = guard.engine.try_enable_onnx_from_env();
-        guard.onnx_probe_done = true;
-    }
-    u8::from(guard.engine.has_onnx_runtime())
+    0
 }
 
 #[no_mangle]
@@ -306,7 +224,6 @@ pub extern "C" fn apollos_eskf_create() -> u64 {
         if let std::collections::hash_map::Entry::Vacant(entry) = guard.entry(handle) {
             entry.insert(SharedEskfEngine {
                 engine: EskfFusionEngine::new(),
-                vision_odometry: VisionOdometryState::default(),
             });
             return handle;
         }
@@ -341,7 +258,6 @@ pub extern "C" fn apollos_eskf_reset(handle: u64) -> u8 {
         return 0;
     };
     shared.engine = EskfFusionEngine::new();
-    shared.vision_odometry.reset();
     1
 }
 
@@ -357,74 +273,19 @@ fn invalid_eskf_snapshot() -> ApollosEskfSnapshot {
     }
 }
 
-fn invalid_vision_odometry_output() -> ApollosVisionOdometryOutput {
-    ApollosVisionOdometryOutput {
-        applied: 0,
-        delta_x_m: 0.0,
-        delta_y_m: 0.0,
-        pose_x_m: 0.0,
-        pose_y_m: 0.0,
-        variance_m2: 999.0,
-        optical_flow_score: 0.0,
-        lateral_bias: 0.0,
-    }
-}
-
 fn invalid_depth_hazard_output() -> ApollosDepthHazardOutput {
     ApollosDepthHazardOutput {
         detected: 0,
         position_x: 0.0,
         confidence: 0.0,
-        source_code: 0,
         distance_code: 0,
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PixelLayout {
-    Rgba,
-    Bgra,
-}
+// visual odometry RGBA helpers removed
 
-fn update_visual_odometry_from_frame(
-    handle: u64,
-    frame: LumaFrame,
-    dt_s: f32,
-) -> ApollosVisionOdometryOutput {
-    if handle == 0 || !dt_s.is_finite() {
-        return invalid_vision_odometry_output();
-    }
-
-    let Ok(mut guard) = ESKF_ENGINES.lock() else {
-        return invalid_vision_odometry_output();
-    };
-    let Some(shared) = guard.get_mut(&handle) else {
-        return invalid_vision_odometry_output();
-    };
-
-    let Some(measurement) = shared.vision_odometry.ingest_frame(frame, dt_s) else {
-        return invalid_vision_odometry_output();
-    };
-
-    let applied = shared.engine.update_vision_with_variance(
-        Vector3::new(measurement.pose_x_m, measurement.pose_y_m, 0.0),
-        measurement.variance_m2,
-    );
-
-    ApollosVisionOdometryOutput {
-        applied: u8::from(applied),
-        delta_x_m: measurement.delta_x_m,
-        delta_y_m: measurement.delta_y_m,
-        pose_x_m: measurement.pose_x_m,
-        pose_y_m: measurement.pose_y_m,
-        variance_m2: measurement.variance_m2,
-        optical_flow_score: measurement.optical_flow_score,
-        lateral_bias: measurement.lateral_bias,
-    }
-}
-
-fn detect_drop_ahead_from_frame(
-    frame: LumaFrame,
+fn detect_drop_ahead_from_objects(
+    objects: &[ObjectSensorFusionInput],
     risk_score: f32,
     carry_mode_code: u8,
     gyro_magnitude: f32,
@@ -434,13 +295,8 @@ fn detect_drop_ahead_from_frame(
         return invalid_depth_hazard_output();
     };
 
-    if !guard.onnx_probe_done {
-        let _ = guard.engine.try_enable_onnx_from_env();
-        guard.onnx_probe_done = true;
-    }
-
     let hazard = guard.engine.process(
-        &frame,
+        objects,
         risk_score,
         carry_mode_from_code(carry_mode_code),
         gyro_magnitude,
@@ -455,10 +311,6 @@ fn detect_drop_ahead_from_frame(
         detected: 1,
         position_x: hazard.position_x,
         confidence: hazard.confidence,
-        source_code: match hazard.source {
-            DepthSource::Onnx => 1,
-            DepthSource::Heuristic => 0,
-        },
         distance_code: match hazard.distance {
             DistanceCategory::VeryClose => 0,
             DistanceCategory::Mid => 1,
@@ -467,42 +319,7 @@ fn detect_drop_ahead_from_frame(
     }
 }
 
-unsafe fn frame_from_strided_ptr(
-    rgba_ptr: *const u8,
-    rgba_len: usize,
-    width: usize,
-    height: usize,
-    row_stride: usize,
-    pixel_stride: usize,
-    layout: PixelLayout,
-) -> Option<LumaFrame> {
-    if rgba_ptr.is_null() || width == 0 || height == 0 {
-        return None;
-    }
-
-    let min_row_stride = width.checked_mul(pixel_stride)?;
-    if row_stride < min_row_stride || pixel_stride < 3 {
-        return None;
-    }
-
-    let required_len = row_stride.checked_mul(height)?;
-    if rgba_len < required_len {
-        return None;
-    }
-
-    // SAFETY:
-    // - caller guarantees `rgba_ptr` points to at least `required_len` readable bytes.
-    // - pointer non-null and bounds checked above.
-    let buffer = unsafe { std::slice::from_raw_parts(rgba_ptr, required_len) };
-    match layout {
-        PixelLayout::Rgba => {
-            LumaFrame::from_rgba_strided(width, height, buffer, row_stride, pixel_stride)
-        }
-        PixelLayout::Bgra => {
-            LumaFrame::from_bgra_strided(width, height, buffer, row_stride, pixel_stride)
-        }
-    }
-}
+// strided frame parsing removed
 
 #[no_mangle]
 pub extern "C" fn apollos_eskf_predict_imu(
@@ -566,100 +383,7 @@ pub extern "C" fn apollos_eskf_update_vision(
     ))
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn apollos_eskf_update_visual_odometry_rgba(
-    handle: u64,
-    rgba_ptr: *const u8,
-    rgba_len: usize,
-    width: u32,
-    height: u32,
-    dt_s: f32,
-) -> ApollosVisionOdometryOutput {
-    // SAFETY:
-    // - contiguous RGBA is a special case of strided RGBA with row_stride=width*4 and pixel_stride=4.
-    unsafe {
-        apollos_eskf_update_visual_odometry_rgba_strided(
-            handle,
-            rgba_ptr,
-            rgba_len,
-            width,
-            height,
-            width.saturating_mul(4),
-            4,
-            dt_s,
-        )
-    }
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn apollos_eskf_update_visual_odometry_rgba_strided(
-    handle: u64,
-    rgba_ptr: *const u8,
-    rgba_len: usize,
-    width: u32,
-    height: u32,
-    row_stride: u32,
-    pixel_stride: u32,
-    dt_s: f32,
-) -> ApollosVisionOdometryOutput {
-    if handle == 0 || !dt_s.is_finite() {
-        return invalid_vision_odometry_output();
-    }
-
-    // SAFETY:
-    // - caller guarantees pointer/length validity for this call.
-    let frame = unsafe {
-        frame_from_strided_ptr(
-            rgba_ptr,
-            rgba_len,
-            width as usize,
-            height as usize,
-            row_stride as usize,
-            pixel_stride as usize,
-            PixelLayout::Rgba,
-        )
-    };
-    let Some(frame) = frame else {
-        return invalid_vision_odometry_output();
-    };
-
-    update_visual_odometry_from_frame(handle, frame, dt_s)
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn apollos_eskf_update_visual_odometry_bgra_strided(
-    handle: u64,
-    bgra_ptr: *const u8,
-    bgra_len: usize,
-    width: u32,
-    height: u32,
-    row_stride: u32,
-    pixel_stride: u32,
-    dt_s: f32,
-) -> ApollosVisionOdometryOutput {
-    if handle == 0 || !dt_s.is_finite() {
-        return invalid_vision_odometry_output();
-    }
-
-    // SAFETY:
-    // - caller guarantees pointer/length validity for this call.
-    let frame = unsafe {
-        frame_from_strided_ptr(
-            bgra_ptr,
-            bgra_len,
-            width as usize,
-            height as usize,
-            row_stride as usize,
-            pixel_stride as usize,
-            PixelLayout::Bgra,
-        )
-    };
-    let Some(frame) = frame else {
-        return invalid_vision_odometry_output();
-    };
-
-    update_visual_odometry_from_frame(handle, frame, dt_s)
-}
+// Optical flow logic removed. Visual odometry via pixels is deprecated in favor of NPU integration.
 
 #[no_mangle]
 pub extern "C" fn apollos_eskf_snapshot(handle: u64) -> ApollosEskfSnapshot {
@@ -690,114 +414,50 @@ pub extern "C" fn apollos_eskf_snapshot(handle: u64) -> ApollosEskfSnapshot {
 }
 
 #[no_mangle]
-/// Runs depth hazard detection on an RGBA frame and returns a compact ABI-safe output.
+/// Runs depth hazard detection on a list of objects fused from YOLO and Depth Anything.
 ///
 /// # Safety
-/// - `rgba_ptr` must point to at least `width * height * 4` readable bytes.
-/// - `rgba_ptr` must remain valid for the duration of this call.
-/// - Caller is responsible for ensuring the buffer memory is properly aligned and initialized.
-pub unsafe extern "C" fn apollos_detect_drop_ahead_rgba(
-    rgba_ptr: *const u8,
-    rgba_len: usize,
-    width: u32,
-    height: u32,
-    risk_score: f32,
-    carry_mode_code: u8,
-    gyro_magnitude: f32,
-    now_ms: u64,
-) -> ApollosDepthHazardOutput {
-    // SAFETY:
-    // - contiguous RGBA is a special case of strided RGBA with row_stride=width*4 and pixel_stride=4.
-    unsafe {
-        apollos_detect_drop_ahead_rgba_strided(
-            rgba_ptr,
-            rgba_len,
-            width,
-            height,
-            width.saturating_mul(4),
-            4,
-            risk_score,
-            carry_mode_code,
-            gyro_magnitude,
-            now_ms,
-        )
-    }
-}
-
-#[no_mangle]
-/// Runs depth hazard detection on a strided RGBA frame.
-///
-/// # Safety
-/// - `rgba_ptr` must point to at least `row_stride * height` readable bytes.
+/// - `objects_ptr` must point to `objects_len` instances of `ApollosObjectSensorFusionInput`.
 /// - pointer must remain valid for this call.
-pub unsafe extern "C" fn apollos_detect_drop_ahead_rgba_strided(
-    rgba_ptr: *const u8,
-    rgba_len: usize,
-    width: u32,
-    height: u32,
-    row_stride: u32,
-    pixel_stride: u32,
+pub unsafe extern "C" fn apollos_detect_drop_ahead_objects(
+    objects_ptr: *const ApollosObjectSensorFusionInput,
+    objects_len: usize,
     risk_score: f32,
     carry_mode_code: u8,
     gyro_magnitude: f32,
     now_ms: u64,
 ) -> ApollosDepthHazardOutput {
-    // SAFETY:
-    // - caller guarantees pointer/length validity for this call.
-    let frame = unsafe {
-        frame_from_strided_ptr(
-            rgba_ptr,
-            rgba_len,
-            width as usize,
-            height as usize,
-            row_stride as usize,
-            pixel_stride as usize,
-            PixelLayout::Rgba,
-        )
-    };
-    let Some(frame) = frame else {
-        return invalid_depth_hazard_output();
+    let raw_objects = if objects_ptr.is_null() || objects_len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(objects_ptr, objects_len) }
     };
 
-    detect_drop_ahead_from_frame(frame, risk_score, carry_mode_code, gyro_magnitude, now_ms)
-}
+    let objects: Vec<ObjectSensorFusionInput> = raw_objects
+        .iter()
+        .map(|obj| ObjectSensorFusionInput {
+            bbox: BoundingBox {
+                label_id: obj.bbox.label_id,
+                x_min: obj.bbox.x_min,
+                y_min: obj.bbox.y_min,
+                x_max: obj.bbox.x_max,
+                y_max: obj.bbox.y_max,
+                confidence: obj.bbox.confidence,
+            },
+            spatial: DepthSpatials {
+                median_depth_m: obj.spatial.median_depth_m,
+                min_depth_m: obj.spatial.min_depth_m,
+            },
+        })
+        .collect();
 
-#[no_mangle]
-/// Runs depth hazard detection on a strided BGRA frame.
-///
-/// # Safety
-/// - `bgra_ptr` must point to at least `row_stride * height` readable bytes.
-/// - pointer must remain valid for this call.
-pub unsafe extern "C" fn apollos_detect_drop_ahead_bgra_strided(
-    bgra_ptr: *const u8,
-    bgra_len: usize,
-    width: u32,
-    height: u32,
-    row_stride: u32,
-    pixel_stride: u32,
-    risk_score: f32,
-    carry_mode_code: u8,
-    gyro_magnitude: f32,
-    now_ms: u64,
-) -> ApollosDepthHazardOutput {
-    // SAFETY:
-    // - caller guarantees pointer/length validity for this call.
-    let frame = unsafe {
-        frame_from_strided_ptr(
-            bgra_ptr,
-            bgra_len,
-            width as usize,
-            height as usize,
-            row_stride as usize,
-            pixel_stride as usize,
-            PixelLayout::Bgra,
-        )
-    };
-    let Some(frame) = frame else {
-        return invalid_depth_hazard_output();
-    };
-
-    detect_drop_ahead_from_frame(frame, risk_score, carry_mode_code, gyro_magnitude, now_ms)
+    detect_drop_ahead_from_objects(
+        &objects,
+        risk_score,
+        carry_mode_code,
+        gyro_magnitude,
+        now_ms,
+    )
 }
 
 fn motion_state_from_code(value: u8) -> MotionState {
@@ -825,7 +485,7 @@ mod tests {
     #[test]
     fn abi_version_packs_into_u32() {
         let packed = apollos_abi_version_u32();
-        assert_eq!(packed, 0x0000_0600);
+        assert_eq!(packed, 0x0000_0700);
     }
 
     #[test]
@@ -872,122 +532,5 @@ mod tests {
 
         assert_eq!(apollos_eskf_destroy(left), 1);
         assert_eq!(apollos_eskf_destroy(right), 1);
-    }
-
-    #[test]
-    fn eskf_visual_odometry_updates_pose_after_second_frame() {
-        let handle = apollos_eskf_create();
-        assert_ne!(handle, 0);
-
-        let width = 32_u32;
-        let height = 24_u32;
-        let mut frame_a = vec![0_u8; (width as usize) * (height as usize) * 4];
-        let mut frame_b = vec![0_u8; (width as usize) * (height as usize) * 4];
-
-        for pixel in frame_a.chunks_exact_mut(4) {
-            pixel[0] = 32;
-            pixel[1] = 32;
-            pixel[2] = 32;
-            pixel[3] = 255;
-        }
-        for pixel in frame_b.chunks_exact_mut(4) {
-            pixel[0] = 96;
-            pixel[1] = 96;
-            pixel[2] = 96;
-            pixel[3] = 255;
-        }
-
-        // SAFETY: test buffers are valid RGBA and pointers remain alive for the call.
-        let first = unsafe {
-            apollos_eskf_update_visual_odometry_rgba(
-                handle,
-                frame_a.as_ptr(),
-                frame_a.len(),
-                width,
-                height,
-                0.033,
-            )
-        };
-        assert_eq!(first.applied, 0);
-
-        // SAFETY: test buffers are valid RGBA and pointers remain alive for the call.
-        let second = unsafe {
-            apollos_eskf_update_visual_odometry_rgba(
-                handle,
-                frame_b.as_ptr(),
-                frame_b.len(),
-                width,
-                height,
-                0.033,
-            )
-        };
-        assert!(second.optical_flow_score > 0.0);
-        assert!(second.pose_y_m >= 0.0);
-        assert!(second.variance_m2.is_finite());
-
-        assert_eq!(apollos_eskf_destroy(handle), 1);
-    }
-
-    #[test]
-    fn eskf_visual_odometry_accepts_bgra_strided_buffer() {
-        let handle = apollos_eskf_create();
-        assert_ne!(handle, 0);
-
-        let width = 8_u32;
-        let height = 4_u32;
-        let row_stride = (width as usize) * 4 + 8;
-        let mut frame_a = vec![0_u8; row_stride * (height as usize)];
-        let mut frame_b = vec![0_u8; row_stride * (height as usize)];
-
-        for y in 0..height as usize {
-            let row_a = &mut frame_a[y * row_stride..(y + 1) * row_stride];
-            let row_b = &mut frame_b[y * row_stride..(y + 1) * row_stride];
-            for x in 0..width as usize {
-                let off = x * 4;
-                // BGRA
-                row_a[off] = 24;
-                row_a[off + 1] = 24;
-                row_a[off + 2] = 24;
-                row_a[off + 3] = 255;
-
-                row_b[off] = 120;
-                row_b[off + 1] = 120;
-                row_b[off + 2] = 120;
-                row_b[off + 3] = 255;
-            }
-        }
-
-        // SAFETY: buffers are valid and live for call duration.
-        let first = unsafe {
-            apollos_eskf_update_visual_odometry_bgra_strided(
-                handle,
-                frame_a.as_ptr(),
-                frame_a.len(),
-                width,
-                height,
-                row_stride as u32,
-                4,
-                0.033,
-            )
-        };
-        assert_eq!(first.applied, 0);
-
-        // SAFETY: buffers are valid and live for call duration.
-        let second = unsafe {
-            apollos_eskf_update_visual_odometry_bgra_strided(
-                handle,
-                frame_b.as_ptr(),
-                frame_b.len(),
-                width,
-                height,
-                row_stride as u32,
-                4,
-                0.033,
-            )
-        };
-        assert!(second.optical_flow_score >= 0.0);
-        assert!(second.variance_m2.is_finite());
-
-        assert_eq!(apollos_eskf_destroy(handle), 1);
     }
 }

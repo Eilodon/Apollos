@@ -1,5 +1,7 @@
 #include <jni.h>
+#include <algorithm>
 #include <cstdint>
+#include <vector>
 
 extern "C" {
 
@@ -13,7 +15,6 @@ struct ApollosDepthHazardOutput {
     uint8_t detected;
     float position_x;
     float confidence;
-    uint8_t source_code;
     uint8_t distance_code;
 };
 
@@ -27,15 +28,23 @@ struct ApollosEskfSnapshot {
     float covariance_zz;
 };
 
-struct ApollosVisionOdometryOutput {
-    uint8_t applied;
-    float delta_x_m;
-    float delta_y_m;
-    float pose_x_m;
-    float pose_y_m;
-    float variance_m2;
-    float optical_flow_score;
-    float lateral_bias;
+struct ApollosBoundingBox {
+    uint32_t label_id;
+    float x_min;
+    float y_min;
+    float x_max;
+    float y_max;
+    float confidence;
+};
+
+struct ApollosDepthSpatials {
+    float median_depth_m;
+    float min_depth_m;
+};
+
+struct ApollosObjectSensorFusionInput {
+    ApollosBoundingBox bbox;
+    ApollosDepthSpatials spatial;
 };
 
 uint32_t apollos_abi_version_u32(void);
@@ -54,23 +63,9 @@ ApollosKinematicOutput apollos_analyze_kinematics(
     float gyro_gamma,
     uint8_t sensor_unavailable
 );
-ApollosDepthHazardOutput apollos_detect_drop_ahead_rgba(
-    const uint8_t* rgba_ptr,
-    uintptr_t rgba_len,
-    uint32_t width,
-    uint32_t height,
-    float risk_score,
-    uint8_t carry_mode_code,
-    float gyro_magnitude,
-    uint64_t now_ms
-);
-ApollosDepthHazardOutput apollos_detect_drop_ahead_rgba_strided(
-    const uint8_t* rgba_ptr,
-    uintptr_t rgba_len,
-    uint32_t width,
-    uint32_t height,
-    uint32_t row_stride,
-    uint32_t pixel_stride,
+ApollosDepthHazardOutput apollos_detect_drop_ahead_objects(
+    const ApollosObjectSensorFusionInput* objects_ptr,
+    uintptr_t objects_len,
     float risk_score,
     uint8_t carry_mode_code,
     float gyro_magnitude,
@@ -92,24 +87,6 @@ uint8_t apollos_eskf_update_vision(
     float position_y,
     float position_z,
     float variance_m2
-);
-ApollosVisionOdometryOutput apollos_eskf_update_visual_odometry_rgba(
-    uint64_t handle,
-    const uint8_t* rgba_ptr,
-    uintptr_t rgba_len,
-    uint32_t width,
-    uint32_t height,
-    float dt_s
-);
-ApollosVisionOdometryOutput apollos_eskf_update_visual_odometry_rgba_strided(
-    uint64_t handle,
-    const uint8_t* rgba_ptr,
-    uintptr_t rgba_len,
-    uint32_t width,
-    uint32_t height,
-    uint32_t row_stride,
-    uint32_t pixel_stride,
-    float dt_s
 );
 ApollosEskfSnapshot apollos_eskf_snapshot(uint64_t handle);
 
@@ -176,106 +153,65 @@ Java_com_apollos_nativeapp_RustCoreBridge_nativeDepthOnnxEnabled(
     return static_cast<jint>(apollos_depth_onnx_runtime_enabled());
 }
 
+
 JNIEXPORT jfloatArray JNICALL
-Java_com_apollos_nativeapp_RustCoreBridge_nativeDetectDropAheadRgba(
+Java_com_apollos_nativeapp_RustCoreBridge_nativeDetectDropAheadObjects(
     JNIEnv* env,
     jobject /* thiz */,
-    jbyteArray rgba_bytes,
-    jint width,
-    jint height,
+    jfloatArray object_vector,
+    jint object_count,
     jfloat risk_score,
     jbyte carry_mode_code,
     jfloat gyro_magnitude,
     jlong now_ms
 ) {
-    if (rgba_bytes == nullptr || width <= 0 || height <= 0) {
-        return nullptr;
+    constexpr int kObjectStride = 8;
+    jsize vector_len = object_vector == nullptr ? 0 : env->GetArrayLength(object_vector);
+    std::vector<jfloat> packed;
+    if (vector_len > 0) {
+        packed.resize(static_cast<size_t>(vector_len));
+        env->GetFloatArrayRegion(object_vector, 0, vector_len, packed.data());
     }
 
-    const jsize len = env->GetArrayLength(rgba_bytes);
-    jbyte* bytes = env->GetByteArrayElements(rgba_bytes, nullptr);
-    if (bytes == nullptr) {
-        return nullptr;
+    const int available = static_cast<int>(packed.size() / kObjectStride);
+    const int requested = std::max(0, static_cast<int>(object_count));
+    const int count = std::min(available, requested);
+
+    std::vector<ApollosObjectSensorFusionInput> objects(static_cast<size_t>(count));
+    for (int idx = 0; idx < count; ++idx) {
+        const int base = idx * kObjectStride;
+        objects[idx].bbox.label_id = static_cast<uint32_t>(std::max(0.0f, packed[base]));
+        objects[idx].bbox.x_min = packed[base + 1];
+        objects[idx].bbox.y_min = packed[base + 2];
+        objects[idx].bbox.x_max = packed[base + 3];
+        objects[idx].bbox.y_max = packed[base + 4];
+        objects[idx].bbox.confidence = packed[base + 5];
+        objects[idx].spatial.median_depth_m = packed[base + 6];
+        objects[idx].spatial.min_depth_m = packed[base + 7];
     }
 
-    ApollosDepthHazardOutput output = apollos_detect_drop_ahead_rgba(
-        reinterpret_cast<const uint8_t*>(bytes),
-        static_cast<uintptr_t>(len),
-        static_cast<uint32_t>(width),
-        static_cast<uint32_t>(height),
-        static_cast<float>(risk_score),
-        static_cast<uint8_t>(carry_mode_code),
-        static_cast<float>(gyro_magnitude),
-        static_cast<uint64_t>(now_ms)
-    );
-    env->ReleaseByteArrayElements(rgba_bytes, bytes, JNI_ABORT);
-
-    jfloat values[5] = {
-        output.detected == 0 ? 0.0f : 1.0f,
-        output.position_x,
-        output.confidence,
-        static_cast<float>(output.source_code),
-        static_cast<float>(output.distance_code),
-    };
-
-    jfloatArray array = env->NewFloatArray(5);
-    if (array == nullptr) {
-        return nullptr;
-    }
-    env->SetFloatArrayRegion(array, 0, 5, values);
-    return array;
-}
-
-JNIEXPORT jfloatArray JNICALL
-Java_com_apollos_nativeapp_RustCoreBridge_nativeDetectDropAheadRgbaBuffer(
-    JNIEnv* env,
-    jobject /* thiz */,
-    jobject rgba_buffer,
-    jint width,
-    jint height,
-    jint row_stride,
-    jint pixel_stride,
-    jfloat risk_score,
-    jbyte carry_mode_code,
-    jfloat gyro_magnitude,
-    jlong now_ms
-) {
-    if (rgba_buffer == nullptr || width <= 0 || height <= 0 || row_stride <= 0 || pixel_stride <= 0) {
-        return nullptr;
-    }
-
-    auto* bytes = static_cast<uint8_t*>(env->GetDirectBufferAddress(rgba_buffer));
-    const jlong len = env->GetDirectBufferCapacity(rgba_buffer);
-    if (bytes == nullptr || len <= 0) {
-        return nullptr;
-    }
-
-    ApollosDepthHazardOutput output = apollos_detect_drop_ahead_rgba_strided(
-        reinterpret_cast<const uint8_t*>(bytes),
-        static_cast<uintptr_t>(len),
-        static_cast<uint32_t>(width),
-        static_cast<uint32_t>(height),
-        static_cast<uint32_t>(row_stride),
-        static_cast<uint32_t>(pixel_stride),
+    const ApollosObjectSensorFusionInput* ptr = objects.empty() ? nullptr : objects.data();
+    ApollosDepthHazardOutput output = apollos_detect_drop_ahead_objects(
+        ptr,
+        static_cast<uintptr_t>(objects.size()),
         static_cast<float>(risk_score),
         static_cast<uint8_t>(carry_mode_code),
         static_cast<float>(gyro_magnitude),
         static_cast<uint64_t>(now_ms)
     );
 
-    jfloat values[5] = {
+    jfloat values[4] = {
         output.detected == 0 ? 0.0f : 1.0f,
         output.position_x,
         output.confidence,
-        static_cast<float>(output.source_code),
         static_cast<float>(output.distance_code),
     };
 
-    jfloatArray array = env->NewFloatArray(5);
+    jfloatArray array = env->NewFloatArray(4);
     if (array == nullptr) {
         return nullptr;
     }
-    env->SetFloatArrayRegion(array, 0, 5, values);
+    env->SetFloatArrayRegion(array, 0, 4, values);
     return array;
 }
 
@@ -343,106 +279,6 @@ Java_com_apollos_nativeapp_RustCoreBridge_nativeEskfUpdateVision(
     ));
 }
 
-JNIEXPORT jfloatArray JNICALL
-Java_com_apollos_nativeapp_RustCoreBridge_nativeEskfUpdateVisualOdometryRgba(
-    JNIEnv* env,
-    jobject /* thiz */,
-    jlong handle,
-    jbyteArray rgba_bytes,
-    jint width,
-    jint height,
-    jfloat dt_s
-) {
-    if (rgba_bytes == nullptr || width <= 0 || height <= 0) {
-        return nullptr;
-    }
-
-    const jsize len = env->GetArrayLength(rgba_bytes);
-    jbyte* bytes = env->GetByteArrayElements(rgba_bytes, nullptr);
-    if (bytes == nullptr) {
-        return nullptr;
-    }
-
-    ApollosVisionOdometryOutput output = apollos_eskf_update_visual_odometry_rgba(
-        static_cast<uint64_t>(handle),
-        reinterpret_cast<const uint8_t*>(bytes),
-        static_cast<uintptr_t>(len),
-        static_cast<uint32_t>(width),
-        static_cast<uint32_t>(height),
-        static_cast<float>(dt_s)
-    );
-    env->ReleaseByteArrayElements(rgba_bytes, bytes, JNI_ABORT);
-
-    jfloat values[8] = {
-        output.applied == 0 ? 0.0f : 1.0f,
-        output.delta_x_m,
-        output.delta_y_m,
-        output.pose_x_m,
-        output.pose_y_m,
-        output.variance_m2,
-        output.optical_flow_score,
-        output.lateral_bias,
-    };
-
-    jfloatArray array = env->NewFloatArray(8);
-    if (array == nullptr) {
-        return nullptr;
-    }
-    env->SetFloatArrayRegion(array, 0, 8, values);
-    return array;
-}
-
-JNIEXPORT jfloatArray JNICALL
-Java_com_apollos_nativeapp_RustCoreBridge_nativeEskfUpdateVisualOdometryRgbaBuffer(
-    JNIEnv* env,
-    jobject /* thiz */,
-    jlong handle,
-    jobject rgba_buffer,
-    jint width,
-    jint height,
-    jint row_stride,
-    jint pixel_stride,
-    jfloat dt_s
-) {
-    if (rgba_buffer == nullptr || width <= 0 || height <= 0 || row_stride <= 0 || pixel_stride <= 0) {
-        return nullptr;
-    }
-
-    auto* bytes = static_cast<uint8_t*>(env->GetDirectBufferAddress(rgba_buffer));
-    const jlong len = env->GetDirectBufferCapacity(rgba_buffer);
-    if (bytes == nullptr || len <= 0) {
-        return nullptr;
-    }
-
-    ApollosVisionOdometryOutput output = apollos_eskf_update_visual_odometry_rgba_strided(
-        static_cast<uint64_t>(handle),
-        reinterpret_cast<const uint8_t*>(bytes),
-        static_cast<uintptr_t>(len),
-        static_cast<uint32_t>(width),
-        static_cast<uint32_t>(height),
-        static_cast<uint32_t>(row_stride),
-        static_cast<uint32_t>(pixel_stride),
-        static_cast<float>(dt_s)
-    );
-
-    jfloat values[8] = {
-        output.applied == 0 ? 0.0f : 1.0f,
-        output.delta_x_m,
-        output.delta_y_m,
-        output.pose_x_m,
-        output.pose_y_m,
-        output.variance_m2,
-        output.optical_flow_score,
-        output.lateral_bias,
-    };
-
-    jfloatArray array = env->NewFloatArray(8);
-    if (array == nullptr) {
-        return nullptr;
-    }
-    env->SetFloatArrayRegion(array, 0, 8, values);
-    return array;
-}
 
 JNIEXPORT jfloatArray JNICALL
 Java_com_apollos_nativeapp_RustCoreBridge_nativeEskfSnapshot(

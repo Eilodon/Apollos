@@ -76,6 +76,16 @@ pub struct CloudLinkSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VisionOdometrySnapshot {
+    pub source: String,
+    pub applied: bool,
+    pub optical_flow_score: Option<f32>,
+    pub variance_m2: Option<f32>,
+    pub pose_x_m: Option<f32>,
+    pub pose_y_m: Option<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EdgeSemanticCueMessage {
     pub cue_type: String,
     pub text: Option<String>,
@@ -106,6 +116,7 @@ pub struct MultimodalFrameMessage {
     pub location_age_ms: Option<u64>,
     pub sensor_health: Option<SensorHealthSnapshot>,
     pub sensor_uncertainty: Option<SensorUncertaintySnapshot>,
+    pub vision_odometry: Option<VisionOdometrySnapshot>,
     pub cloud_link: Option<CloudLinkSnapshot>,
     pub edge_semantic_cues: Vec<EdgeSemanticCueMessage>,
 }
@@ -289,6 +300,7 @@ mod tests {
             location_age_ms: None,
             sensor_health: None,
             sensor_uncertainty: None,
+            vision_odometry: None,
             cloud_link: None,
             edge_semantic_cues: Vec::new(),
         });

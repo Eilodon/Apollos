@@ -20,6 +20,7 @@ import android.hardware.SensorManager
 import android.util.Base64
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.ImageProxy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
@@ -82,14 +83,15 @@ class RealtimeSessionManager(
     private var geoOrigin: LocationSnapshot? = null
     @Volatile private var eskfHandle: Long = 0L
     @Volatile private var lastImuTimestampNs: Long = 0L
-    @Volatile private var lastCameraFrameTimestampNs: Long = 0L
     @Volatile private var latestGyroMagnitudeDeg: Float = 0.0f
     @Volatile private var latestVoApplied: Boolean = false
     @Volatile private var latestVoFlowScore: Float = 0.0f
     @Volatile private var latestVoVarianceM2: Float = 999.0f
     @Volatile private var latestVoPoseXM: Float = 0.0f
     @Volatile private var latestVoPoseYM: Float = 0.0f
+    @Volatile private var latestDepthObjectsFeedAvailable: Boolean = false
     private var gravityEstimate = FloatArray(3)
+    private val edgePipeline by lazy { YoloDa3NnapiPipeline(context) }
 
     private var sessionId: String = UUID.randomUUID().toString()
     private var webSocket: WebSocket? = null
@@ -126,13 +128,13 @@ class RealtimeSessionManager(
         }
         geoOrigin = null
         lastImuTimestampNs = 0L
-        lastCameraFrameTimestampNs = 0L
         latestGyroMagnitudeDeg = 0.0f
         latestVoApplied = false
         latestVoFlowScore = 0.0f
         latestVoVarianceM2 = 999.0f
         latestVoPoseXM = 0.0f
         latestVoPoseYM = 0.0f
+        latestDepthObjectsFeedAvailable = false
         gravityEstimate = FloatArray(3)
         latestSafetyDirectiveAtMs = 0L
 
@@ -172,14 +174,17 @@ class RealtimeSessionManager(
         }
         sensorListener = null
         lastImuTimestampNs = 0L
-        lastCameraFrameTimestampNs = 0L
         latestGyroMagnitudeDeg = 0.0f
         latestVoApplied = false
         latestVoFlowScore = 0.0f
         latestVoVarianceM2 = 999.0f
         latestVoPoseXM = 0.0f
         latestVoPoseYM = 0.0f
+        latestDepthObjectsFeedAvailable = false
         latestSafetyDirectiveAtMs = 0L
+        if (edgePipeline.isAvailable()) {
+            edgePipeline.close()
+        }
         if (eskfHandle != 0L) {
             RustCoreBridge.eskfDestroy(eskfHandle)
             eskfHandle = 0L
@@ -526,13 +531,18 @@ class RealtimeSessionManager(
         val posY = ((location.lat - origin.lat) * latScaleM.toDouble()).toFloat()
         val varianceM2 = location.accuracyM.coerceIn(4.0f, 50.0f).let { it * it }
 
-        RustCoreBridge.eskfUpdateVision(
+        val applied = RustCoreBridge.eskfUpdateVision(
             handle = eskfHandle,
             positionX = posX,
             positionY = posY,
             positionZ = 0.0f,
             varianceM2 = varianceM2,
         )
+        latestVoApplied = applied
+        latestVoFlowScore = if (applied) 1.0f else 0.0f
+        latestVoVarianceM2 = varianceM2
+        latestVoPoseXM = posX
+        latestVoPoseYM = posY
     }
 
     private fun startAudio(onStatus: (String) -> Unit) {
@@ -593,46 +603,10 @@ class RealtimeSessionManager(
                     .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                     .build()
                 analysis.setAnalyzer(cameraExecutor) { image ->
-                    val plane = image.planes.firstOrNull()
-                    if (plane == null) {
-                        image.close()
-                        return@setAnalyzer
-                    }
-                    val buffer = plane.buffer
-                    buffer.rewind()
-                    val rowStride = plane.rowStride
-                    val pixelStride = plane.pixelStride
-                    val frameTimestampNs = image.imageInfo.timestamp
-                    val dtS = if (lastCameraFrameTimestampNs == 0L) {
-                        0.033f
-                    } else {
-                        ((frameTimestampNs - lastCameraFrameTimestampNs).coerceAtLeast(0L) / 1_000_000_000f)
-                            .coerceIn(0.01f, 0.2f)
-                    }
-                    lastCameraFrameTimestampNs = frameTimestampNs
-
-                    val vo = RustCoreBridge.eskfUpdateVisualOdometryRgbaBuffer(
-                        handle = eskfHandle,
-                        rgbaBuffer = buffer,
-                        width = image.width,
-                        height = image.height,
-                        rowStride = rowStride,
-                        pixelStride = pixelStride,
-                        dtS = dtS,
-                    )
-                    latestVoApplied = vo.applied
-                    latestVoFlowScore = vo.opticalFlowScore
-                    latestVoVarianceM2 = vo.varianceM2
-                    latestVoPoseXM = vo.poseXM
-                    latestVoPoseYM = vo.poseYM
-
                     val kinematic = RustCoreBridge.analyzeDefaultWalkingFrame()
-                    val depth = RustCoreBridge.detectDropAheadRgbaBuffer(
-                        rgbaBuffer = buffer,
-                        width = image.width,
-                        height = image.height,
-                        rowStride = rowStride,
-                        pixelStride = pixelStride,
+                    val detections = detectEdgeObjects(image)
+                    val depth = RustCoreBridge.detectDropAheadObjects(
+                        objects = detections,
                         riskScore = kinematic.riskScore,
                         carryModeCode = 1,
                         gyroMagnitude = latestGyroMagnitudeDeg,
@@ -676,8 +650,8 @@ class RealtimeSessionManager(
         if (eskf.localizationUncertaintyM > 6.0f) {
             flags.add("localization_uncertain")
         }
-        if (depth.sourceCode != 1) {
-            flags.add("depth_heuristic_fallback")
+        if (!latestDepthObjectsFeedAvailable) {
+            flags.add("depth_objects_feed_missing")
         }
         if (!latestVoApplied) {
             flags.add("vision_odometry_fallback")
@@ -738,6 +712,12 @@ class RealtimeSessionManager(
         webSocket?.send(payload.toString())
     }
 
+    private fun detectEdgeObjects(image: ImageProxy): List<EdgeObjectDetection> {
+        val inference = edgePipeline.detect(image)
+        latestDepthObjectsFeedAvailable = inference.feedAvailable
+        return inference.objects
+    }
+
     private fun buildEdgeSemanticCues(depth: DepthHazardResult): org.json.JSONArray {
         val cues = org.json.JSONArray()
         if (!depth.detected) {
@@ -758,7 +738,7 @@ class RealtimeSessionManager(
             .put("distance_m", distanceM)
             .put("position_clock", clockFaceFromPositionX(depth.positionX))
             .put("ttl_ms", 1200)
-            .put("source", if (depth.sourceCode == 1) "edge_depth_onnx" else "edge_depth_heuristic")
+            .put("source", "edge_depth_objects_v3")
         cues.put(cue)
         return cues
     }
@@ -798,7 +778,7 @@ class RealtimeSessionManager(
             else -> 3.0f
         }
         val relativeVelocityMps = -riskScore.coerceIn(0.4f, 3.0f)
-        val source = if (depth.sourceCode == 1) "depth_onnx" else "depth_heuristic"
+        val source = "depth_objects_v3"
 
         val payload = JSONObject()
             .put("type", "hazard_observation")

@@ -128,6 +128,14 @@ fn native_frame_payload(
             "innovation_norm": 0.8,
             "source": source
         },
+        "vision_odometry": {
+            "source": source,
+            "applied": true,
+            "optical_flow_score": 0.77,
+            "variance_m2": 1.4,
+            "pose_x_m": 0.9,
+            "pose_y_m": -0.2
+        },
         "cloud_link": {
             "connected": true,
             "rtt_ms": 65.0,

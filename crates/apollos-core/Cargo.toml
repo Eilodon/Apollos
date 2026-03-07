@@ -25,13 +25,8 @@ uniffi = { workspace = true, optional = true }
 uuid.workspace = true
 
 # Phase-1 target dependencies (feature-gated until modules are fully wired).
-cpal = { version = "0.15", optional = true }
-hrtf = { version = "0.8", optional = true }
-ort = { version = "2.0.0-rc.12", default-features = false, optional = true }
 
 [features]
 default = []
-audio = ["dep:cpal", "dep:hrtf"]
 ffi = ["dep:uniffi"]
-ml = ["dep:ort"]
 net = ["dep:anyhow", "dep:tokio", "dep:tokio-tungstenite", "dep:futures-util"]

@@ -1,6 +1,6 @@
 use apollos_proto::contracts::{
-    AssistantTextMessage, BackendToClientMessage, ClientToBackendMessage, ConnectionState,
-    ConnectionStateMessage, CognitionLayer, NavigationMode, SafetyDirectiveMessage, SemanticCue,
+    AssistantTextMessage, BackendToClientMessage, ClientToBackendMessage, CognitionLayer,
+    ConnectionState, ConnectionStateMessage, NavigationMode, SafetyDirectiveMessage, SemanticCue,
     SemanticCueMessage,
 };
 use chrono::Utc;
@@ -26,6 +26,28 @@ impl AgentOrchestrator {
             crate::ws_handler::Channel::Emergency => Channel::Emergency,
         };
         Self { channel }
+    }
+
+    async fn send_channel(
+        &self,
+        state: &AppState,
+        session_id: &str,
+        payload: BackendToClientMessage,
+    ) -> bool {
+        match self.channel {
+            Channel::Live => state.ws_registry.send_live(session_id, payload).await,
+            Channel::Emergency => {
+                if state
+                    .ws_registry
+                    .send_emergency(session_id, payload.clone())
+                    .await
+                {
+                    true
+                } else {
+                    state.ws_registry.send_live(session_id, payload).await
+                }
+            }
+        }
     }
 
     pub async fn route_message(
@@ -79,9 +101,9 @@ impl AgentOrchestrator {
                     )
                     .await;
                 if let Some(transition) = cognition_transition {
-                    let _ = state
-                        .ws_registry
-                        .send_live(
+                    let _ = self
+                        .send_channel(
+                            state,
                             &frame.session_id,
                             BackendToClientMessage::CognitionState(transition),
                         )
@@ -92,9 +114,9 @@ impl AgentOrchestrator {
                 if observability.active_cognition_layer == CognitionLayer::L2Edge {
                     if let Some(cue) = strongest_edge_cue(&frame.edge_semantic_cues) {
                         let text = format_edge_cue(cue);
-                        let _ = state
-                            .ws_registry
-                            .send_live(
+                        let _ = self
+                            .send_channel(
+                                state,
                                 &frame.session_id,
                                 BackendToClientMessage::AssistantText(AssistantTextMessage {
                                     session_id: frame.session_id.clone(),
@@ -105,9 +127,9 @@ impl AgentOrchestrator {
                             .await;
 
                         if let Some(position_x) = cue.position_x {
-                            let _ = state
-                                .ws_registry
-                                .send_live(
+                            let _ = self
+                                .send_channel(
+                                    state,
                                     &frame.session_id,
                                     BackendToClientMessage::SemanticCue(SemanticCueMessage {
                                         cue: SemanticCue::ApproachingObject,
@@ -118,10 +140,12 @@ impl AgentOrchestrator {
                         }
                     }
 
-                    return Some(BackendToClientMessage::ConnectionState(ConnectionStateMessage {
-                        state: ConnectionState::Degraded,
-                        detail: Some("edge_cognition_active".to_string()),
-                    }));
+                    return Some(BackendToClientMessage::ConnectionState(
+                        ConnectionStateMessage {
+                            state: ConnectionState::Degraded,
+                            detail: Some("edge_cognition_active".to_string()),
+                        },
+                    ));
                 }
 
                 if let Err(error) = state.gemini.forward_multimodal_frame(state, &frame).await {
@@ -338,16 +362,20 @@ impl AgentOrchestrator {
                         .fallback
                         .create_help_session(&hazard.session_id, "safety_policy")
                         .await;
-                    let _ = state
-                        .ws_registry
-                        .send_live(
+                    let _ = self
+                        .send_channel(
+                            state,
                             &hazard.session_id,
                             BackendToClientMessage::HumanHelpSession(help),
                         )
                         .await;
                 }
 
-                Some(directive)
+                if decision.should_emit_hard_stop() {
+                    None
+                } else {
+                    Some(directive)
+                }
             }
         }
     }

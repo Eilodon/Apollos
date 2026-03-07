@@ -5,6 +5,11 @@
 native/android/.gradle/
 native/android/**/build/
 native/android/app/src/main/jniLibs/
+native/android/app/src/main/assets/models/*
+!native/android/app/src/main/assets/models/.gitkeep
+native/ios/ApollosShell/Models/*
+!native/ios/ApollosShell/Models/.gitkeep
+native/model_manifest.sha256
 
 # Terraform
 .terraform/

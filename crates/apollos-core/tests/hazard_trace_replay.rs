@@ -1,70 +1,63 @@
-use apollos_core::{DepthEngine, LumaFrame, SurvivalReflexEngine};
+use apollos_core::depth_engine::{BoundingBox, DepthSpatials, ObjectSensorFusionInput};
+use apollos_core::DepthEngine;
 use apollos_proto::contracts::CarryMode;
 
-fn uniform_frame(width: usize, height: usize, luma: f32) -> LumaFrame {
-    LumaFrame {
-        width,
-        height,
-        pixels: vec![luma; width * height],
-    }
-}
-
-fn drop_like_frame(width: usize, height: usize) -> LumaFrame {
-    let mut pixels = vec![220.0_f32; width * height];
-
-    for y in (height / 2)..height {
-        for x in 0..width {
-            let luma = if y % 2 == 0 { 220.0 } else { 20.0 };
-            pixels[y * width + x] = luma;
-        }
-    }
-
-    LumaFrame {
-        width,
-        height,
-        pixels,
-    }
-}
-
-#[test]
-fn replay_survival_reflex_stream_emits_and_dedups_hazard() {
-    let mut engine = SurvivalReflexEngine::default();
-
-    // warm-up frame
-    let _ = engine.process(uniform_frame(16, 16, 10.0), 4.0, 20);
-
-    let first = engine.process(uniform_frame(16, 16, 200.0), 4.0, 40);
-    assert!(first.is_some());
-
-    // within dedup cooldown window
-    let _ = engine.process(uniform_frame(16, 16, 10.0), 4.0, 60);
-    let duplicated = engine.process(uniform_frame(16, 16, 200.0), 4.0, 80);
-    assert!(duplicated.is_none());
-
-    // after cooldown should emit again
-    let second = engine.process(uniform_frame(16, 16, 10.0), 4.0, 3100);
-    if second.is_none() {
-        let third = engine.process(uniform_frame(16, 16, 200.0), 4.0, 3200);
-        assert!(third.is_some());
+fn object(
+    label_id: u32,
+    x_min: f32,
+    x_max: f32,
+    confidence: f32,
+    min_depth_m: f32,
+) -> ObjectSensorFusionInput {
+    ObjectSensorFusionInput {
+        bbox: BoundingBox {
+            label_id,
+            x_min,
+            y_min: 0.2,
+            x_max,
+            y_max: 0.8,
+            confidence,
+        },
+        spatial: DepthSpatials {
+            median_depth_m: min_depth_m + 0.3,
+            min_depth_m,
+        },
     }
 }
 
 #[test]
-fn replay_depth_guard_stream_detects_drop_ahead() {
+fn replay_object_fusion_stream_detects_nearest_hazard() {
     let mut engine = DepthEngine::default();
 
-    let _ = engine.process(
-        &uniform_frame(64, 64, 220.0),
-        4.0,
-        CarryMode::Necklace,
-        0.0,
-        100,
-    );
+    let warmup = [object(1, 0.4, 0.6, 0.8, 3.2)];
+    let none = engine.process(&warmup, 1.2, CarryMode::Necklace, 0.0, 10);
+    assert!(none.is_none());
 
-    let hazard = engine.process(&drop_like_frame(64, 64), 4.0, CarryMode::Necklace, 0.0, 220);
-    assert!(hazard.is_some());
+    let mixed = [
+        object(7, 0.1, 0.2, 0.55, 1.8),
+        object(42, 0.48, 0.58, 0.92, 0.35),
+        object(9, 0.75, 0.88, 0.88, 0.9),
+    ];
+    let hazard = engine
+        .process(&mixed, 1.8, CarryMode::Necklace, 0.2, 80)
+        .expect("expected nearest valid hazard");
 
-    let hazard = hazard.expect("hazard should be detected");
-    assert_eq!(hazard.hazard_type, "DROP_AHEAD");
-    assert!(hazard.confidence >= 0.62);
+    assert_eq!(hazard.hazard_type, "HAZARD_42");
+    assert!(hazard.position_x.abs() < 0.2);
+    assert!(hazard.confidence > 0.9);
+}
+
+#[test]
+fn replay_object_fusion_respects_rate_limit_window() {
+    let mut engine = DepthEngine::default();
+    let hazardous = [object(3, 0.2, 0.4, 0.9, 0.6)];
+
+    let first = engine.process(&hazardous, 1.6, CarryMode::Necklace, 0.0, 100);
+    assert!(first.is_some());
+
+    let suppressed = engine.process(&hazardous, 1.6, CarryMode::Necklace, 0.0, 120);
+    assert!(suppressed.is_none());
+
+    let resumed = engine.process(&hazardous, 1.6, CarryMode::Necklace, 0.0, 170);
+    assert!(resumed.is_some());
 }

@@ -10,7 +10,6 @@ struct IOSDepthHazardResult {
     let detected: Bool
     let positionX: Float
     let confidence: Float
-    let sourceCode: UInt8
     let distanceCode: UInt8
 }
 
@@ -33,6 +32,17 @@ struct IOSVisionOdometryResult {
     let varianceM2: Float
     let opticalFlowScore: Float
     let lateralBias: Float
+}
+
+struct IOSEdgeObjectDetection {
+    let labelId: UInt32
+    let xMin: Float
+    let yMin: Float
+    let xMax: Float
+    let yMax: Float
+    let confidence: Float
+    let medianDepthM: Float
+    let minDepthM: Float
 }
 
 enum RustCoreBridge {
@@ -135,110 +145,44 @@ enum RustCoreBridge {
         )
     }
 
-    static func eskfUpdateVisualOdometryRgba(
-        handle: UInt64,
-        rgba: [UInt8],
-        width: UInt32,
-        height: UInt32,
-        dtS: Float
-    ) -> IOSVisionOdometryResult {
-        if handle == 0 || width == 0 || height == 0 || dtS <= 0 {
-            return IOSVisionOdometryResult(
-                applied: false,
-                deltaXM: 0.0,
-                deltaYM: 0.0,
-                poseXM: 0.0,
-                poseYM: 0.0,
-                varianceM2: 999.0,
-                opticalFlowScore: 0.0,
-                lateralBias: 0.0
-            )
-        }
 
-        let output = rgba.withUnsafeBufferPointer { buffer -> ApollosVisionOdometryOutput in
-            apollos_eskf_update_visual_odometry_rgba(
-                handle,
-                buffer.baseAddress,
-                rgba.count,
-                width,
-                height,
-                dtS
-            )
-        }
-
-        return IOSVisionOdometryResult(
-            applied: output.applied != 0,
-            deltaXM: output.delta_x_m,
-            deltaYM: output.delta_y_m,
-            poseXM: output.pose_x_m,
-            poseYM: output.pose_y_m,
-            varianceM2: output.variance_m2,
-            opticalFlowScore: output.optical_flow_score,
-            lateralBias: output.lateral_bias
-        )
-    }
-
-    static func eskfUpdateVisualOdometryBgraStrided(
-        handle: UInt64,
-        baseAddress: UnsafeRawPointer,
-        bufferLen: Int,
-        width: UInt32,
-        height: UInt32,
-        rowStride: UInt32,
-        pixelStride: UInt32,
-        dtS: Float
-    ) -> IOSVisionOdometryResult {
-        if handle == 0 || width == 0 || height == 0 || dtS <= 0 || bufferLen <= 0 {
-            return IOSVisionOdometryResult(
-                applied: false,
-                deltaXM: 0.0,
-                deltaYM: 0.0,
-                poseXM: 0.0,
-                poseYM: 0.0,
-                varianceM2: 999.0,
-                opticalFlowScore: 0.0,
-                lateralBias: 0.0
-            )
-        }
-
-        let output = apollos_eskf_update_visual_odometry_bgra_strided(
-            handle,
-            baseAddress.assumingMemoryBound(to: UInt8.self),
-            bufferLen,
-            width,
-            height,
-            rowStride,
-            pixelStride,
-            dtS
-        )
-
-        return IOSVisionOdometryResult(
-            applied: output.applied != 0,
-            deltaXM: output.delta_x_m,
-            deltaYM: output.delta_y_m,
-            poseXM: output.pose_x_m,
-            poseYM: output.pose_y_m,
-            varianceM2: output.variance_m2,
-            opticalFlowScore: output.optical_flow_score,
-            lateralBias: output.lateral_bias
-        )
-    }
-
-    static func detectDropAheadRgba(
-        rgba: [UInt8],
-        width: UInt32,
-        height: UInt32,
+    static func detectDropAheadObjects(
+        objects: [IOSEdgeObjectDetection],
         riskScore: Float,
         carryModeCode: UInt8,
         gyroMagnitude: Float,
         nowMs: UInt64
     ) -> IOSDepthHazardResult {
-        let output = rgba.withUnsafeBufferPointer { buffer -> ApollosDepthHazardOutput in
-            apollos_detect_drop_ahead_rgba(
+        if objects.isEmpty {
+            return IOSDepthHazardResult(
+                detected: false,
+                positionX: 0.0,
+                confidence: 0.0,
+                distanceCode: 0
+            )
+        }
+
+        let mapped = objects.prefix(32).map { obj in
+            ApollosObjectSensorFusionInput(
+                bbox: ApollosBoundingBox(
+                    label_id: obj.labelId,
+                    x_min: obj.xMin,
+                    y_min: obj.yMin,
+                    x_max: obj.xMax,
+                    y_max: obj.yMax,
+                    confidence: obj.confidence
+                ),
+                spatial: ApollosDepthSpatials(
+                    median_depth_m: obj.medianDepthM,
+                    min_depth_m: obj.minDepthM
+                )
+            )
+        }
+
+        let output = mapped.withUnsafeBufferPointer { buffer -> ApollosDepthHazardOutput in
+            apollos_detect_drop_ahead_objects(
                 buffer.baseAddress,
-                rgba.count,
-                width,
-                height,
+                mapped.count,
                 riskScore,
                 carryModeCode,
                 gyroMagnitude,
@@ -250,50 +194,6 @@ enum RustCoreBridge {
             detected: output.detected != 0,
             positionX: output.position_x,
             confidence: output.confidence,
-            sourceCode: output.source_code,
-            distanceCode: output.distance_code
-        )
-    }
-
-    static func detectDropAheadBgraStrided(
-        baseAddress: UnsafeRawPointer,
-        bufferLen: Int,
-        width: UInt32,
-        height: UInt32,
-        rowStride: UInt32,
-        pixelStride: UInt32,
-        riskScore: Float,
-        carryModeCode: UInt8,
-        gyroMagnitude: Float,
-        nowMs: UInt64
-    ) -> IOSDepthHazardResult {
-        if width == 0 || height == 0 || bufferLen <= 0 {
-            return IOSDepthHazardResult(
-                detected: false,
-                positionX: 0.0,
-                confidence: 0.0,
-                sourceCode: 0,
-                distanceCode: 0
-            )
-        }
-
-        let output = apollos_detect_drop_ahead_bgra_strided(
-            baseAddress.assumingMemoryBound(to: UInt8.self),
-            bufferLen,
-            width,
-            height,
-            rowStride,
-            pixelStride,
-            riskScore,
-            carryModeCode,
-            gyroMagnitude,
-            nowMs
-        )
-        return IOSDepthHazardResult(
-            detected: output.detected != 0,
-            positionX: output.position_x,
-            confidence: output.confidence,
-            sourceCode: output.source_code,
             distanceCode: output.distance_code
         )
     }

@@ -13,7 +13,6 @@ typedef struct {
     uint8_t detected;
     float position_x;
     float confidence;
-    uint8_t source_code;
     uint8_t distance_code;
 } ApollosDepthHazardOutput;
 
@@ -28,15 +27,23 @@ typedef struct {
 } ApollosEskfSnapshot;
 
 typedef struct {
-    uint8_t applied;
-    float delta_x_m;
-    float delta_y_m;
-    float pose_x_m;
-    float pose_y_m;
-    float variance_m2;
-    float optical_flow_score;
-    float lateral_bias;
-} ApollosVisionOdometryOutput;
+    uint32_t label_id;
+    float x_min;
+    float y_min;
+    float x_max;
+    float y_max;
+    float confidence;
+} ApollosBoundingBox;
+
+typedef struct {
+    float median_depth_m;
+    float min_depth_m;
+} ApollosDepthSpatials;
+
+typedef struct {
+    ApollosBoundingBox bbox;
+    ApollosDepthSpatials spatial;
+} ApollosObjectSensorFusionInput;
 
 uint32_t apollos_abi_version_u32(void);
 ApollosKinematicOutput apollos_analyze_kinematics(
@@ -54,35 +61,9 @@ ApollosKinematicOutput apollos_analyze_kinematics(
     uint8_t sensor_unavailable
 );
 uint8_t apollos_depth_onnx_runtime_enabled(void);
-ApollosDepthHazardOutput apollos_detect_drop_ahead_rgba(
-    const uint8_t *rgba_ptr,
-    uintptr_t rgba_len,
-    uint32_t width,
-    uint32_t height,
-    float risk_score,
-    uint8_t carry_mode_code,
-    float gyro_magnitude,
-    uint64_t now_ms
-);
-ApollosDepthHazardOutput apollos_detect_drop_ahead_rgba_strided(
-    const uint8_t *rgba_ptr,
-    uintptr_t rgba_len,
-    uint32_t width,
-    uint32_t height,
-    uint32_t row_stride,
-    uint32_t pixel_stride,
-    float risk_score,
-    uint8_t carry_mode_code,
-    float gyro_magnitude,
-    uint64_t now_ms
-);
-ApollosDepthHazardOutput apollos_detect_drop_ahead_bgra_strided(
-    const uint8_t *bgra_ptr,
-    uintptr_t bgra_len,
-    uint32_t width,
-    uint32_t height,
-    uint32_t row_stride,
-    uint32_t pixel_stride,
+ApollosDepthHazardOutput apollos_detect_drop_ahead_objects(
+    const ApollosObjectSensorFusionInput *objects_ptr,
+    uintptr_t objects_len,
     float risk_score,
     uint8_t carry_mode_code,
     float gyro_magnitude,
@@ -104,34 +85,6 @@ uint8_t apollos_eskf_update_vision(
     float position_y,
     float position_z,
     float variance_m2
-);
-ApollosVisionOdometryOutput apollos_eskf_update_visual_odometry_rgba(
-    uint64_t handle,
-    const uint8_t *rgba_ptr,
-    uintptr_t rgba_len,
-    uint32_t width,
-    uint32_t height,
-    float dt_s
-);
-ApollosVisionOdometryOutput apollos_eskf_update_visual_odometry_rgba_strided(
-    uint64_t handle,
-    const uint8_t *rgba_ptr,
-    uintptr_t rgba_len,
-    uint32_t width,
-    uint32_t height,
-    uint32_t row_stride,
-    uint32_t pixel_stride,
-    float dt_s
-);
-ApollosVisionOdometryOutput apollos_eskf_update_visual_odometry_bgra_strided(
-    uint64_t handle,
-    const uint8_t *bgra_ptr,
-    uintptr_t bgra_len,
-    uint32_t width,
-    uint32_t height,
-    uint32_t row_stride,
-    uint32_t pixel_stride,
-    float dt_s
 );
 ApollosEskfSnapshot apollos_eskf_snapshot(uint64_t handle);
 

@@ -411,51 +411,70 @@ impl SessionStore {
         cloud_link: Option<&CloudLinkSnapshot>,
         edge_semantic_cues: &[EdgeSemanticCueMessage],
     ) -> Option<CognitionStateMessage> {
-        let mut transition = None;
-        let mut guard = self.inner.write().await;
-        let state = guard
-            .entry(session_id.to_string())
-            .or_insert_with(|| SessionState::new(session_id.to_string()));
+        let (transition, persist_snapshot) = {
+            let mut transition = None;
+            let mut guard = self.inner.write().await;
+            let state = guard
+                .entry(session_id.to_string())
+                .or_insert_with(|| SessionState::new(session_id.to_string()));
 
-        let now = now_epoch();
+            let now = now_epoch();
 
-        if let Some(link) = cloud_link {
-            let rtt_ms = link.rtt_ms.filter(|value| value.is_finite() && *value >= 0.0);
-            state.cloud_rtt_ms = rtt_ms;
-            let rtt_healthy = rtt_ms
-                .map(|value| value <= Self::CLOUD_RTT_DEGRADED_MS)
-                .unwrap_or(true);
-            state.cloud_link_healthy = link.connected && rtt_healthy;
-        }
+            if let Some(link) = cloud_link {
+                let rtt_ms = link
+                    .rtt_ms
+                    .filter(|value| value.is_finite() && *value >= 0.0);
+                state.cloud_rtt_ms = rtt_ms;
+                let rtt_healthy = rtt_ms
+                    .map(|value| value <= Self::CLOUD_RTT_DEGRADED_MS)
+                    .unwrap_or(true);
+                state.cloud_link_healthy = link.connected && rtt_healthy;
+            }
 
-        let has_strong_edge_cue = edge_semantic_cues.iter().any(|cue| {
-            cue.confidence.is_finite()
-                && cue.confidence >= 0.55
-                && (!cue.cue_type.trim().is_empty() || cue.text.as_deref().unwrap_or("").len() > 2)
-        });
-        if has_strong_edge_cue {
-            state.edge_cognition_available = true;
-            state.last_edge_cue_epoch = now;
-        } else if state.last_edge_cue_epoch > 0.0
-            && (now - state.last_edge_cue_epoch) > Self::EDGE_COGNITION_STALE_S
-        {
-            state.edge_cognition_available = false;
-        }
-
-        let previous_layer = state.active_cognition_layer;
-        let previous_reason = state.cognition_reason.clone();
-        self.refresh_cognition_layer(state, now);
-        if previous_layer != state.active_cognition_layer || previous_reason != state.cognition_reason
-        {
-            transition = Some(CognitionStateMessage {
-                session_id: state.session_id.clone(),
-                timestamp: Utc::now().to_rfc3339(),
-                active_layer: state.active_cognition_layer,
-                cloud_link_healthy: state.cloud_link_healthy,
-                edge_cognition_available: state.edge_cognition_available,
-                cloud_rtt_ms: state.cloud_rtt_ms,
-                reason: Some(state.cognition_reason.clone()),
+            let has_strong_edge_cue = edge_semantic_cues.iter().any(|cue| {
+                cue.confidence.is_finite()
+                    && cue.confidence >= 0.55
+                    && (!cue.cue_type.trim().is_empty()
+                        || cue.text.as_deref().unwrap_or("").len() > 2)
             });
+            if has_strong_edge_cue {
+                state.edge_cognition_available = true;
+                state.last_edge_cue_epoch = now;
+            } else if state.last_edge_cue_epoch > 0.0
+                && (now - state.last_edge_cue_epoch) > Self::EDGE_COGNITION_STALE_S
+            {
+                state.edge_cognition_available = false;
+            }
+
+            let previous_layer = state.active_cognition_layer;
+            let previous_reason = state.cognition_reason.clone();
+            self.refresh_cognition_layer(state, now);
+            if previous_layer != state.active_cognition_layer
+                || previous_reason != state.cognition_reason
+            {
+                transition = Some(CognitionStateMessage {
+                    session_id: state.session_id.clone(),
+                    timestamp: Utc::now().to_rfc3339(),
+                    active_layer: state.active_cognition_layer,
+                    cloud_link_healthy: state.cloud_link_healthy,
+                    edge_cognition_available: state.edge_cognition_available,
+                    cloud_rtt_ms: state.cloud_rtt_ms,
+                    reason: Some(state.cognition_reason.clone()),
+                });
+            }
+
+            let should_persist = self.mark_persist_if_due(state, transition.is_some());
+            let persist_snapshot = if should_persist {
+                Some(state.clone())
+            } else {
+                None
+            };
+
+            (transition, persist_snapshot)
+        };
+
+        if let Some(snapshot) = persist_snapshot {
+            self.persist_session_async(snapshot);
         }
 
         transition
@@ -1359,6 +1378,9 @@ mod tests {
             .await;
 
         let observability = store.get_observability("s7").await;
-        assert_eq!(observability.active_cognition_layer, CognitionLayer::L1Survival);
+        assert_eq!(
+            observability.active_cognition_layer,
+            CognitionLayer::L1Survival
+        );
     }
 }
